@@ -77,13 +77,26 @@ fetchNYCCameras();
 const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
-// NYPD Feed IDs - verified active feeds
+// NYPD Feed IDs - verified active feeds from broadcastify.com/listen/ctid/1855
 const NYPD_FEEDS = [
-  { id: '9315', name: 'NYPD Citywide 1' },        // Most active - all boroughs
-  { id: '32284', name: 'NYPD Manhattan South' },  // Manhattan below 59th
-  { id: '30882', name: 'NYPD Brooklyn North' },   // Brooklyn busy areas
-  { id: '1189', name: 'NYPD Special Operations' }, // ESU, Aviation, etc
+  { id: '40184', name: 'NYPD Citywide 1' },        // Most active - all boroughs
+  { id: '40185', name: 'NYPD Citywide 2' },        // Secondary citywide
+  { id: '40186', name: 'NYPD Citywide 3' },        // Third citywide channel
+  { id: '1189', name: 'NYPD Bronx/Manhattan Transit' }, // Transit division
 ];
+
+// Scanner stats for debug endpoint
+let scannerStats = {
+  currentFeed: null,
+  lastChunkTime: null,
+  lastChunkSize: 0,
+  lastTranscriptTime: null,
+  lastTranscript: null,
+  totalChunks: 0,
+  successfulTranscripts: 0,
+  skippedChunks: 0,
+  errors: []
+};
 
 let currentFeedIndex = 0;
 let audioBuffer = [];
@@ -97,60 +110,39 @@ async function startBroadcastifyStream() {
   }
 
   const feed = NYPD_FEEDS[currentFeedIndex];
-  const streamUrl = `https://audio.broadcastify.com/${feed.id}.mp3`;
   
-  // Create Basic Auth header
-  const authString = Buffer.from(`${BROADCASTIFY_USERNAME}:${BROADCASTIFY_PASSWORD}`).toString('base64');
+  // Try URL-embedded credentials (works better with Broadcastify)
+  const streamUrl = `https://${encodeURIComponent(BROADCASTIFY_USERNAME)}:${encodeURIComponent(BROADCASTIFY_PASSWORD)}@audio.broadcastify.com/${feed.id}.mp3`;
   
   console.log(`Connecting to Broadcastify feed: ${feed.name} (${feed.id})`);
 
   try {
-    const response = await fetch(streamUrl, {
-      headers: {
-        'Authorization': `Basic ${authString}`
-      }
-    });
+    const response = await fetch(streamUrl);
     
     if (!response.ok) {
-      console.error(`Broadcastify stream error: ${response.status}`);
-      // Try next feed
-      currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
-      setTimeout(startBroadcastifyStream, 5000);
+      console.error(`Broadcastify stream error: ${response.status} - trying header auth...`);
+      
+      // Fallback to header-based auth
+      const authString = Buffer.from(`${BROADCASTIFY_USERNAME}:${BROADCASTIFY_PASSWORD}`).toString('base64');
+      const fallbackUrl = `https://audio.broadcastify.com/${feed.id}.mp3`;
+      const fallbackResponse = await fetch(fallbackUrl, {
+        headers: { 'Authorization': `Basic ${authString}` }
+      });
+      
+      if (!fallbackResponse.ok) {
+        console.error(`Fallback also failed: ${fallbackResponse.status}`);
+        // Try next feed
+        currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+        setTimeout(startBroadcastifyStream, 5000);
+        return;
+      }
+      
+      // Use fallback response
+      handleStream(fallbackResponse.body, feed);
       return;
     }
 
-    console.log(`Connected to ${feed.name}! Streaming audio...`);
-    
-    // Use Node.js stream approach
-    const stream = response.body;
-    let chunks = [];
-    
-    stream.on('data', (chunk) => {
-      chunks.push(chunk);
-      
-      // Process every CHUNK_DURATION ms
-      if (Date.now() - lastProcessTime >= CHUNK_DURATION) {
-        const fullBuffer = Buffer.concat(chunks);
-        const bufferSize = fullBuffer.length;
-        chunks = [];
-        lastProcessTime = Date.now();
-        
-        console.log(`[${feed.name}] Audio chunk: ${(bufferSize / 1024).toFixed(1)}KB`);
-        
-        // Process in background (don't await)
-        processAudioFromStream(fullBuffer, feed.name);
-      }
-    });
-    
-    stream.on('end', () => {
-      console.log('Stream ended, reconnecting...');
-      setTimeout(startBroadcastifyStream, 2000);
-    });
-    
-    stream.on('error', (error) => {
-      console.error('Stream error:', error.message);
-      setTimeout(startBroadcastifyStream, 5000);
-    });
+    handleStream(response.body, feed);
     
   } catch (error) {
     console.error('Broadcastify connection error:', error.message);
@@ -158,9 +150,52 @@ async function startBroadcastifyStream() {
   }
 }
 
+function handleStream(stream, feed) {
+  console.log(`Connected to ${feed.name}! Streaming audio...`);
+  scannerStats.currentFeed = feed.name;
+  
+  let chunks = [];
+  
+  stream.on('data', (chunk) => {
+    chunks.push(chunk);
+    
+    // Process every CHUNK_DURATION ms
+    if (Date.now() - lastProcessTime >= CHUNK_DURATION) {
+      const fullBuffer = Buffer.concat(chunks);
+      const bufferSize = fullBuffer.length;
+      chunks = [];
+      lastProcessTime = Date.now();
+      
+      scannerStats.lastChunkTime = new Date().toISOString();
+      scannerStats.lastChunkSize = bufferSize;
+      scannerStats.totalChunks++;
+      
+      console.log(`[${feed.name}] Audio chunk: ${(bufferSize / 1024).toFixed(1)}KB`);
+      
+      // Process in background (don't await)
+      processAudioFromStream(fullBuffer, feed.name);
+    }
+  });
+  
+  stream.on('end', () => {
+    console.log('Stream ended, reconnecting...');
+    scannerStats.currentFeed = null;
+    setTimeout(startBroadcastifyStream, 2000);
+  });
+  
+  stream.on('error', (error) => {
+    console.error('Stream error:', error.message);
+    scannerStats.errors.push({ time: new Date().toISOString(), error: error.message });
+    if (scannerStats.errors.length > 10) scannerStats.errors.shift();
+    setTimeout(startBroadcastifyStream, 5000);
+  });
+}
+
 async function processAudioFromStream(buffer, feedName) {
-  if (buffer.length < 5000) {
+  // Need at least ~10KB for meaningful audio (about 5 seconds at low bitrate)
+  if (buffer.length < 10000) {
     console.log(`[${feedName}] Skipping - buffer too small: ${buffer.length} bytes`);
+    scannerStats.skippedChunks++;
     return;
   }
   
@@ -169,10 +204,52 @@ async function processAudioFromStream(buffer, feedName) {
     console.log(`[${feedName}] Sending ${(buffer.length / 1024).toFixed(1)}KB to Whisper...`);
     const transcript = await transcribeAudio(buffer);
     
-    if (!transcript || transcript.trim().length < 10) {
-      console.log(`[${feedName}] Empty/short transcript: "${transcript || '(null)'}"`);
+    if (!transcript) {
+      console.log(`[${feedName}] No transcript returned`);
+      scannerStats.skippedChunks++;
       return;
     }
+    
+    // Filter out garbage transcripts (noise, music, repeated words)
+    const cleanTranscript = transcript.trim();
+    if (cleanTranscript.length < 10) {
+      console.log(`[${feedName}] Transcript too short: "${cleanTranscript}"`);
+      scannerStats.skippedChunks++;
+      return;
+    }
+    
+    // Check for repeated word patterns (like "You You You You")
+    const words = cleanTranscript.split(/\s+/);
+    const uniqueWords = new Set(words.map(w => w.toLowerCase()));
+    if (words.length > 3 && uniqueWords.size <= 2) {
+      console.log(`[${feedName}] Skipping repetitive noise: "${cleanTranscript}"`);
+      scannerStats.skippedChunks++;
+      return;
+    }
+    
+    // Check for punctuation-only transcripts
+    if (/^[\s.,!?-]+$/.test(cleanTranscript)) {
+      console.log(`[${feedName}] Skipping punctuation-only: "${cleanTranscript}"`);
+      scannerStats.skippedChunks++;
+      return;
+    }
+    
+    // Check for common Whisper hallucinations on silence/noise
+    const hallucinations = [
+      'thank you', 'thanks for watching', 'subscribe', 'like and subscribe',
+      'you', 'bye', 'music', 'applause', 'silence'
+    ];
+    const lowerTranscript = cleanTranscript.toLowerCase();
+    if (hallucinations.some(h => lowerTranscript === h || lowerTranscript === h + '.')) {
+      console.log(`[${feedName}] Skipping likely hallucination: "${cleanTranscript}"`);
+      scannerStats.skippedChunks++;
+      return;
+    }
+    
+    // Success! Track stats
+    scannerStats.lastTranscriptTime = new Date().toISOString();
+    scannerStats.lastTranscript = cleanTranscript.substring(0, 200);
+    scannerStats.successfulTranscripts++;
     
     console.log(`[${feedName}] Transcript:`, transcript);
     
@@ -528,6 +605,23 @@ app.get('/incidents', (req, res) => {
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Debug endpoint for scanner status
+app.get('/debug', (req, res) => {
+  res.json({
+    scanner: {
+      ...scannerStats,
+      feeds: NYPD_FEEDS,
+      currentFeedIndex,
+      chunkDuration: CHUNK_DURATION + 'ms',
+      password_set: !!BROADCASTIFY_PASSWORD
+    },
+    connections: clients.size,
+    incidents: incidents.length,
+    cameras: cameras.length,
+    uptime: process.uptime() + 's'
+  });
 });
 
 // Start server
