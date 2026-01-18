@@ -527,18 +527,14 @@ app.get('/health', (req, res) => {
 // Start server
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
-  ╔═══════════════════════════════════════════════════════╗
-  ║                                                       ║
-  ║   🚨 DISPATCH - Police Scanner Intelligence           ║
-  ║   Running on port ${PORT}                                ║
-  ║                                                       ║
-  ║   WebSocket: ws://localhost:${PORT}                      ║
-  ║   REST API:  http://localhost:${PORT}                    ║
-  ║                                                       ║
-  ╚═══════════════════════════════════════════════════════╝
-  `);
-});
-
-  ╚═══════════════════════════════════════════════════════╝
+  ========================================================
+  
+     DISPATCH - Police Scanner Intelligence
+     Running on port ${PORT}
+  
+     WebSocket: ws://localhost:${PORT}
+     REST API:  http://localhost:${PORT}
+  
+  ========================================================
   `);
 });
