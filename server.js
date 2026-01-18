@@ -2,7 +2,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
+import OpenAI, { toFile } from 'openai';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import cors from 'cors';
@@ -77,11 +77,12 @@ fetchNYCCameras();
 const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
-// NYPD Feed IDs
+// NYPD Feed IDs - verified active feeds
 const NYPD_FEEDS = [
-  { id: '40184', name: 'NYPD Citywide 1' },
-  { id: '1189', name: 'NYPD Special Operations' },
-  { id: '36689', name: 'NYPD Manhattan 19, 23' },
+  { id: '9315', name: 'NYPD Citywide 1' },        // Most active - all boroughs
+  { id: '32284', name: 'NYPD Manhattan South' },  // Manhattan below 59th
+  { id: '30882', name: 'NYPD Brooklyn North' },   // Brooklyn busy areas
+  { id: '1189', name: 'NYPD Special Operations' }, // ESU, Aviation, etc
 ];
 
 let currentFeedIndex = 0;
@@ -130,8 +131,11 @@ async function startBroadcastifyStream() {
       // Process every CHUNK_DURATION ms
       if (Date.now() - lastProcessTime >= CHUNK_DURATION) {
         const fullBuffer = Buffer.concat(chunks);
+        const bufferSize = fullBuffer.length;
         chunks = [];
         lastProcessTime = Date.now();
+        
+        console.log(`[${feed.name}] Audio chunk: ${(bufferSize / 1024).toFixed(1)}KB`);
         
         // Process in background (don't await)
         processAudioFromStream(fullBuffer, feed.name);
@@ -156,15 +160,17 @@ async function startBroadcastifyStream() {
 
 async function processAudioFromStream(buffer, feedName) {
   if (buffer.length < 5000) {
-    // Too small, probably silence
+    console.log(`[${feedName}] Skipping - buffer too small: ${buffer.length} bytes`);
     return;
   }
   
   try {
     // Transcribe with Whisper
+    console.log(`[${feedName}] Sending ${(buffer.length / 1024).toFixed(1)}KB to Whisper...`);
     const transcript = await transcribeAudio(buffer);
     
     if (!transcript || transcript.trim().length < 10) {
+      console.log(`[${feedName}] Empty/short transcript: "${transcript || '(null)'}"`);
       return;
     }
     
@@ -327,8 +333,8 @@ Common codes: 10-50 = Accident, 10-31 = Crime in Progress, 10-52 = Medical, 10-3
 // Transcribe audio with Whisper
 async function transcribeAudio(audioBuffer) {
   try {
-    // Create a File-like object for the API
-    const file = new File([audioBuffer], "audio.mp3", { type: "audio/mpeg" });
+    // Use OpenAI's toFile utility for Node.js compatibility
+    const file = await toFile(audioBuffer, 'audio.mp3', { type: 'audio/mpeg' });
     
     const transcription = await openai.audio.transcriptions.create({
       file: file,
@@ -338,7 +344,7 @@ async function transcribeAudio(audioBuffer) {
 
     return transcription.text;
   } catch (error) {
-    console.error("Whisper transcription error:", error);
+    console.error("Whisper transcription error:", error.message);
     return null;
   }
 }
