@@ -71,81 +71,111 @@ async function fetchNYCCameras() {
 fetchNYCCameras();
 
 // ============================================
-// OpenMHz Scanner Scraper - Auto-fetch NYPD calls
+// Broadcastify Live Scanner - NYPD Feeds
 // ============================================
 
-let lastCallTime = Date.now();
-const OPENMHZ_SYSTEM = 'nypd'; // NYPD system on OpenMHz
-const POLL_INTERVAL = 15000; // Poll every 15 seconds
+const BROADCASTIFY_USERNAME = 'whitefang123';
+const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
-async function fetchNewCalls() {
+// NYPD Feed IDs
+const NYPD_FEEDS = [
+  { id: '40184', name: 'NYPD Citywide 1' },
+  { id: '1189', name: 'NYPD Special Operations' },
+  { id: '36689', name: 'NYPD Manhattan 19, 23' },
+];
+
+let currentFeedIndex = 0;
+let audioBuffer = [];
+let lastProcessTime = Date.now();
+const CHUNK_DURATION = 15000; // Process every 15 seconds
+
+async function startBroadcastifyStream() {
+  if (!BROADCASTIFY_PASSWORD) {
+    console.log('BROADCASTIFY_PASSWORD not set - scanner disabled');
+    return;
+  }
+
+  const feed = NYPD_FEEDS[currentFeedIndex];
+  const streamUrl = `https://${BROADCASTIFY_USERNAME}:${BROADCASTIFY_PASSWORD}@audio.broadcastify.com/${feed.id}.mp3`;
+  
+  console.log(`Connecting to Broadcastify feed: ${feed.name} (${feed.id})`);
+
   try {
-    // Convert timestamp to OpenMHz format (milliseconds as integer)
-    const timeParam = lastCallTime;
-    const url = `https://api.openmhz.com/${OPENMHZ_SYSTEM}/calls/newer?time=${timeParam}`;
+    const response = await fetch(streamUrl);
     
-    const response = await fetch(url);
     if (!response.ok) {
-      console.log('OpenMHz API error:', response.status);
+      console.error(`Broadcastify stream error: ${response.status}`);
+      // Try next feed
+      currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+      setTimeout(startBroadcastifyStream, 5000);
       return;
     }
+
+    const reader = response.body.getReader();
     
-    const data = await response.json();
-    const calls = data.calls || [];
-    
-    if (calls.length === 0) {
-      return;
-    }
-    
-    console.log(`Fetched ${calls.length} new calls from OpenMHz`);
-    
-    // Update last call time to most recent
-    if (calls.length > 0) {
-      const mostRecent = calls[0];
-      lastCallTime = new Date(mostRecent.time).getTime();
-    }
-    
-    // Process each call
-    for (const call of calls.slice(0, 5)) { // Limit to 5 per poll to avoid overload
-      await processOpenMHzCall(call);
-    }
+    const processStream = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          
+          if (done) {
+            console.log('Stream ended, reconnecting...');
+            setTimeout(startBroadcastifyStream, 2000);
+            return;
+          }
+          
+          // Accumulate audio data
+          audioBuffer.push(value);
+          
+          // Process every CHUNK_DURATION ms
+          if (Date.now() - lastProcessTime >= CHUNK_DURATION) {
+            const fullBuffer = Buffer.concat(audioBuffer);
+            audioBuffer = [];
+            lastProcessTime = Date.now();
+            
+            // Process in background
+            processAudioFromStream(fullBuffer, feed.name);
+          }
+        }
+      } catch (error) {
+        console.error('Stream read error:', error.message);
+        setTimeout(startBroadcastifyStream, 5000);
+      }
+    };
+
+    processStream();
     
   } catch (error) {
-    console.error('OpenMHz fetch error:', error.message);
+    console.error('Broadcastify connection error:', error.message);
+    setTimeout(startBroadcastifyStream, 10000);
   }
 }
 
-async function processOpenMHzCall(call) {
+async function processAudioFromStream(buffer, feedName) {
+  if (buffer.length < 5000) {
+    // Too small, probably silence
+    return;
+  }
+  
   try {
-    // Download the audio file
-    const audioUrl = call.url;
-    if (!audioUrl) return;
-    
-    console.log(`Processing call from talkgroup ${call.talkgroupNum}: ${audioUrl}`);
-    
-    const audioResponse = await fetch(audioUrl);
-    if (!audioResponse.ok) return;
-    
-    const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
-    
     // Transcribe with Whisper
-    const transcript = await transcribeAudio(audioBuffer);
+    const transcript = await transcribeAudio(buffer);
+    
     if (!transcript || transcript.trim().length < 10) {
-      console.log('Transcript too short, skipping');
       return;
     }
     
-    console.log('Transcript:', transcript);
+    console.log(`[${feedName}] Transcript:`, transcript);
     
-    // Broadcast transcript to all clients
+    // Broadcast transcript
     broadcast({
       type: "transcript",
       text: transcript,
-      talkgroup: call.talkgroupNum,
-      timestamp: call.time || new Date().toISOString()
+      source: feedName,
+      timestamp: new Date().toISOString()
     });
     
-    // Parse with Claude for incidents
+    // Parse with Claude
     const parsed = await parseTranscript(transcript);
     
     if (parsed.hasIncident) {
@@ -156,22 +186,19 @@ async function processOpenMHzCall(call) {
         id: incidentId,
         ...parsed,
         camera: camera,
-        talkgroup: call.talkgroupNum,
-        audioUrl: audioUrl,
-        timestamp: call.time || new Date().toISOString(),
+        source: feedName,
+        timestamp: new Date().toISOString(),
         status: "ACTIVE"
       };
       
       incidents.unshift(incident);
       if (incidents.length > 50) incidents.pop();
       
-      // Broadcast incident
       broadcast({
         type: "incident",
         incident: incident
       });
       
-      // Broadcast camera switch
       if (camera) {
         broadcast({
           type: "camera_switch",
@@ -183,7 +210,6 @@ async function processOpenMHzCall(call) {
       console.log('Incident detected:', incident);
     }
     
-    // Broadcast AI analysis
     broadcast({
       type: "analysis",
       text: parsed.hasIncident 
@@ -193,15 +219,13 @@ async function processOpenMHzCall(call) {
     });
     
   } catch (error) {
-    console.error('Error processing OpenMHz call:', error.message);
+    console.error('Audio processing error:', error.message);
   }
 }
 
-// Start polling OpenMHz
-console.log('Starting OpenMHz scanner scraper...');
-setInterval(fetchNewCalls, POLL_INTERVAL);
-// Initial fetch
-setTimeout(fetchNewCalls, 5000);
+// Start scanner after a delay
+console.log('Starting Broadcastify scanner in 5 seconds...');
+setTimeout(startBroadcastifyStream, 5000);
 
 // Incident log
 const incidents = [];
