@@ -96,12 +96,19 @@ async function startBroadcastifyStream() {
   }
 
   const feed = NYPD_FEEDS[currentFeedIndex];
-  const streamUrl = `https://${BROADCASTIFY_USERNAME}:${BROADCASTIFY_PASSWORD}@audio.broadcastify.com/${feed.id}.mp3`;
+  const streamUrl = `https://audio.broadcastify.com/${feed.id}.mp3`;
+  
+  // Create Basic Auth header
+  const authString = Buffer.from(`${BROADCASTIFY_USERNAME}:${BROADCASTIFY_PASSWORD}`).toString('base64');
   
   console.log(`Connecting to Broadcastify feed: ${feed.name} (${feed.id})`);
 
   try {
-    const response = await fetch(streamUrl);
+    const response = await fetch(streamUrl, {
+      headers: {
+        'Authorization': `Basic ${authString}`
+      }
+    });
     
     if (!response.ok) {
       console.error(`Broadcastify stream error: ${response.status}`);
@@ -111,6 +118,7 @@ async function startBroadcastifyStream() {
       return;
     }
 
+    console.log(`Connected to ${feed.name}! Streaming audio...`);
     const reader = response.body.getReader();
     
     const processStream = async () => {
