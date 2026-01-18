@@ -7,8 +7,105 @@ import OpenAI, { toFile } from 'openai';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
+
+// ============================================
+// PERSISTENCE - Save incidents to file
+// ============================================
+const DATA_DIR = process.env.DATA_DIR || './data';
+const INCIDENTS_FILE = path.join(DATA_DIR, 'incidents.json');
+const TRANSCRIPTS_FILE = path.join(DATA_DIR, 'transcripts.json');
+const DETECTIVE_FILE = path.join(DATA_DIR, 'detective.json');
+const MAX_INCIDENT_AGE_HOURS = 6; // Keep incidents for 6 hours
+
+// Ensure data directory exists
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function loadIncidents() {
+  try {
+    if (fs.existsSync(INCIDENTS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(INCIDENTS_FILE, 'utf8'));
+      const cutoff = Date.now() - (MAX_INCIDENT_AGE_HOURS * 60 * 60 * 1000);
+      // Filter out old incidents
+      return data.filter(inc => new Date(inc.timestamp).getTime() > cutoff);
+    }
+  } catch (error) {
+    console.error('[PERSISTENCE] Error loading incidents:', error.message);
+  }
+  return [];
+}
+
+function saveIncidents(incidents) {
+  try {
+    fs.writeFileSync(INCIDENTS_FILE, JSON.stringify(incidents.slice(0, 100), null, 2));
+  } catch (error) {
+    console.error('[PERSISTENCE] Error saving incidents:', error.message);
+  }
+}
+
+function loadTranscripts() {
+  try {
+    if (fs.existsSync(TRANSCRIPTS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TRANSCRIPTS_FILE, 'utf8'));
+      const cutoff = Date.now() - (MAX_INCIDENT_AGE_HOURS * 60 * 60 * 1000);
+      return data.filter(t => new Date(t.timestamp).getTime() > cutoff);
+    }
+  } catch (error) {
+    console.error('[PERSISTENCE] Error loading transcripts:', error.message);
+  }
+  return [];
+}
+
+function saveTranscripts(transcripts) {
+  try {
+    fs.writeFileSync(TRANSCRIPTS_FILE, JSON.stringify(transcripts.slice(0, 50), null, 2));
+  } catch (error) {
+    console.error('[PERSISTENCE] Error saving transcripts:', error.message);
+  }
+}
+
+function loadDetectiveState() {
+  try {
+    if (fs.existsSync(DETECTIVE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(DETECTIVE_FILE, 'utf8'));
+      const cutoff = Date.now() - (MAX_INCIDENT_AGE_HOURS * 60 * 60 * 1000);
+      // Filter old data
+      if (data.patterns) {
+        data.patterns = data.patterns.filter(p => new Date(p.detectedAt).getTime() > cutoff);
+      }
+      if (data.predictions) {
+        data.predictions = data.predictions.filter(p => new Date(p.createdAt).getTime() > cutoff);
+      }
+      return data;
+    }
+  } catch (error) {
+    console.error('[PERSISTENCE] Error loading detective state:', error.message);
+  }
+  return null;
+}
+
+function saveDetectiveState(bureau) {
+  try {
+    const state = {
+      patterns: bureau.memory.patterns.slice(0, 50),
+      predictions: bureau.predictionStats.pending.slice(0, 20),
+      predictionStats: {
+        total: bureau.predictionStats.total,
+        correct: bureau.predictionStats.correct
+      },
+      hotspots: Array.from(bureau.memory.hotspots.entries()).slice(0, 100),
+      savedAt: new Date().toISOString()
+    };
+    fs.writeFileSync(DETECTIVE_FILE, JSON.stringify(state, null, 2));
+  } catch (error) {
+    console.error('[PERSISTENCE] Error saving detective state:', error.message);
+  }
+}
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
@@ -549,9 +646,52 @@ Pending predictions: ${JSON.stringify(this.predictionStats.pending)}`
       return { error: error.message, stats, agents: this.getAgentStatuses() };
     }
   }
+
+  restoreState(savedState) {
+    if (!savedState) return;
+    
+    try {
+      if (savedState.patterns && Array.isArray(savedState.patterns)) {
+        this.memory.patterns = savedState.patterns;
+        console.log(`[DETECTIVE] Restored ${savedState.patterns.length} patterns`);
+      }
+      
+      if (savedState.predictions && Array.isArray(savedState.predictions)) {
+        this.predictionStats.pending = savedState.predictions;
+        console.log(`[DETECTIVE] Restored ${savedState.predictions.length} pending predictions`);
+      }
+      
+      if (savedState.predictionStats) {
+        this.predictionStats.total = savedState.predictionStats.total || 0;
+        this.predictionStats.correct = savedState.predictionStats.correct || 0;
+        console.log(`[DETECTIVE] Restored prediction stats: ${this.getAccuracy()} accuracy`);
+      }
+      
+      if (savedState.hotspots && Array.isArray(savedState.hotspots)) {
+        this.memory.hotspots = new Map(savedState.hotspots);
+        console.log(`[DETECTIVE] Restored ${savedState.hotspots.length} hotspots`);
+      }
+    } catch (error) {
+      console.error('[DETECTIVE] Error restoring state:', error.message);
+    }
+  }
 }
 
 const detectiveBureau = new DetectiveBureau(anthropic);
+
+// Restore detective bureau state from persistence
+const savedDetectiveState = loadDetectiveState();
+if (savedDetectiveState) {
+  detectiveBureau.restoreState(savedDetectiveState);
+  // Also restore incidents to detective memory
+  detectiveBureau.memory.incidents = incidents.slice(0, 200);
+  console.log(`[DETECTIVE] Restored ${incidents.length} incidents to memory`);
+}
+
+// Periodically save detective state (every 2 minutes)
+setInterval(() => {
+  saveDetectiveState(detectiveBureau);
+}, 2 * 60 * 1000);
 
 // ============================================
 // BETTING SYSTEM
@@ -598,12 +738,14 @@ const betHistory = [];
 // ============================================
 
 let cameras = [];
-const incidents = [];
-let incidentId = 0;
-const recentTranscripts = [];
-const MAX_TRANSCRIPTS = 20;
+const incidents = loadIncidents(); // Load persisted incidents on startup
+let incidentId = incidents.length > 0 ? Math.max(...incidents.map(i => i.id || 0)) + 1 : 1;
+const recentTranscripts = loadTranscripts(); // Load persisted transcripts
+const MAX_TRANSCRIPTS = 50;
 const audioClips = new Map();
 const MAX_AUDIO_CLIPS = 50;
+
+console.log(`[PERSISTENCE] Loaded ${incidents.length} incidents, ${recentTranscripts.length} transcripts from storage`);
 
 async function fetchNYCCameras() {
   try {
@@ -796,10 +938,9 @@ Respond ONLY with valid JSON:
         parsed.borough = 'Unknown';
       }
       
-      // If we still don't have a valid borough, don't treat this as an incident
+      // Log when we have an incident without a borough for debugging
       if (parsed.borough === 'Unknown' && parsed.hasIncident) {
-        console.log('[PARSE] Incident detected but no borough - downgrading to monitoring');
-        parsed.hasIncident = false;
+        console.log('[PARSE] Incident detected but no borough identified - keeping as incident');
       }
       
       return parsed;
@@ -898,13 +1039,14 @@ async function processAudioFromStream(buffer, feedName) {
   const clean = transcript.trim();
   const lower = clean.toLowerCase();
   
-  // Filter out noise - expanded list
-  const noise = ['thank you', 'thanks for watching', 'subscribe', 'you', 'bye', 'music', 'for more'];
+  // Filter out noise - but don't be too aggressive
+  const noise = ['thank you', 'thanks for watching', 'subscribe', 'bye', 'music'];
   if (noise.some(n => lower === n || lower === n + '.')) return;
   if (lower.includes('broadcastify') || lower.includes('fema.gov')) return;
-  if (lower.includes('www.') || lower.includes('.org') || lower.includes('.com') || lower.includes('.gov')) return;
-  if (lower.includes('un videos') || lower.includes('united nations')) return;
-  if (lower.includes('visit') && lower.includes('more')) return;
+  if (lower.includes('un videos') || lower.includes('for more un videos')) return;
+  // Only filter URLs if they're the main content, not mentioned in passing
+  if (lower.startsWith('for more') && (lower.includes('.org') || lower.includes('.com'))) return;
+  if (clean.length < 15 && (lower.includes('www.') || lower.includes('.org'))) return;
   
   scannerStats.lastTranscript = clean.substring(0, 200);
   scannerStats.successfulTranscripts++;
@@ -912,6 +1054,7 @@ async function processAudioFromStream(buffer, feedName) {
   const transcriptEntry = { text: clean, source: feedName, timestamp: new Date().toISOString() };
   recentTranscripts.unshift(transcriptEntry);
   if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
+  saveTranscripts(recentTranscripts); // Persist transcripts
   
   broadcast({ type: "transcript", ...transcriptEntry });
   
@@ -938,10 +1081,16 @@ async function processAudioFromStream(buffer, feedName) {
     };
     
     incidents.unshift(incident);
-    if (incidents.length > 50) incidents.pop();
+    if (incidents.length > 100) incidents.pop();
+    
+    // Persist incidents to disk
+    saveIncidents(incidents);
     
     // Process through Detective Bureau
     detectiveBureau.processIncident(incident, broadcast);
+    
+    // Save detective state after processing (patterns, predictions may have changed)
+    saveDetectiveState(detectiveBureau);
     
     // Check bets
     checkBetsForIncident(incident);
@@ -1098,15 +1247,35 @@ app.get('/debug', (req, res) => res.json({ scanner: scannerStats, connections: c
 // WebSocket
 wss.on('connection', (ws) => {
   clients.add(ws);
-  ws.send(JSON.stringify({
+  
+  // Send comprehensive init data so new users see activity
+  const initData = {
     type: "init",
-    incidents: incidents.slice(0, 20),
+    incidents: incidents.slice(0, 30), // More incidents for new users
     cameras,
-    transcripts: recentTranscripts.slice(0, 10),
+    transcripts: recentTranscripts.slice(0, 30), // More transcripts
     currentFeed: NYPD_FEEDS[currentFeedIndex]?.name,
     agents: detectiveBureau.getAgentStatuses(),
-    predictions: detectiveBureau.getPredictionStats()
-  }));
+    predictions: detectiveBureau.getPredictionStats(),
+    patterns: detectiveBureau.memory.patterns.filter(p => p.status === 'active').slice(0, 10),
+    hotspots: Array.from(detectiveBureau.memory.hotspots.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 20)
+      .map(([key, count]) => {
+        const [borough, location] = key.split('-');
+        return { borough, location, count };
+      }),
+    stats: {
+      totalIncidents: incidents.length,
+      activePatterns: detectiveBureau.memory.patterns.filter(p => p.status === 'active').length,
+      predictionAccuracy: detectiveBureau.getAccuracy(),
+      uptime: process.uptime()
+    }
+  };
+  
+  ws.send(JSON.stringify(initData));
+  console.log(`[WS] New client connected. Sent ${initData.incidents.length} incidents, ${initData.transcripts.length} transcripts`);
+  
   ws.on('close', () => clients.delete(ws));
   ws.on('message', async (message) => {
     try {
@@ -1119,6 +1288,8 @@ wss.on('connection', (ws) => {
           const camera = findNearestCamera(parsed.location, null, null, parsed.borough);
           const incident = { id: incidentId, ...parsed, camera, lat: camera?.lat, lng: camera?.lng, timestamp: new Date().toISOString() };
           incidents.unshift(incident);
+          if (incidents.length > 100) incidents.pop();
+          saveIncidents(incidents);
           detectiveBureau.processIncident(incident, broadcast);
           checkBetsForIncident(incident);
           broadcast({ type: "incident", incident });
@@ -1136,6 +1307,7 @@ server.listen(PORT, '0.0.0.0', () => {
 ║  Port: ${PORT}                                            ║
 ║  Agents: CHASE | PATTERN | PROPHET | HISTORIAN         ║
 ║  Chunk Duration: ${CHUNK_DURATION/1000}s (improved for full transmissions)  ║
+║  Loaded Incidents: ${incidents.length} (persisted ${MAX_INCIDENT_AGE_HOURS}h)              ║
 ╚════════════════════════════════════════════════════════╝
   `);
 });
