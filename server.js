@@ -299,6 +299,9 @@ async function processAudioFromStream(buffer, feedName) {
         transcript: cleanTranscript,
         audioUrl: `/audio/${audioId}`,
         camera: camera,
+        // Add coordinates directly for easier frontend access
+        lat: camera?.lat || null,
+        lng: camera?.lng || null,
         source: feedName,
         timestamp: new Date().toISOString()
       };
@@ -321,7 +324,6 @@ async function processAudioFromStream(buffer, feedName) {
       }
       
       console.log('Incident detected:', incident.incidentType, '@', incident.location, '- Priority:', incident.priority);
-    }
     }
     
     broadcast({
@@ -524,6 +526,8 @@ async function processAudioChunk(audioBuffer) {
       id: incidentId,
       ...parsed,
       camera: camera,
+      lat: camera?.lat || null,
+      lng: camera?.lng || null,
       timestamp: new Date().toISOString(),
       status: "ACTIVE"
     };
@@ -601,6 +605,8 @@ wss.on('connection', (ws) => {
             id: incidentId,
             ...parsed,
             camera: camera,
+            lat: camera?.lat || null,
+            lng: camera?.lng || null,
             timestamp: new Date().toISOString(),
             status: "ACTIVE"
           };
@@ -700,14 +706,6 @@ app.get('/stream/live', (req, res) => {
   
   console.log(`[Stream Proxy] Client requesting live stream: ${feedInfo.name} (${feedId})`);
 
-  // Set headers for audio streaming
-  res.set({
-    'Content-Type': 'audio/mpeg',
-    'Cache-Control': 'no-cache, no-store',
-    'Connection': 'keep-alive',
-    'Transfer-Encoding': 'chunked',
-  });
-
   const options = {
     hostname: 'audio.broadcastify.com',
     port: 443,
@@ -728,6 +726,13 @@ app.get('/stream/live', (req, res) => {
 
     console.log(`[Stream Proxy] Connected to ${feedInfo.name}, streaming to client...`);
     
+    // Set headers only after successful connection
+    res.set({
+      'Content-Type': 'audio/mpeg',
+      'Cache-Control': 'no-cache, no-store',
+      'Connection': 'keep-alive',
+    });
+    
     // Pipe the audio stream to the client
     proxyRes.pipe(res);
 
@@ -737,6 +742,7 @@ app.get('/stream/live', (req, res) => {
 
     proxyRes.on('error', (err) => {
       console.error(`[Stream Proxy] Stream error:`, err.message);
+      res.end();
     });
   });
 
