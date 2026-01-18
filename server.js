@@ -1,6 +1,7 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
+import https from 'https';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI, { toFile } from 'openai';
 import fetch from 'node-fetch';
@@ -79,10 +80,11 @@ const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
 // NYPD Feed IDs - verified active feeds from broadcastify.com/listen/ctid/1855
 const NYPD_FEEDS = [
-  { id: '40184', name: 'NYPD Citywide 1' },        // Most active - all boroughs
-  { id: '40185', name: 'NYPD Citywide 2' },        // Secondary citywide
-  { id: '40186', name: 'NYPD Citywide 3' },        // Third citywide channel
-  { id: '1189', name: 'NYPD Bronx/Manhattan Transit' }, // Transit division
+  { id: '40184', name: 'NYPD Citywide 1' },              // Most listeners - all boroughs
+  { id: '40185', name: 'NYPD Citywide 2' },
+  { id: '40186', name: 'NYPD Citywide 3' },
+  { id: '1189', name: 'NYPD Bronx/Manhattan Transit' },  // ESU, Harbor, K-9
+  { id: '7392', name: 'Hatzolah EMS Dispatch' },         // EMS backup
 ];
 
 // Scanner stats for debug endpoint
@@ -101,7 +103,7 @@ let scannerStats = {
 let currentFeedIndex = 0;
 let audioBuffer = [];
 let lastProcessTime = Date.now();
-const CHUNK_DURATION = 15000; // Process every 15 seconds
+const CHUNK_DURATION = 30000; // Process every 30 seconds for more content
 
 async function startBroadcastifyStream() {
   if (!BROADCASTIFY_PASSWORD) {
@@ -111,43 +113,47 @@ async function startBroadcastifyStream() {
 
   const feed = NYPD_FEEDS[currentFeedIndex];
   
-  // Try URL-embedded credentials (works better with Broadcastify)
-  const streamUrl = `https://${encodeURIComponent(BROADCASTIFY_USERNAME)}:${encodeURIComponent(BROADCASTIFY_PASSWORD)}@audio.broadcastify.com/${feed.id}.mp3`;
-  
   console.log(`Connecting to Broadcastify feed: ${feed.name} (${feed.id})`);
 
-  try {
-    const response = await fetch(streamUrl);
+  // Use native https module which properly supports auth
+  const options = {
+    hostname: 'audio.broadcastify.com',
+    port: 443,
+    path: `/${feed.id}.mp3`,
+    method: 'GET',
+    auth: `${BROADCASTIFY_USERNAME}:${BROADCASTIFY_PASSWORD}`,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+  };
+
+  const req = https.request(options, (res) => {
+    console.log(`Broadcastify response: ${res.statusCode} ${res.statusMessage}`);
     
-    if (!response.ok) {
-      console.error(`Broadcastify stream error: ${response.status} - trying header auth...`);
-      
-      // Fallback to header-based auth
-      const authString = Buffer.from(`${BROADCASTIFY_USERNAME}:${BROADCASTIFY_PASSWORD}`).toString('base64');
-      const fallbackUrl = `https://audio.broadcastify.com/${feed.id}.mp3`;
-      const fallbackResponse = await fetch(fallbackUrl, {
-        headers: { 'Authorization': `Basic ${authString}` }
-      });
-      
-      if (!fallbackResponse.ok) {
-        console.error(`Fallback also failed: ${fallbackResponse.status}`);
-        // Try next feed
-        currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
-        setTimeout(startBroadcastifyStream, 5000);
-        return;
-      }
-      
-      // Use fallback response
-      handleStream(fallbackResponse.body, feed);
+    if (res.statusCode === 401 || res.statusCode === 403) {
+      console.error('Auth failed - check username/password');
+      currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+      setTimeout(startBroadcastifyStream, 10000);
+      return;
+    }
+    
+    if (res.statusCode !== 200) {
+      console.error(`Broadcastify stream error: ${res.statusCode}`);
+      currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+      setTimeout(startBroadcastifyStream, 5000);
       return;
     }
 
-    handleStream(response.body, feed);
-    
-  } catch (error) {
+    handleStream(res, feed);
+  });
+
+  req.on('error', (error) => {
     console.error('Broadcastify connection error:', error.message);
+    currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
     setTimeout(startBroadcastifyStream, 10000);
-  }
+  });
+
+  req.end();
 }
 
 function handleStream(stream, feed) {
@@ -192,8 +198,8 @@ function handleStream(stream, feed) {
 }
 
 async function processAudioFromStream(buffer, feedName) {
-  // Need at least ~10KB for meaningful audio (about 5 seconds at low bitrate)
-  if (buffer.length < 10000) {
+  // Need at least ~5KB for meaningful audio
+  if (buffer.length < 5000) {
     console.log(`[${feedName}] Skipping - buffer too small: ${buffer.length} bytes`);
     scannerStats.skippedChunks++;
     return;
