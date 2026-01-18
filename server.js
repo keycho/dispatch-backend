@@ -252,6 +252,15 @@ async function processAudioFromStream(buffer, feedName) {
       return;
     }
     
+    // Filter out transcripts that are mostly "you" repetitions (Whisper artifact)
+    const youCount = (lowerTranscript.match(/\byou\b/g) || []).length;
+    const wordCount = words.length;
+    if (youCount > 3 && youCount / wordCount > 0.3) {
+      console.log(`[${feedName}] Skipping you-heavy transcript (${youCount}/${wordCount} words): "${cleanTranscript.substring(0, 50)}..."`);
+      scannerStats.skippedChunks++;
+      return;
+    }
+    
     // Success! Track stats
     scannerStats.lastTranscriptTime = new Date().toISOString();
     scannerStats.lastTranscript = cleanTranscript.substring(0, 200);
