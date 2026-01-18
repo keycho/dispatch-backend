@@ -252,6 +252,21 @@ async function processAudioFromStream(buffer, feedName) {
       return;
     }
     
+    // Filter out Broadcastify ads and PSAs
+    const adPatterns = [
+      'fema.gov', 'fema gov', 'broadcastify', 'radioreference',
+      'for more information visit', 'visit www', 'visit http',
+      'this stream', 'this feed', 'premium subscriber',
+      'brought to you by', 'sponsored by', 'support this feed',
+      'emergency alert system', 'this is a test', 'only a test',
+      'ready.gov', 'weather.gov', 'public service announcement'
+    ];
+    if (adPatterns.some(pattern => lowerTranscript.includes(pattern))) {
+      console.log(`[${feedName}] Skipping ad/PSA: "${cleanTranscript.substring(0, 50)}..."`);
+      scannerStats.skippedChunks++;
+      return;
+    }
+    
     // Filter out transcripts that are mostly "you" repetitions (Whisper artifact)
     const youCount = (lowerTranscript.match(/\byou\b/g) || []).length;
     const wordCount = words.length;
