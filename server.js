@@ -814,6 +814,31 @@ function isPromptEcho(text) {
   return false;
 }
 
+// Detect Whisper repetition loops (e.g., "7-8-0. 7-8-0. 7-8-0.")
+function isRepetitionLoop(text) {
+  // Check for repeated short patterns
+  const patterns = [
+    /(\d-\d-\d\.?\s*){4,}/,  // "7-8-0. 7-8-0. 7-8-0. 7-8-0."
+    /(\b\w{2,6}\b[.\s]+)\1{3,}/i,  // Any word repeated 4+ times
+    /(.{3,10})\1{4,}/,  // Any 3-10 char pattern repeated 5+ times
+  ];
+  
+  for (const pattern of patterns) {
+    if (pattern.test(text)) return true;
+  }
+  
+  // Check if more than 50% of the text is the same short phrase
+  const words = text.split(/\s+/);
+  if (words.length > 6) {
+    const wordCounts = {};
+    words.forEach(w => { wordCounts[w] = (wordCounts[w] || 0) + 1; });
+    const maxCount = Math.max(...Object.values(wordCounts));
+    if (maxCount > words.length * 0.5) return true;
+  }
+  
+  return false;
+}
+
 function forceNextFeed() {
   console.log(`[SCANNER] Force switching to next feed...`);
   if (currentStream) {
@@ -1151,6 +1176,17 @@ async function processAudioFromStream(buffer, feedName) {
     return;
   }
   
+  // Detect Whisper repetition loops (garbled audio)
+  if (isRepetitionLoop(clean)) {
+    console.log(`[SCANNER] Filtered: Whisper repetition loop (garbled audio)`);
+    consecutivePSAs++;
+    if (consecutivePSAs >= 3) {
+      console.log(`[SCANNER] Too much garbled audio on ${SCANNER_FEEDS[currentFeedIndex].name}, forcing feed switch...`);
+      forceNextFeed();
+    }
+    return;
+  }
+  
   if (lower.includes('broadcastify') || lower.includes('fema.gov') || lower.includes('fema gov') || lower.includes('for more information')) {
     console.log(`[SCANNER] Filtered: PSA/ad content`);
     consecutivePSAs++;
@@ -1188,6 +1224,7 @@ async function processAudioFromStream(buffer, feedName) {
   broadcast({ type: "transcript", ...transcriptEntry });
   
   const parsed = await parseTranscript(clean);
+  console.log(`[PARSER] Result: hasIncident=${parsed.hasIncident}, type=${parsed.incidentType || 'none'}, location=${parsed.location || 'none'}, borough=${parsed.borough || 'none'}`);
   
   if (parsed.hasIncident) {
     incidentId++;
