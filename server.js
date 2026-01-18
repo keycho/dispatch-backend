@@ -331,6 +331,9 @@ async function processAudioFromStream(buffer, feedName) {
       incidents.unshift(incident);
       if (incidents.length > 50) incidents.pop();
       
+      // Check if any bets won
+      checkBetsForIncident(incident);
+      
       // Store for pattern analysis
       recentIncidentsForAnalysis.unshift({
         id: incident.id,
@@ -709,6 +712,9 @@ async function processAudioChunk(audioBuffer) {
     
     incidents.unshift(incident);
     if (incidents.length > 50) incidents.pop();
+    
+    // Check if any bets won
+    checkBetsForIncident(incident);
 
     // Broadcast incident
     broadcast({
@@ -789,6 +795,9 @@ wss.on('connection', (ws) => {
           };
           
           incidents.unshift(incident);
+          
+          // Check if any bets won
+          checkBetsForIncident(incident);
           
           broadcast({
             type: "incident",
@@ -946,6 +955,232 @@ app.get('/stream/feeds', (req, res) => {
     currentFeed: NYPD_FEEDS[currentFeedIndex],
     streamUrl: '/stream/live'
   });
+});
+
+// ============================================
+// SOLANA BETTING SYSTEM
+// ============================================
+
+// Active bets pool
+const activeBets = new Map();
+const userProfiles = new Map();
+const betHistory = [];
+
+// Verify a Solana signature (for wallet auth)
+app.post('/auth/verify', express.json(), (req, res) => {
+  const { walletAddress, signature, message } = req.body;
+  
+  if (!walletAddress) {
+    return res.status(400).json({ error: 'Wallet address required' });
+  }
+  
+  // In production, verify the signature matches the wallet
+  // For now, trust the client (add @solana/web3.js for real verification)
+  
+  // Create or get user profile
+  let profile = userProfiles.get(walletAddress);
+  if (!profile) {
+    profile = {
+      walletAddress: walletAddress,
+      displayName: `detective_${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)}`,
+      score: 0,
+      totalBets: 0,
+      wins: 0,
+      totalWinnings: 0,
+      createdAt: new Date().toISOString()
+    };
+    userProfiles.set(walletAddress, profile);
+  }
+  
+  res.json({ 
+    success: true, 
+    profile,
+    activeBets: Array.from(activeBets.values()).filter(b => b.walletAddress === walletAddress)
+  });
+});
+
+// Place a bet
+app.post('/bet/place', express.json(), (req, res) => {
+  const { walletAddress, borough, incidentType, amount, timeWindow, txSignature } = req.body;
+  
+  if (!walletAddress || !borough || !amount) {
+    return res.status(400).json({ error: 'walletAddress, borough, and amount required' });
+  }
+  
+  // Validate amount (minimum 0.01 SOL = 10000000 lamports)
+  const lamports = parseInt(amount);
+  if (lamports < 10000000) {
+    return res.status(400).json({ error: 'Minimum bet is 0.01 SOL' });
+  }
+  
+  // Check if user already has active bet
+  const existingBet = Array.from(activeBets.values()).find(
+    b => b.walletAddress === walletAddress && b.status === 'ACTIVE'
+  );
+  if (existingBet) {
+    return res.status(400).json({ error: 'You already have an active bet', bet: existingBet });
+  }
+  
+  const betId = `bet_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const bet = {
+    id: betId,
+    walletAddress,
+    borough,
+    incidentType: incidentType || 'any',
+    amount: lamports,
+    amountSOL: lamports / 1000000000,
+    timeWindow: timeWindow || 30, // minutes
+    txSignature, // Solana transaction signature
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + (timeWindow || 30) * 60 * 1000).toISOString(),
+    status: 'ACTIVE',
+    potentialWin: lamports * 2 // 2x payout for correct prediction
+  };
+  
+  activeBets.set(betId, bet);
+  
+  // Update user profile
+  const profile = userProfiles.get(walletAddress);
+  if (profile) {
+    profile.totalBets++;
+  }
+  
+  console.log(`[Betting] New bet: ${bet.amountSOL} SOL on ${borough} by ${walletAddress.slice(0, 8)}...`);
+  
+  // Broadcast to show live betting action
+  broadcast({
+    type: 'new_bet',
+    bet: {
+      id: bet.id,
+      borough: bet.borough,
+      amount: bet.amountSOL,
+      user: `${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)}`
+    },
+    timestamp: new Date().toISOString()
+  });
+  
+  res.json({ success: true, bet });
+});
+
+// Get betting pool stats
+app.get('/bet/pool', (req, res) => {
+  const active = Array.from(activeBets.values()).filter(b => b.status === 'ACTIVE');
+  
+  const poolByBorough = {};
+  active.forEach(bet => {
+    if (!poolByBorough[bet.borough]) {
+      poolByBorough[bet.borough] = { total: 0, count: 0 };
+    }
+    poolByBorough[bet.borough].total += bet.amount;
+    poolByBorough[bet.borough].count++;
+  });
+  
+  const totalPool = active.reduce((sum, b) => sum + b.amount, 0);
+  
+  res.json({
+    totalPool: totalPool / 1000000000, // In SOL
+    totalBets: active.length,
+    poolByBorough: Object.fromEntries(
+      Object.entries(poolByBorough).map(([k, v]) => [k, { 
+        total: v.total / 1000000000, 
+        count: v.count 
+      }])
+    ),
+    recentWinners: betHistory.filter(b => b.status === 'WON').slice(0, 5)
+  });
+});
+
+// Get user's betting history
+app.get('/bet/history/:walletAddress', (req, res) => {
+  const wallet = req.params.walletAddress;
+  const userBets = betHistory.filter(b => b.walletAddress === wallet);
+  const profile = userProfiles.get(wallet);
+  
+  res.json({
+    profile,
+    bets: userBets.slice(0, 50),
+    activeBet: Array.from(activeBets.values()).find(b => b.walletAddress === wallet && b.status === 'ACTIVE')
+  });
+});
+
+// Check and resolve bets when incident comes in
+function checkBetsForIncident(incident) {
+  const now = new Date();
+  
+  activeBets.forEach((bet, betId) => {
+    if (bet.status !== 'ACTIVE') return;
+    
+    const expiresAt = new Date(bet.expiresAt);
+    if (now > expiresAt) {
+      // Bet expired - loss
+      bet.status = 'EXPIRED';
+      bet.resolvedAt = now.toISOString();
+      betHistory.unshift(bet);
+      activeBets.delete(betId);
+      return;
+    }
+    
+    // Check if incident matches bet
+    const boroughMatch = incident.borough?.toLowerCase() === bet.borough.toLowerCase();
+    const typeMatch = bet.incidentType === 'any' || 
+      incident.incidentType?.toLowerCase().includes(bet.incidentType.toLowerCase());
+    
+    if (boroughMatch && typeMatch) {
+      // Winner!
+      bet.status = 'WON';
+      bet.resolvedAt = now.toISOString();
+      bet.matchedIncident = incident.id;
+      bet.winnings = bet.amount * 2;
+      
+      // Update profile
+      const profile = userProfiles.get(bet.walletAddress);
+      if (profile) {
+        profile.wins++;
+        profile.score += 100;
+        profile.totalWinnings += bet.winnings;
+      }
+      
+      betHistory.unshift(bet);
+      activeBets.delete(betId);
+      
+      console.log(`[Betting] WINNER! ${bet.walletAddress.slice(0, 8)}... won ${bet.winnings / 1000000000} SOL`);
+      
+      // Broadcast winner
+      broadcast({
+        type: 'bet_won',
+        bet: {
+          id: bet.id,
+          user: `${bet.walletAddress.slice(0, 4)}...${bet.walletAddress.slice(-4)}`,
+          amount: bet.amountSOL,
+          winnings: bet.winnings / 1000000000,
+          borough: bet.borough,
+          incidentType: incident.incidentType
+        },
+        incident: {
+          id: incident.id,
+          type: incident.incidentType,
+          location: incident.location
+        },
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+}
+
+// Leaderboard with SOL winnings
+app.get('/bet/leaderboard', (req, res) => {
+  const leaders = Array.from(userProfiles.values())
+    .sort((a, b) => b.totalWinnings - a.totalWinnings)
+    .slice(0, 20)
+    .map(p => ({
+      displayName: p.displayName,
+      wins: p.wins,
+      totalBets: p.totalBets,
+      winnings: p.totalWinnings / 1000000000, // in SOL
+      winRate: p.totalBets > 0 ? ((p.wins / p.totalBets) * 100).toFixed(1) + '%' : '0%'
+    }));
+  
+  res.json(leaders);
 });
 
 // Health check
