@@ -24,6 +24,52 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const clients = new Set();
 
 // ============================================
+// NYPD PRECINCT TO BOROUGH MAPPING
+// ============================================
+
+const PRECINCT_TO_BOROUGH = {
+  // Manhattan (1-34)
+  '1': 'Manhattan', '5': 'Manhattan', '6': 'Manhattan', '7': 'Manhattan', '9': 'Manhattan',
+  '10': 'Manhattan', '13': 'Manhattan', '14': 'Manhattan', '17': 'Manhattan', '18': 'Manhattan',
+  '19': 'Manhattan', '20': 'Manhattan', '22': 'Manhattan', '23': 'Manhattan', '24': 'Manhattan',
+  '25': 'Manhattan', '26': 'Manhattan', '28': 'Manhattan', '30': 'Manhattan', '32': 'Manhattan',
+  '33': 'Manhattan', '34': 'Manhattan',
+  // Bronx (40-52)
+  '40': 'Bronx', '41': 'Bronx', '42': 'Bronx', '43': 'Bronx', '44': 'Bronx',
+  '45': 'Bronx', '46': 'Bronx', '47': 'Bronx', '48': 'Bronx', '49': 'Bronx',
+  '50': 'Bronx', '52': 'Bronx',
+  // Brooklyn (60-94)
+  '60': 'Brooklyn', '61': 'Brooklyn', '62': 'Brooklyn', '63': 'Brooklyn', '66': 'Brooklyn',
+  '67': 'Brooklyn', '68': 'Brooklyn', '69': 'Brooklyn', '70': 'Brooklyn', '71': 'Brooklyn',
+  '72': 'Brooklyn', '73': 'Brooklyn', '75': 'Brooklyn', '76': 'Brooklyn', '77': 'Brooklyn',
+  '78': 'Brooklyn', '79': 'Brooklyn', '81': 'Brooklyn', '83': 'Brooklyn', '84': 'Brooklyn',
+  '88': 'Brooklyn', '90': 'Brooklyn', '94': 'Brooklyn',
+  // Queens (100-115)
+  '100': 'Queens', '101': 'Queens', '102': 'Queens', '103': 'Queens', '104': 'Queens',
+  '105': 'Queens', '106': 'Queens', '107': 'Queens', '108': 'Queens', '109': 'Queens',
+  '110': 'Queens', '111': 'Queens', '112': 'Queens', '113': 'Queens', '114': 'Queens', '115': 'Queens',
+  // Staten Island (120-123)
+  '120': 'Staten Island', '121': 'Staten Island', '122': 'Staten Island', '123': 'Staten Island'
+};
+
+// Common NYC landmarks and areas for better parsing
+const NYC_LANDMARKS = [
+  'Times Square', 'Penn Station', 'Grand Central', 'Port Authority', 'Lincoln Tunnel',
+  'Holland Tunnel', 'Brooklyn Bridge', 'Manhattan Bridge', 'Williamsburg Bridge',
+  'GW Bridge', 'George Washington Bridge', 'Yankee Stadium', 'Citi Field', 'JFK', 'LaGuardia',
+  'Central Park', 'Prospect Park', 'Harlem', 'SoHo', 'Tribeca', 'Chinatown', 'Little Italy',
+  'East Village', 'West Village', 'Midtown', 'Downtown', 'Uptown', 'FDR', 'West Side Highway',
+  'BQE', 'LIE', 'Cross Bronx', 'Major Deegan', 'Bruckner', 'Flatbush', 'Atlantic Avenue',
+  'Fulton Street', 'Broadway', '125th Street', '42nd Street', '34th Street', '14th Street',
+  'Wall Street', 'Canal Street', 'Houston Street', 'Delancey', 'Bowery'
+];
+
+function getPrecinctBorough(precinctNum) {
+  const num = precinctNum.toString().replace(/\D/g, '');
+  return PRECINCT_TO_BOROUGH[num] || null;
+}
+
+// ============================================
 // DETECTIVE BUREAU - 4 SPECIALIZED AGENTS
 // ============================================
 
@@ -31,7 +77,6 @@ class DetectiveBureau {
   constructor(anthropicClient) {
     this.anthropic = anthropicClient;
     
-    // Agent definitions
     this.agents = {
       CHASE: {
         id: 'CHASE',
@@ -39,7 +84,7 @@ class DetectiveBureau {
         icon: '🚔',
         role: 'Pursuit Specialist',
         status: 'idle',
-        triggers: ['pursuit', 'fled', 'fleeing', 'chase', 'vehicle pursuit', 'on foot', 'running', 'high speed'],
+        triggers: ['pursuit', 'fled', 'fleeing', 'chase', 'vehicle pursuit', 'on foot', 'running', 'high speed', 'foot pursuit'],
         systemPrompt: `You are CHASE, a pursuit specialist AI. You predict escape routes, containment points, and track active pursuits across NYC. You know NYC street topology intimately - one-ways, dead ends, bridge/tunnel access. Keep responses to 2-3 sentences. Be tactical and specific.`
       },
       PATTERN: {
@@ -48,7 +93,7 @@ class DetectiveBureau {
         icon: '🔍',
         role: 'Serial Crime Analyst',
         status: 'idle',
-        triggers: [], // Triggers on every incident
+        triggers: [],
         systemPrompt: `You are PATTERN, a serial crime analyst AI. You find connections between incidents - matching MOs, geographic clusters, temporal patterns, suspect descriptions. You name the patterns you discover. Keep responses to 2-3 sentences. Reference specific incident details.`
       },
       PROPHET: {
@@ -57,7 +102,7 @@ class DetectiveBureau {
         icon: '🔮',
         role: 'Predictive Analyst',
         status: 'idle',
-        triggers: [], // Runs on cycles
+        triggers: [],
         systemPrompt: `You are PROPHET, a predictive analyst AI. You make specific, testable predictions about where and when incidents will occur. Always include location, time window, incident type, and confidence percentage. Your accuracy is tracked publicly.`
       },
       HISTORIAN: {
@@ -66,12 +111,11 @@ class DetectiveBureau {
         icon: '📚',
         role: 'Historical Context',
         status: 'idle',
-        triggers: [], // Triggers on every incident
+        triggers: [],
         systemPrompt: `You are HISTORIAN, the memory of the Detective Bureau. You remember every incident, every address, every suspect description. When new incidents occur, you surface relevant history - "this address had 4 calls this week", "suspect matches description from yesterday". Keep responses to 2-3 sentences.`
       }
     };
 
-    // Shared memory
     this.memory = {
       incidents: [],
       cases: new Map(),
@@ -82,39 +126,32 @@ class DetectiveBureau {
       addressHistory: new Map()
     };
 
-    // Prediction tracking
     this.predictionStats = {
       total: 0,
       correct: 0,
       pending: []
     };
 
-    // Start background cycles
     this.startProphetCycle();
     this.startPatternCycle();
   }
 
-  // Process new incident through all agents
   async processIncident(incident, broadcast) {
     const insights = [];
     
-    // Store in memory
     this.memory.incidents.unshift(incident);
     if (this.memory.incidents.length > 200) this.memory.incidents.pop();
     
-    // Track address history
     const addressKey = incident.location?.toLowerCase() || 'unknown';
     const addressCount = (this.memory.addressHistory.get(addressKey) || 0) + 1;
     this.memory.addressHistory.set(addressKey, addressCount);
     
-    // Track hotspots
     const hotspotKey = `${incident.borough}-${incident.location}`;
     this.memory.hotspots.set(hotspotKey, (this.memory.hotspots.get(hotspotKey) || 0) + 1);
     
-    // Check predictions
     this.checkPredictionHit(incident, broadcast);
 
-    // 1. CHASE - Activates on pursuits
+    // CHASE - Activates on pursuits
     if (this.shouldActivateChase(incident)) {
       this.agents.CHASE.status = 'active';
       const chaseInsight = await this.runChase(incident);
@@ -133,48 +170,52 @@ class DetectiveBureau {
       this.agents.CHASE.status = 'idle';
     }
 
-    // 2. HISTORIAN - Always runs
-    this.agents.HISTORIAN.status = 'analyzing';
-    const historianInsight = await this.runHistorian(incident, addressCount);
-    if (historianInsight) {
-      insights.push(historianInsight);
-      broadcast({
-        type: 'agent_insight',
-        agent: 'HISTORIAN',
-        agentIcon: '📚',
-        incidentId: incident.id,
-        analysis: historianInsight,
-        urgency: addressCount > 3 ? 'high' : 'medium',
-        timestamp: new Date().toISOString()
-      });
-    }
-    this.agents.HISTORIAN.status = 'idle';
-
-    // 3. PATTERN - Check for connections
-    this.agents.PATTERN.status = 'analyzing';
-    const patternInsight = await this.runPattern(incident);
-    if (patternInsight) {
-      insights.push(patternInsight);
-      broadcast({
-        type: 'agent_insight',
-        agent: 'PATTERN',
-        agentIcon: '🔍',
-        incidentId: incident.id,
-        analysis: patternInsight.analysis,
-        urgency: patternInsight.confidence === 'HIGH' ? 'high' : 'medium',
-        timestamp: new Date().toISOString()
-      });
-      
-      if (patternInsight.isPattern) {
+    // HISTORIAN - Always runs (but only for incidents with locations)
+    if (incident.location && incident.location !== 'Unknown') {
+      this.agents.HISTORIAN.status = 'analyzing';
+      const historianInsight = await this.runHistorian(incident, addressCount);
+      if (historianInsight) {
+        insights.push(historianInsight);
         broadcast({
-          type: 'pattern_detected',
-          agent: 'PATTERN',
-          pattern: patternInsight,
+          type: 'agent_insight',
+          agent: 'HISTORIAN',
+          agentIcon: '📚',
+          incidentId: incident.id,
+          analysis: historianInsight,
+          urgency: addressCount > 3 ? 'high' : 'medium',
           timestamp: new Date().toISOString()
         });
       }
+      this.agents.HISTORIAN.status = 'idle';
     }
-    this.agents.PATTERN.status = 'idle';
+
+    // PATTERN - Check for connections
+    if (this.memory.incidents.length >= 3) {
+      this.agents.PATTERN.status = 'analyzing';
+      const patternInsight = await this.runPattern(incident);
+      if (patternInsight) {
+        insights.push(patternInsight);
+        broadcast({
+          type: 'agent_insight',
+          agent: 'PATTERN',
+          agentIcon: '🔍',
+          incidentId: incident.id,
+          analysis: patternInsight.analysis,
+          urgency: patternInsight.confidence === 'HIGH' ? 'high' : 'medium',
+          timestamp: new Date().toISOString()
+        });
+        
+        if (patternInsight.isPattern) {
+          broadcast({
+            type: 'pattern_detected',
+            agent: 'PATTERN',
+            pattern: patternInsight,
+            timestamp: new Date().toISOString()
+          });
+        }
+      }
+      this.agents.PATTERN.status = 'idle';
+    }
 
     return insights;
   }
@@ -211,7 +252,6 @@ Predict escape routes and recommend containment.`
 
   async runHistorian(incident, addressCount) {
     try {
-      // Get recent incidents at same location or nearby
       const relatedIncidents = this.memory.incidents.filter(inc => 
         inc.id !== incident.id && 
         (inc.location === incident.location || inc.borough === incident.borough)
@@ -243,11 +283,10 @@ What historical context is relevant?`
 
   async runPattern(incident) {
     try {
-      // Get similar recent incidents
       const recentSimilar = this.memory.incidents.filter(inc => {
         if (inc.id === incident.id) return false;
         const timeDiff = new Date(incident.timestamp) - new Date(inc.timestamp);
-        const isRecent = timeDiff < 2 * 60 * 60 * 1000; // 2 hours
+        const isRecent = timeDiff < 2 * 60 * 60 * 1000;
         return isRecent;
       }).slice(0, 10);
 
@@ -286,13 +325,11 @@ Are these connected? Is there a pattern forming?`
     }
   }
 
-  // PROPHET - Runs every 15 minutes
   startProphetCycle() {
     setInterval(async () => {
       await this.runProphet();
     }, 15 * 60 * 1000);
     
-    // Initial run after 2 minutes
     setTimeout(() => this.runProphet(), 2 * 60 * 1000);
   }
 
@@ -345,7 +382,6 @@ Based on patterns and current activity, what incidents do you predict in the nex
           this.predictionStats.pending.push(prediction);
           this.predictionStats.total++;
           
-          // Broadcast prediction
           broadcast({
             type: 'prophet_prediction',
             agent: 'PROPHET',
@@ -364,20 +400,17 @@ Based on patterns and current activity, what incidents do you predict in the nex
     this.agents.PROPHET.status = 'idle';
   }
 
-  // Check if incident matches any pending predictions
   checkPredictionHit(incident, broadcast) {
     const now = new Date();
     
     this.predictionStats.pending = this.predictionStats.pending.filter(pred => {
       const expiresAt = new Date(pred.expiresAt);
       
-      // Expired
       if (now > expiresAt) {
         pred.status = 'expired';
         return false;
       }
       
-      // Check for match
       const boroughMatch = incident.borough?.toLowerCase() === pred.borough?.toLowerCase();
       const typeMatch = incident.incidentType?.toLowerCase().includes(pred.incidentType?.toLowerCase()) ||
                        pred.incidentType?.toLowerCase().includes(incident.incidentType?.toLowerCase());
@@ -405,7 +438,6 @@ Based on patterns and current activity, what incidents do you predict in the nex
     });
   }
 
-  // PATTERN - Background analysis every 5 minutes
   startPatternCycle() {
     setInterval(async () => {
       if (this.memory.incidents.length < 10) return;
@@ -423,7 +455,6 @@ Based on patterns and current activity, what incidents do you predict in the nex
           }]
         });
         
-        // Could broadcast pattern updates here
         console.log('[PATTERN] Background analysis complete');
       } catch (error) {
         console.error('[PATTERN] Background error:', error.message);
@@ -458,7 +489,6 @@ Based on patterns and current activity, what incidents do you predict in the nex
   }
 
   async askAgents(question, context = {}) {
-    // Route to most appropriate agent or all
     const responses = [];
     
     for (const agent of Object.values(this.agents)) {
@@ -521,11 +551,10 @@ Pending predictions: ${JSON.stringify(this.predictionStats.pending)}`
   }
 }
 
-// Initialize Detective Bureau
 const detectiveBureau = new DetectiveBureau(anthropic);
 
 // ============================================
-// BETTING SYSTEM - DYNAMIC ODDS
+// BETTING SYSTEM
 // ============================================
 
 const TREASURY_WALLET = process.env.TREASURY_WALLET || 'YOUR_SOLANA_WALLET_HERE';
@@ -606,7 +635,9 @@ const NYPD_FEEDS = [
 
 let currentFeedIndex = 0;
 let lastProcessTime = Date.now();
-const CHUNK_DURATION = 10000;
+
+// INCREASED from 10 seconds to 20 seconds to capture full transmissions
+const CHUNK_DURATION = 20000;
 
 let scannerStats = { currentFeed: null, lastChunkTime: null, lastTranscript: null, totalChunks: 0, successfulTranscripts: 0 };
 
@@ -664,33 +695,130 @@ async function transcribeAudio(audioBuffer) {
     const file = await toFile(audioBuffer, 'audio.mp3', { type: 'audio/mpeg' });
     const transcription = await openai.audio.transcriptions.create({
       file, model: "whisper-1", language: "en",
-      prompt: "NYPD police radio dispatch. 10-4, 10-13, 10-85, K, forthwith, precinct, sector."
+      prompt: "NYPD police radio dispatch with locations. 10-4, 10-13, 10-85, K, forthwith, precinct, sector, central, responding. Addresses like 123 Main Street, intersections like 42nd and Lex, landmarks like Times Square, Penn Station."
     });
     return transcription.text;
   } catch (error) { return null; }
 }
 
+// ============================================
+// IMPROVED LOCATION PARSING
+// ============================================
+
 async function parseTranscript(transcript) {
   try {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 600,
-      system: `Parse NYPD radio. Respond JSON: { "hasIncident": bool, "incidentType": "string", "location": "string", "borough": "Manhattan/Brooklyn/Bronx/Queens/Staten Island/Unknown", "units": [], "priority": "CRITICAL/HIGH/MEDIUM/LOW", "summary": "string" }`,
-      messages: [{ role: "user", content: `Parse: "${transcript}"` }]
+      max_tokens: 800,
+      system: `You are an expert NYPD radio parser. Your PRIMARY job is to extract LOCATION information.
+
+LOCATION EXTRACTION RULES:
+1. Look for street addresses: "123 West 45th Street" → location: "123 W 45th St"
+2. Look for intersections: "42nd and Lexington", "at the corner of Broadway and 125th" → location: "42nd St & Lexington Ave"
+3. Look for landmarks: "Times Square", "Penn Station", "Grand Central", "Port Authority" → use landmark name
+4. Look for precinct references: "the 7-5", "75 precinct", "seven-five" → location: "75th Precinct", borough: "Brooklyn"
+5. Look for sector/Adam/Boy/Charlie designations with location context
+6. Look for highways: "FDR at 96th", "BQE", "Cross Bronx" → use highway location
+7. Look for project names, building names, park names
+
+PRECINCT TO BOROUGH MAPPING:
+- 1-34: Manhattan
+- 40-52: Bronx  
+- 60-94: Brooklyn
+- 100-115: Queens
+- 120-123: Staten Island
+
+When you hear "the 7-5" or "75" or "seven-five" in context of a precinct, that's the 75th Precinct in Brooklyn.
+When you hear "the 4-4" or "44", that's the 44th Precinct in the Bronx.
+
+If NO location can be determined, set location to null (not "Unknown").
+
+INCIDENT TYPE MAPPING:
+- 10-10: Possible crime
+- 10-13: Officer needs assistance (CRITICAL)
+- 10-30: Robbery in progress
+- 10-31: Burglary in progress
+- 10-34: Assault
+- 10-52: Dispute
+- 10-53: Accident
+- 10-54: Ambulance needed
+- 10-85: Backup needed
+- Shots fired, shooting, gun → Shots Fired
+- EDP, emotionally disturbed → EDP
+- Pursuit, chase, fleeing → Pursuit
+
+Respond ONLY with valid JSON:
+{
+  "hasIncident": boolean,
+  "incidentType": "string describing incident",
+  "location": "specific location or null if none found",
+  "borough": "Manhattan/Brooklyn/Bronx/Queens/Staten Island/Unknown",
+  "units": ["unit IDs mentioned"],
+  "priority": "CRITICAL/HIGH/MEDIUM/LOW",
+  "summary": "brief summary",
+  "rawCodes": ["any 10-codes heard"],
+  "precinctMentioned": "number or null"
+}`,
+      messages: [{ role: "user", content: `Parse this NYPD radio transmission and extract any location information:\n\n"${transcript}"` }]
     });
+    
     const text = response.content[0].text;
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    return jsonMatch ? JSON.parse(jsonMatch[0]) : { hasIncident: false };
-  } catch (error) { return { hasIncident: false }; }
+    
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      
+      // If precinct mentioned but no borough, look it up
+      if (parsed.precinctMentioned && (!parsed.borough || parsed.borough === 'Unknown')) {
+        const boroughFromPrecinct = getPrecinctBorough(parsed.precinctMentioned);
+        if (boroughFromPrecinct) {
+          parsed.borough = boroughFromPrecinct;
+          if (!parsed.location || parsed.location === 'Unknown') {
+            parsed.location = `${parsed.precinctMentioned}th Precinct area`;
+          }
+        }
+      }
+      
+      // Convert null location to "Unknown" for backwards compatibility
+      if (parsed.location === null) {
+        parsed.location = 'Unknown';
+      }
+      
+      return parsed;
+    }
+    return { hasIncident: false };
+  } catch (error) {
+    console.error('[PARSE] Error:', error.message);
+    return { hasIncident: false };
+  }
 }
 
 function findNearestCamera(location, lat, lng, borough) {
   if (cameras.length === 0) return null;
   let searchCameras = cameras;
+  
+  // First, try to match by borough
   if (borough && borough !== 'Unknown') {
     const boroughCameras = cameras.filter(cam => cam.area?.toLowerCase().includes(borough.toLowerCase()));
     if (boroughCameras.length > 0) searchCameras = boroughCameras;
   }
+  
+  // If we have a location string, try to find a camera with matching street name
+  if (location && location !== 'Unknown') {
+    const locationLower = location.toLowerCase();
+    const matchingCameras = searchCameras.filter(cam => {
+      const camLocation = cam.location?.toLowerCase() || '';
+      // Check for street name matches
+      const locationWords = locationLower.split(/[\s&@]+/).filter(w => w.length > 2);
+      return locationWords.some(word => camLocation.includes(word));
+    });
+    
+    if (matchingCameras.length > 0) {
+      return matchingCameras[Math.floor(Math.random() * matchingCameras.length)];
+    }
+  }
+  
+  // Fallback to random camera in borough
   return searchCameras[Math.floor(Math.random() * searchCameras.length)];
 }
 
@@ -700,9 +828,10 @@ async function processAudioFromStream(buffer, feedName) {
   const transcript = await transcribeAudio(buffer);
   if (!transcript || transcript.trim().length < 10) return;
   
-  // Filter noise
   const clean = transcript.trim();
   const lower = clean.toLowerCase();
+  
+  // Filter out noise
   const noise = ['thank you', 'thanks for watching', 'subscribe', 'you', 'bye', 'music'];
   if (noise.some(n => lower === n || lower === n + '.')) return;
   if (lower.includes('broadcastify') || lower.includes('fema.gov')) return;
@@ -727,8 +856,15 @@ async function processAudioFromStream(buffer, feedName) {
     if (audioClips.size > MAX_AUDIO_CLIPS) audioClips.delete(audioClips.keys().next().value);
     
     const incident = {
-      id: incidentId, ...parsed, transcript: clean, audioUrl: `/audio/${audioId}`,
-      camera, lat: camera?.lat, lng: camera?.lng, source: feedName, timestamp: new Date().toISOString()
+      id: incidentId,
+      ...parsed,
+      transcript: clean,
+      audioUrl: `/audio/${audioId}`,
+      camera,
+      lat: camera?.lat,
+      lng: camera?.lng,
+      source: feedName,
+      timestamp: new Date().toISOString()
     };
     
     incidents.unshift(incident);
@@ -743,14 +879,16 @@ async function processAudioFromStream(buffer, feedName) {
     broadcast({ type: "incident", incident });
     if (camera) broadcast({ type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}`, priority: parsed.priority });
     
-    console.log('Incident:', incident.incidentType, '@', incident.location);
+    console.log('[INCIDENT]', incident.incidentType, '@', incident.location, `(${incident.borough})`);
+  } else {
+    // Broadcast as monitoring even if no incident detected
+    broadcast({
+      type: "analysis",
+      text: `[MONITORING] ${clean.substring(0, 100)}...`,
+      location: 'Unknown',
+      timestamp: new Date().toISOString()
+    });
   }
-  
-  broadcast({
-    type: "analysis",
-    text: parsed.hasIncident ? `[INCIDENT] ${parsed.incidentType} at ${parsed.location}` : `[MONITORING] ${clean.substring(0, 100)}...`,
-    timestamp: new Date().toISOString()
-  });
 }
 
 setTimeout(startBroadcastifyStream, 5000);
@@ -927,7 +1065,7 @@ server.listen(PORT, '0.0.0.0', () => {
 ║  🚨 DISPATCH NYC - Police Scanner Intelligence         ║
 ║  Port: ${PORT}                                            ║
 ║  Agents: CHASE | PATTERN | PROPHET | HISTORIAN         ║
-║  House Edge: ${HOUSE_EDGE * 100}%                                       ║
+║  Chunk Duration: ${CHUNK_DURATION/1000}s (improved for full transmissions)  ║
 ╚════════════════════════════════════════════════════════╝
   `);
 });
