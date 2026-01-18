@@ -119,39 +119,34 @@ async function startBroadcastifyStream() {
     }
 
     console.log(`Connected to ${feed.name}! Streaming audio...`);
-    const reader = response.body.getReader();
     
-    const processStream = async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          
-          if (done) {
-            console.log('Stream ended, reconnecting...');
-            setTimeout(startBroadcastifyStream, 2000);
-            return;
-          }
-          
-          // Accumulate audio data
-          audioBuffer.push(value);
-          
-          // Process every CHUNK_DURATION ms
-          if (Date.now() - lastProcessTime >= CHUNK_DURATION) {
-            const fullBuffer = Buffer.concat(audioBuffer);
-            audioBuffer = [];
-            lastProcessTime = Date.now();
-            
-            // Process in background
-            processAudioFromStream(fullBuffer, feed.name);
-          }
-        }
-      } catch (error) {
-        console.error('Stream read error:', error.message);
-        setTimeout(startBroadcastifyStream, 5000);
+    // Use Node.js stream approach
+    const stream = response.body;
+    let chunks = [];
+    
+    stream.on('data', (chunk) => {
+      chunks.push(chunk);
+      
+      // Process every CHUNK_DURATION ms
+      if (Date.now() - lastProcessTime >= CHUNK_DURATION) {
+        const fullBuffer = Buffer.concat(chunks);
+        chunks = [];
+        lastProcessTime = Date.now();
+        
+        // Process in background (don't await)
+        processAudioFromStream(fullBuffer, feed.name);
       }
-    };
-
-    processStream();
+    });
+    
+    stream.on('end', () => {
+      console.log('Stream ended, reconnecting...');
+      setTimeout(startBroadcastifyStream, 2000);
+    });
+    
+    stream.on('error', (error) => {
+      console.error('Stream error:', error.message);
+      setTimeout(startBroadcastifyStream, 5000);
+    });
     
   } catch (error) {
     console.error('Broadcastify connection error:', error.message);
