@@ -689,6 +689,82 @@ app.get('/audio/:id', (req, res) => {
   res.send(buffer);
 });
 
+// Live audio stream proxy - bypasses CORS for browser playback
+app.get('/stream/live', (req, res) => {
+  if (!BROADCASTIFY_PASSWORD) {
+    return res.status(503).json({ error: 'Scanner not configured' });
+  }
+
+  const feedId = req.query.feed || NYPD_FEEDS[currentFeedIndex]?.id || '40184';
+  const feedInfo = NYPD_FEEDS.find(f => f.id === feedId) || { name: 'Unknown Feed' };
+  
+  console.log(`[Stream Proxy] Client requesting live stream: ${feedInfo.name} (${feedId})`);
+
+  // Set headers for audio streaming
+  res.set({
+    'Content-Type': 'audio/mpeg',
+    'Cache-Control': 'no-cache, no-store',
+    'Connection': 'keep-alive',
+    'Transfer-Encoding': 'chunked',
+  });
+
+  const options = {
+    hostname: 'audio.broadcastify.com',
+    port: 443,
+    path: `/${feedId}.mp3`,
+    method: 'GET',
+    auth: `${BROADCASTIFY_USERNAME}:${BROADCASTIFY_PASSWORD}`,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+  };
+
+  const proxyReq = https.request(options, (proxyRes) => {
+    if (proxyRes.statusCode !== 200) {
+      console.error(`[Stream Proxy] Broadcastify returned ${proxyRes.statusCode}`);
+      res.status(proxyRes.statusCode).json({ error: 'Stream unavailable' });
+      return;
+    }
+
+    console.log(`[Stream Proxy] Connected to ${feedInfo.name}, streaming to client...`);
+    
+    // Pipe the audio stream to the client
+    proxyRes.pipe(res);
+
+    proxyRes.on('end', () => {
+      console.log(`[Stream Proxy] Stream ended for ${feedInfo.name}`);
+    });
+
+    proxyRes.on('error', (err) => {
+      console.error(`[Stream Proxy] Stream error:`, err.message);
+    });
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error(`[Stream Proxy] Connection error:`, err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to connect to stream' });
+    }
+  });
+
+  // Handle client disconnect
+  req.on('close', () => {
+    console.log(`[Stream Proxy] Client disconnected from ${feedInfo.name}`);
+    proxyReq.destroy();
+  });
+
+  proxyReq.end();
+});
+
+// Get available feeds list
+app.get('/stream/feeds', (req, res) => {
+  res.json({
+    feeds: NYPD_FEEDS,
+    currentFeed: NYPD_FEEDS[currentFeedIndex],
+    streamUrl: '/stream/live'
+  });
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
