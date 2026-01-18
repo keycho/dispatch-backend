@@ -35,16 +35,88 @@ const openai = new OpenAI({
 // Store connected clients
 const clients = new Set();
 
-// NYC Traffic Camera database - fetched from NYC DOT API
+// ============================================
+// BETTING SYSTEM - DYNAMIC ODDS ENGINE
+// ============================================
+
+const TREASURY_WALLET = process.env.TREASURY_WALLET || 'YOUR_SOLANA_WALLET_HERE';
+const HOUSE_EDGE = 0.05; // 5% edge = your profit margin
+
+const oddsEngine = {
+  boroughRates: {
+    'Manhattan': 12.5,
+    'Brooklyn': 9.8,
+    'Bronx': 7.2,
+    'Queens': 6.1,
+    'Staten Island': 1.4,
+  },
+  
+  incidentTypeRarity: {
+    'any': 1.0,
+    'traffic': 0.25,
+    'medical': 0.20,
+    'domestic': 0.15,
+    'assault': 0.12,
+    'suspicious': 0.10,
+    'theft': 0.08,
+    'robbery': 0.05,
+    'pursuit': 0.03,
+    'shots fired': 0.02,
+  },
+  
+  timeMultipliers: {
+    0: 0.7, 1: 0.5, 2: 0.4, 3: 0.3, 4: 0.4, 5: 0.5,
+    6: 0.7, 7: 0.9, 8: 1.0, 9: 1.0, 10: 1.0, 11: 1.1,
+    12: 1.2, 13: 1.1, 14: 1.0, 15: 1.1, 16: 1.2, 17: 1.3,
+    18: 1.4, 19: 1.5, 20: 1.6, 21: 1.5, 22: 1.3, 23: 1.0
+  },
+  
+  calculateProbability(borough, incidentType = 'any', windowMinutes = 30) {
+    const hour = new Date().getHours();
+    const baseRate = this.boroughRates[borough] || 5.0;
+    const timeAdjusted = baseRate * this.timeMultipliers[hour];
+    const typeMultiplier = this.incidentTypeRarity[incidentType.toLowerCase()] || 0.1;
+    const adjusted = timeAdjusted * typeMultiplier;
+    const expected = (adjusted / 60) * windowMinutes;
+    return Math.min(0.95, 1 - Math.exp(-expected));
+  },
+  
+  calculateMultiplier(probability) {
+    const fair = 1 / probability;
+    const withEdge = fair * (1 - HOUSE_EDGE);
+    return Math.max(1.1, Math.min(50.0, Math.round(withEdge * 100) / 100));
+  },
+  
+  getOdds(borough, incidentType = 'any', windowMinutes = 30) {
+    const prob = this.calculateProbability(borough, incidentType, windowMinutes);
+    const mult = this.calculateMultiplier(prob);
+    return {
+      borough,
+      incidentType,
+      windowMinutes,
+      probability: Math.round(prob * 1000) / 10,
+      multiplier: mult,
+    };
+  }
+};
+
+const treasury = {
+  totalReceived: 0,
+  totalPaidOut: 0,
+  get netProfit() { return this.totalReceived - this.totalPaidOut; }
+};
+
+// ============================================
+// NYC Traffic Camera database
+// ============================================
+
 let cameras = [];
 
-// Fetch cameras from NYC DOT on startup
 async function fetchNYCCameras() {
   try {
     const response = await fetch('https://webcams.nyctmc.org/api/cameras');
     const data = await response.json();
     
-    // Transform to our format and filter online cameras
     cameras = data
       .filter(cam => cam.isOnline === true || cam.isOnline === "true")
       .map(cam => ({
@@ -60,7 +132,6 @@ async function fetchNYCCameras() {
     console.log(`Loaded ${cameras.length} NYC traffic cameras`);
   } catch (error) {
     console.error("Failed to fetch NYC cameras:", error);
-    // Fallback to some default cameras
     cameras = [
       { id: "07b8616e-373e-4ec9-89cc-11cad7d59fcb", location: "Worth St @ Centre St", lat: 40.715157, lng: -74.00213, area: "Manhattan", imageUrl: "https://webcams.nyctmc.org/api/cameras/07b8616e-373e-4ec9-89cc-11cad7d59fcb/image", isOnline: true },
       { id: "8d2b3ae9-da68-4d37-8ae2-d3bc014f827b", location: "WBB - Bedford Ave & S 5 St", lat: 40.710983, lng: -73.963168, area: "Brooklyn", imageUrl: "https://webcams.nyctmc.org/api/cameras/8d2b3ae9-da68-4d37-8ae2-d3bc014f827b/image", isOnline: true },
@@ -68,7 +139,6 @@ async function fetchNYCCameras() {
   }
 }
 
-// Fetch cameras on startup
 fetchNYCCameras();
 
 // ============================================
@@ -78,16 +148,14 @@ fetchNYCCameras();
 const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
-// NYPD Feed IDs - verified active feeds from broadcastify.com/listen/ctid/1855
 const NYPD_FEEDS = [
-  { id: '40184', name: 'NYPD Citywide 1' },              // Most listeners - all boroughs
+  { id: '40184', name: 'NYPD Citywide 1' },
   { id: '40185', name: 'NYPD Citywide 2' },
   { id: '40186', name: 'NYPD Citywide 3' },
-  { id: '1189', name: 'NYPD Bronx/Manhattan Transit' },  // ESU, Harbor, K-9
-  { id: '7392', name: 'Hatzolah EMS Dispatch' },         // EMS backup
+  { id: '1189', name: 'NYPD Bronx/Manhattan Transit' },
+  { id: '7392', name: 'Hatzolah EMS Dispatch' },
 ];
 
-// Scanner stats for debug endpoint
 let scannerStats = {
   currentFeed: null,
   lastChunkTime: null,
@@ -103,7 +171,7 @@ let scannerStats = {
 let currentFeedIndex = 0;
 let audioBuffer = [];
 let lastProcessTime = Date.now();
-const CHUNK_DURATION = 10000; // Process every 10 seconds for fast updates
+const CHUNK_DURATION = 10000;
 
 async function startBroadcastifyStream() {
   if (!BROADCASTIFY_PASSWORD) {
@@ -115,7 +183,6 @@ async function startBroadcastifyStream() {
   
   console.log(`Connecting to Broadcastify feed: ${feed.name} (${feed.id})`);
 
-  // Use native https module which properly supports auth
   const options = {
     hostname: 'audio.broadcastify.com',
     port: 443,
@@ -165,7 +232,6 @@ function handleStream(stream, feed) {
   stream.on('data', (chunk) => {
     chunks.push(chunk);
     
-    // Process every CHUNK_DURATION ms
     if (Date.now() - lastProcessTime >= CHUNK_DURATION) {
       const fullBuffer = Buffer.concat(chunks);
       const bufferSize = fullBuffer.length;
@@ -178,7 +244,6 @@ function handleStream(stream, feed) {
       
       console.log(`[${feed.name}] Audio chunk: ${(bufferSize / 1024).toFixed(1)}KB`);
       
-      // Process in background (don't await)
       processAudioFromStream(fullBuffer, feed.name);
     }
   });
@@ -198,7 +263,6 @@ function handleStream(stream, feed) {
 }
 
 async function processAudioFromStream(buffer, feedName) {
-  // Need at least ~5KB for meaningful audio
   if (buffer.length < 5000) {
     console.log(`[${feedName}] Skipping - buffer too small: ${buffer.length} bytes`);
     scannerStats.skippedChunks++;
@@ -206,7 +270,6 @@ async function processAudioFromStream(buffer, feedName) {
   }
   
   try {
-    // Transcribe with Whisper
     console.log(`[${feedName}] Sending ${(buffer.length / 1024).toFixed(1)}KB to Whisper...`);
     const transcript = await transcribeAudio(buffer);
     
@@ -216,7 +279,6 @@ async function processAudioFromStream(buffer, feedName) {
       return;
     }
     
-    // Filter out garbage transcripts (noise, music, repeated words)
     const cleanTranscript = transcript.trim();
     if (cleanTranscript.length < 10) {
       console.log(`[${feedName}] Transcript too short: "${cleanTranscript}"`);
@@ -224,7 +286,6 @@ async function processAudioFromStream(buffer, feedName) {
       return;
     }
     
-    // Check for repeated word patterns (like "You You You You")
     const words = cleanTranscript.split(/\s+/);
     const uniqueWords = new Set(words.map(w => w.toLowerCase()));
     if (words.length > 3 && uniqueWords.size <= 2) {
@@ -233,14 +294,12 @@ async function processAudioFromStream(buffer, feedName) {
       return;
     }
     
-    // Check for punctuation-only transcripts
     if (/^[\s.,!?-]+$/.test(cleanTranscript)) {
       console.log(`[${feedName}] Skipping punctuation-only: "${cleanTranscript}"`);
       scannerStats.skippedChunks++;
       return;
     }
     
-    // Check for common Whisper hallucinations on silence/noise
     const hallucinations = [
       'thank you', 'thanks for watching', 'subscribe', 'like and subscribe',
       'you', 'bye', 'music', 'applause', 'silence'
@@ -252,7 +311,6 @@ async function processAudioFromStream(buffer, feedName) {
       return;
     }
     
-    // Filter out Broadcastify ads and PSAs
     const adPatterns = [
       'fema.gov', 'fema gov', 'broadcastify', 'radioreference',
       'for more information visit', 'visit www', 'visit http',
@@ -267,7 +325,6 @@ async function processAudioFromStream(buffer, feedName) {
       return;
     }
     
-    // Filter out transcripts that are mostly "you" repetitions (Whisper artifact)
     const youCount = (lowerTranscript.match(/\byou\b/g) || []).length;
     const wordCount = words.length;
     if (youCount > 3 && youCount / wordCount > 0.3) {
@@ -276,14 +333,12 @@ async function processAudioFromStream(buffer, feedName) {
       return;
     }
     
-    // Success! Track stats
     scannerStats.lastTranscriptTime = new Date().toISOString();
     scannerStats.lastTranscript = cleanTranscript.substring(0, 200);
     scannerStats.successfulTranscripts++;
     
     console.log(`[${feedName}] Transcript:`, transcript);
     
-    // Store transcript for new clients
     const transcriptEntry = {
       text: transcript,
       source: feedName,
@@ -292,24 +347,20 @@ async function processAudioFromStream(buffer, feedName) {
     recentTranscripts.unshift(transcriptEntry);
     if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
     
-    // Broadcast transcript
     broadcast({
       type: "transcript",
       ...transcriptEntry
     });
     
-    // Parse with Claude
     const parsed = await parseTranscript(transcript);
     
     if (parsed.hasIncident) {
       incidentId++;
       const camera = findNearestCamera(parsed.location || "", null, null, parsed.borough);
       
-      // Store audio clip
       const audioId = `audio_${incidentId}_${Date.now()}`;
       audioClips.set(audioId, buffer);
       
-      // Cleanup old clips
       if (audioClips.size > MAX_AUDIO_CLIPS) {
         const firstKey = audioClips.keys().next().value;
         audioClips.delete(firstKey);
@@ -321,7 +372,6 @@ async function processAudioFromStream(buffer, feedName) {
         transcript: cleanTranscript,
         audioUrl: `/audio/${audioId}`,
         camera: camera,
-        // Add coordinates directly for easier frontend access
         lat: camera?.lat || null,
         lng: camera?.lng || null,
         source: feedName,
@@ -331,10 +381,8 @@ async function processAudioFromStream(buffer, feedName) {
       incidents.unshift(incident);
       if (incidents.length > 50) incidents.pop();
       
-      // Check if any bets won
       checkBetsForIncident(incident);
       
-      // Store for pattern analysis
       recentIncidentsForAnalysis.unshift({
         id: incident.id,
         type: incident.incidentType,
@@ -349,7 +397,6 @@ async function processAudioFromStream(buffer, feedName) {
         recentIncidentsForAnalysis.pop();
       }
       
-      // Check for linked incidents
       const linkAnalysis = await checkForLinkedIncidents(incident);
       if (linkAnalysis) {
         incident.linkedCase = linkAnalysis;
@@ -377,7 +424,6 @@ async function processAudioFromStream(buffer, feedName) {
       
       console.log('Incident detected:', incident.incidentType, '@', incident.location, '- Priority:', incident.priority);
       
-      // Generate Claude's detective commentary (async, don't block)
       generateDetectiveCommentary(incident, recentIncidentsForAnalysis.slice(0, 5))
         .then(commentary => {
           if (commentary) {
@@ -390,7 +436,6 @@ async function processAudioFromStream(buffer, feedName) {
           }
         });
       
-      // If this incident is linked to others, build a case file
       if (linkAnalysis && linkAnalysis.linkedIncidentIds?.length > 0) {
         const linkedIncs = incidents.filter(i => 
           linkAnalysis.linkedIncidentIds.includes(i.id) || i.id === incident.id
@@ -422,7 +467,6 @@ async function processAudioFromStream(buffer, feedName) {
   }
 }
 
-// Start scanner after a delay
 console.log('Starting Broadcastify scanner in 5 seconds...');
 setTimeout(startBroadcastifyStream, 5000);
 
@@ -430,11 +474,9 @@ setTimeout(startBroadcastifyStream, 5000);
 // AI CRIME ANALYST - Pattern Detection
 // ============================================
 
-// Store recent incidents for pattern analysis
 const recentIncidentsForAnalysis = [];
 const MAX_ANALYSIS_INCIDENTS = 100;
 
-// Analyze patterns every 5 minutes
 setInterval(analyzePatterns, 5 * 60 * 1000);
 
 async function analyzePatterns() {
@@ -482,7 +524,6 @@ Respond in JSON:
     if (jsonMatch) {
       const analysis = JSON.parse(jsonMatch[0]);
       
-      // Broadcast pattern alerts to clients
       if (analysis.patterns && analysis.patterns.length > 0) {
         broadcast({
           type: "pattern_alert",
@@ -498,11 +539,10 @@ Respond in JSON:
   }
 }
 
-// Link related incidents in real-time
 async function checkForLinkedIncidents(newIncident) {
   const recentSimilar = recentIncidentsForAnalysis.filter(inc => {
     const timeDiff = new Date(newIncident.timestamp) - new Date(inc.timestamp);
-    const isRecent = timeDiff < 30 * 60 * 1000; // Within 30 minutes
+    const isRecent = timeDiff < 30 * 60 * 1000;
     const sameBorough = inc.borough === newIncident.borough;
     return isRecent && sameBorough && inc.id !== newIncident.id;
   });
@@ -552,11 +592,9 @@ Respond in JSON:
 // CLAUDE DETECTIVE - AI Crime Investigation
 // ============================================
 
-// Active case files
 const caseFiles = new Map();
 let caseNumber = 0;
 
-// Generate detective commentary for new incidents
 async function generateDetectiveCommentary(incident, recentIncidents) {
   try {
     const response = await anthropic.messages.create({
@@ -590,7 +628,6 @@ Give your detective's take on this - what do you notice? Any connections? What s
   }
 }
 
-// Build a case file when pattern detected
 async function buildCaseFile(linkedIncidents, linkAnalysis) {
   try {
     caseNumber++;
@@ -646,7 +683,6 @@ Link analysis: ${JSON.stringify(linkAnalysis)}`
   return null;
 }
 
-// Let users ask Claude about cases/incidents
 app.post('/detective/ask', express.json(), async (req, res) => {
   const { question, incidentId, caseId } = req.body;
   
@@ -654,7 +690,6 @@ app.post('/detective/ask', express.json(), async (req, res) => {
     return res.status(400).json({ error: 'Question required' });
   }
   
-  // Get context
   let context = '';
   
   if (incidentId) {
@@ -668,13 +703,11 @@ app.post('/detective/ask', express.json(), async (req, res) => {
     const caseFile = caseFiles.get(parseInt(caseId));
     if (caseFile) {
       context += `\nCase file:\n${JSON.stringify(caseFile, null, 2)}`;
-      // Add linked incidents
       const linkedIncs = incidents.filter(i => caseFile.incidents.includes(i.id));
       context += `\nLinked incidents:\n${JSON.stringify(linkedIncs, null, 2)}`;
     }
   }
   
-  // Add recent incidents for general context
   context += `\nRecent incidents:\n${JSON.stringify(incidents.slice(0, 10), null, 2)}`;
   
   try {
@@ -708,26 +741,22 @@ User's question: ${question}`
   }
 });
 
-// Get all case files
 app.get('/detective/cases', (req, res) => {
   const cases = Array.from(caseFiles.values())
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   res.json(cases);
 });
 
-// Get specific case file
 app.get('/detective/cases/:id', (req, res) => {
   const caseFile = caseFiles.get(parseInt(req.params.id));
   if (!caseFile) {
     return res.status(404).json({ error: 'Case not found' });
   }
   
-  // Include full incident details
   const fullIncidents = incidents.filter(i => caseFile.incidents.includes(i.id));
   res.json({ ...caseFile, fullIncidents });
 });
 
-// Get Claude's daily briefing
 app.get('/detective/briefing', async (req, res) => {
   try {
     const response = await anthropic.messages.create({
@@ -774,31 +803,26 @@ Provide:
 const incidents = [];
 let incidentId = 0;
 
-// Recent transcripts for new clients
 const recentTranscripts = [];
 const MAX_TRANSCRIPTS = 20;
 
-// Audio clip storage (for playback)
 const audioClips = new Map();
 const MAX_AUDIO_CLIPS = 50;
 
-// Broadcast to all connected clients
 function broadcast(data) {
   const message = JSON.stringify(data);
   clients.forEach(client => {
-    if (client.readyState === 1) { // WebSocket.OPEN
+    if (client.readyState === 1) {
       client.send(message);
     }
   });
 }
 
-// Find nearest camera to a location using text matching, coordinates, and borough
 function findNearestCamera(location, lat = null, lng = null, borough = null) {
   if (cameras.length === 0) {
     return null;
   }
   
-  // If we have coordinates, find nearest by distance
   if (lat && lng) {
     let nearest = cameras[0];
     let minDist = Infinity;
@@ -815,7 +839,6 @@ function findNearestCamera(location, lat = null, lng = null, borough = null) {
     return nearest;
   }
   
-  // Filter by borough first if available
   let searchCameras = cameras;
   if (borough && borough !== 'Unknown') {
     const boroughCameras = cameras.filter(cam => 
@@ -826,16 +849,11 @@ function findNearestCamera(location, lat = null, lng = null, borough = null) {
     }
   }
   
-  // Try text matching on location
   const locationLower = location.toLowerCase();
-  
-  // Extract street numbers and names
-  const streetMatch = locationLower.match(/(\d+)(?:st|nd|rd|th)?\s*(street|st|avenue|ave|place|pl|road|rd|boulevard|blvd)/i);
   
   for (const cam of searchCameras) {
     const camLocationLower = cam.location.toLowerCase();
     
-    // Check if any part of the location matches
     const locationParts = locationLower.split(/[&@,\s]+/);
     for (const part of locationParts) {
       if (part.length > 2 && camLocationLower.includes(part)) {
@@ -844,11 +862,9 @@ function findNearestCamera(location, lat = null, lng = null, borough = null) {
     }
   }
   
-  // Return random camera from the borough, or any camera
   return searchCameras[Math.floor(Math.random() * searchCameras.length)];
 }
 
-// Parse scanner transcript with Claude
 async function parseTranscript(transcript) {
   try {
     const response = await anthropic.messages.create({
@@ -911,10 +927,8 @@ If no clear incident (just routine radio chatter), set hasIncident to false.`,
   }
 }
 
-// Transcribe audio with Whisper
 async function transcribeAudio(audioBuffer) {
   try {
-    // Use OpenAI's toFile utility for Node.js compatibility
     const file = await toFile(audioBuffer, 'audio.mp3', { type: 'audio/mpeg' });
     
     const transcription = await openai.audio.transcriptions.create({
@@ -931,22 +945,18 @@ async function transcribeAudio(audioBuffer) {
   }
 }
 
-// Process incoming audio chunk
 async function processAudioChunk(audioBuffer) {
-  // Transcribe
   const transcript = await transcribeAudio(audioBuffer);
   if (!transcript || transcript.trim().length < 10) return;
 
   console.log("Transcript:", transcript);
   
-  // Broadcast transcript
   broadcast({
     type: "transcript",
     text: transcript,
     timestamp: new Date().toISOString()
   });
 
-  // Parse with Claude
   const parsed = await parseTranscript(transcript);
   
   if (parsed.hasIncident) {
@@ -966,16 +976,13 @@ async function processAudioChunk(audioBuffer) {
     incidents.unshift(incident);
     if (incidents.length > 50) incidents.pop();
     
-    // Check if any bets won
     checkBetsForIncident(incident);
 
-    // Broadcast incident
     broadcast({
       type: "incident",
       incident: incident
     });
 
-    // Broadcast camera switch
     broadcast({
       type: "camera_switch",
       camera: camera,
@@ -985,7 +992,6 @@ async function processAudioChunk(audioBuffer) {
     console.log("Incident detected:", incident);
   }
 
-  // Broadcast AI analysis
   broadcast({
     type: "analysis",
     text: parsed.hasIncident 
@@ -1000,7 +1006,6 @@ wss.on('connection', (ws) => {
   console.log('Client connected');
   clients.add(ws);
 
-  // Send current state with recent transcripts
   ws.send(JSON.stringify({
     type: "init",
     incidents: incidents.slice(0, 20),
@@ -1018,13 +1023,11 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message);
       
-      // Handle audio chunks from client
       if (data.type === 'audio_chunk') {
         const audioBuffer = Buffer.from(data.audio, 'base64');
         await processAudioChunk(audioBuffer);
       }
       
-      // Handle manual transcript input (for testing)
       if (data.type === 'manual_transcript') {
         broadcast({
           type: "transcript",
@@ -1049,7 +1052,6 @@ wss.on('connection', (ws) => {
           
           incidents.unshift(incident);
           
-          // Check if any bets won
           checkBetsForIncident(incident);
           
           broadcast({
@@ -1086,7 +1088,10 @@ app.get('/', (req, res) => {
     name: "DISPATCH - Police Scanner Intelligence",
     status: "operational",
     connections: clients.size,
-    incidents: incidents.length
+    incidents: incidents.length,
+    treasury: {
+      netProfitSOL: treasury.netProfit / 1e9
+    }
   });
 });
 
@@ -1094,7 +1099,6 @@ app.get('/cameras', (req, res) => {
   res.json(cameras);
 });
 
-// Proxy endpoint for camera images (to avoid CORS issues)
 app.get('/camera-image/:id', async (req, res) => {
   try {
     const imageUrl = `https://webcams.nyctmc.org/api/cameras/${req.params.id}/image`;
@@ -1109,7 +1113,6 @@ app.get('/camera-image/:id', async (req, res) => {
   }
 });
 
-// Refresh cameras endpoint
 app.get('/refresh-cameras', async (req, res) => {
   await fetchNYCCameras();
   res.json({ count: cameras.length, message: 'Cameras refreshed' });
@@ -1119,7 +1122,6 @@ app.get('/incidents', (req, res) => {
   res.json(incidents);
 });
 
-// Serve audio clips for playback
 app.get('/audio/:id', (req, res) => {
   const audioId = req.params.id;
   const buffer = audioClips.get(audioId);
@@ -1134,7 +1136,6 @@ app.get('/audio/:id', (req, res) => {
   res.send(buffer);
 });
 
-// Live audio stream proxy - bypasses CORS for browser playback
 app.get('/stream/live', (req, res) => {
   if (!BROADCASTIFY_PASSWORD) {
     return res.status(503).json({ error: 'Scanner not configured' });
@@ -1165,14 +1166,12 @@ app.get('/stream/live', (req, res) => {
 
     console.log(`[Stream Proxy] Connected to ${feedInfo.name}, streaming to client...`);
     
-    // Set headers only after successful connection
     res.set({
       'Content-Type': 'audio/mpeg',
       'Cache-Control': 'no-cache, no-store',
       'Connection': 'keep-alive',
     });
     
-    // Pipe the audio stream to the client
     proxyRes.pipe(res);
 
     proxyRes.on('end', () => {
@@ -1192,7 +1191,6 @@ app.get('/stream/live', (req, res) => {
     }
   });
 
-  // Handle client disconnect
   req.on('close', () => {
     console.log(`[Stream Proxy] Client disconnected from ${feedInfo.name}`);
     proxyReq.destroy();
@@ -1201,7 +1199,6 @@ app.get('/stream/live', (req, res) => {
   proxyReq.end();
 });
 
-// Get available feeds list
 app.get('/stream/feeds', (req, res) => {
   res.json({
     feeds: NYPD_FEEDS,
@@ -1211,15 +1208,13 @@ app.get('/stream/feeds', (req, res) => {
 });
 
 // ============================================
-// SOLANA BETTING SYSTEM
+// SOLANA BETTING SYSTEM - DYNAMIC ODDS
 // ============================================
 
-// Active bets pool
 const activeBets = new Map();
 const userProfiles = new Map();
 const betHistory = [];
 
-// Verify a Solana signature (for wallet auth)
 app.post('/auth/verify', express.json(), (req, res) => {
   const { walletAddress, signature, message } = req.body;
   
@@ -1227,10 +1222,6 @@ app.post('/auth/verify', express.json(), (req, res) => {
     return res.status(400).json({ error: 'Wallet address required' });
   }
   
-  // In production, verify the signature matches the wallet
-  // For now, trust the client (add @solana/web3.js for real verification)
-  
-  // Create or get user profile
   let profile = userProfiles.get(walletAddress);
   if (!profile) {
     profile = {
@@ -1252,7 +1243,58 @@ app.post('/auth/verify', express.json(), (req, res) => {
   });
 });
 
-// Place a bet
+// Get dynamic odds
+app.get('/bet/odds', (req, res) => {
+  const { type = 'any', window = 30 } = req.query;
+  const windowMins = parseInt(window);
+  
+  const boroughs = ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
+  const odds = boroughs.map(b => oddsEngine.getOdds(b, type, windowMins));
+  
+  res.json(odds);
+});
+
+// Get all odds for betting UI
+app.get('/bet/all-odds', (req, res) => {
+  const { window = 30 } = req.query;
+  const windowMins = parseInt(window);
+  const boroughs = ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
+  const types = ['any', 'assault', 'robbery', 'traffic', 'shots fired'];
+  
+  const odds = {};
+  boroughs.forEach(borough => {
+    odds[borough] = {};
+    types.forEach(type => {
+      odds[borough][type] = oddsEngine.getOdds(borough, type, windowMins);
+    });
+  });
+  
+  res.json({
+    timestamp: new Date().toISOString(),
+    windowMinutes: windowMins,
+    houseEdge: `${HOUSE_EDGE * 100}%`,
+    odds,
+    treasury: {
+      totalReceivedSOL: treasury.totalReceived / 1e9,
+      totalPaidOutSOL: treasury.totalPaidOut / 1e9,
+      netProfitSOL: treasury.netProfit / 1e9,
+    }
+  });
+});
+
+// Treasury stats
+app.get('/bet/treasury', (req, res) => {
+  res.json({
+    wallet: TREASURY_WALLET,
+    totalReceivedSOL: treasury.totalReceived / 1e9,
+    totalPaidOutSOL: treasury.totalPaidOut / 1e9,
+    netProfitSOL: treasury.netProfit / 1e9,
+    activeBets: activeBets.size,
+    houseEdge: `${HOUSE_EDGE * 100}%`,
+  });
+});
+
+// Place a bet with dynamic odds
 app.post('/bet/place', express.json(), (req, res) => {
   const { walletAddress, borough, incidentType, amount, timeWindow, txSignature } = req.body;
   
@@ -1260,13 +1302,14 @@ app.post('/bet/place', express.json(), (req, res) => {
     return res.status(400).json({ error: 'walletAddress, borough, and amount required' });
   }
   
-  // Validate amount (minimum 0.01 SOL = 10000000 lamports)
   const lamports = parseInt(amount);
   if (lamports < 10000000) {
     return res.status(400).json({ error: 'Minimum bet is 0.01 SOL' });
   }
+  if (lamports > 10000000000) {
+    return res.status(400).json({ error: 'Maximum bet is 10 SOL' });
+  }
   
-  // Check if user already has active bet
   const existingBet = Array.from(activeBets.values()).find(
     b => b.walletAddress === walletAddress && b.status === 'ACTIVE'
   );
@@ -1274,48 +1317,58 @@ app.post('/bet/place', express.json(), (req, res) => {
     return res.status(400).json({ error: 'You already have an active bet', bet: existingBet });
   }
   
+  // GET DYNAMIC ODDS
+  const type = incidentType || 'any';
+  const window = timeWindow || 30;
+  const odds = oddsEngine.getOdds(borough, type, window);
+  
+  const potentialWin = Math.floor(lamports * odds.multiplier);
+  
   const betId = `bet_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   const bet = {
     id: betId,
     walletAddress,
     borough,
-    incidentType: incidentType || 'any',
+    incidentType: type,
     amount: lamports,
-    amountSOL: lamports / 1000000000,
-    timeWindow: timeWindow || 30, // minutes
-    txSignature, // Solana transaction signature
+    amountSOL: lamports / 1e9,
+    timeWindow: window,
+    txSignature,
     createdAt: new Date().toISOString(),
-    expiresAt: new Date(Date.now() + (timeWindow || 30) * 60 * 1000).toISOString(),
+    expiresAt: new Date(Date.now() + window * 60 * 1000).toISOString(),
     status: 'ACTIVE',
-    potentialWin: lamports * 2 // 2x payout for correct prediction
+    multiplier: odds.multiplier,
+    probability: odds.probability,
+    potentialWin: potentialWin,
+    potentialWinSOL: potentialWin / 1e9,
   };
   
   activeBets.set(betId, bet);
   
-  // Update user profile
+  treasury.totalReceived += lamports;
+  
   const profile = userProfiles.get(walletAddress);
-  if (profile) {
-    profile.totalBets++;
-  }
+  if (profile) profile.totalBets++;
   
-  console.log(`[Betting] New bet: ${bet.amountSOL} SOL on ${borough} by ${walletAddress.slice(0, 8)}...`);
+  console.log(`[BET] ${bet.amountSOL} SOL on ${type} in ${borough} @ ${odds.multiplier}x (potential: ${bet.potentialWinSOL} SOL)`);
   
-  // Broadcast to show live betting action
   broadcast({
     type: 'new_bet',
     bet: {
       id: bet.id,
       borough: bet.borough,
+      incidentType: bet.incidentType,
       amount: bet.amountSOL,
+      multiplier: bet.multiplier,
+      potentialWinSOL: bet.potentialWinSOL,
       user: `${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)}`
     },
     timestamp: new Date().toISOString()
   });
   
-  res.json({ success: true, bet });
+  res.json({ success: true, bet, odds });
 });
 
-// Get betting pool stats
 app.get('/bet/pool', (req, res) => {
   const active = Array.from(activeBets.values()).filter(b => b.status === 'ACTIVE');
   
@@ -1331,11 +1384,11 @@ app.get('/bet/pool', (req, res) => {
   const totalPool = active.reduce((sum, b) => sum + b.amount, 0);
   
   res.json({
-    totalPool: totalPool / 1000000000, // In SOL
+    totalPool: totalPool / 1e9,
     totalBets: active.length,
     poolByBorough: Object.fromEntries(
       Object.entries(poolByBorough).map(([k, v]) => [k, { 
-        total: v.total / 1000000000, 
+        total: v.total / 1e9, 
         count: v.count 
       }])
     ),
@@ -1343,7 +1396,6 @@ app.get('/bet/pool', (req, res) => {
   });
 });
 
-// Get user's betting history
 app.get('/bet/history/:walletAddress', (req, res) => {
   const wallet = req.params.walletAddress;
   const userBets = betHistory.filter(b => b.walletAddress === wallet);
@@ -1356,7 +1408,6 @@ app.get('/bet/history/:walletAddress', (req, res) => {
   });
 });
 
-// Check and resolve bets when incident comes in
 function checkBetsForIncident(incident) {
   const now = new Date();
   
@@ -1365,27 +1416,26 @@ function checkBetsForIncident(incident) {
     
     const expiresAt = new Date(bet.expiresAt);
     if (now > expiresAt) {
-      // Bet expired - loss
       bet.status = 'EXPIRED';
       bet.resolvedAt = now.toISOString();
       betHistory.unshift(bet);
       activeBets.delete(betId);
+      console.log(`[BET] EXPIRED - kept ${bet.amountSOL} SOL`);
       return;
     }
     
-    // Check if incident matches bet
     const boroughMatch = incident.borough?.toLowerCase() === bet.borough.toLowerCase();
     const typeMatch = bet.incidentType === 'any' || 
       incident.incidentType?.toLowerCase().includes(bet.incidentType.toLowerCase());
     
     if (boroughMatch && typeMatch) {
-      // Winner!
       bet.status = 'WON';
       bet.resolvedAt = now.toISOString();
       bet.matchedIncident = incident.id;
-      bet.winnings = bet.amount * 2;
+      bet.winnings = bet.potentialWin;
       
-      // Update profile
+      treasury.totalPaidOut += bet.winnings;
+      
       const profile = userProfiles.get(bet.walletAddress);
       if (profile) {
         profile.wins++;
@@ -1396,18 +1446,19 @@ function checkBetsForIncident(incident) {
       betHistory.unshift(bet);
       activeBets.delete(betId);
       
-      console.log(`[Betting] WINNER! ${bet.walletAddress.slice(0, 8)}... won ${bet.winnings / 1000000000} SOL`);
+      console.log(`[BET] WINNER! Paying ${bet.winnings / 1e9} SOL (${bet.multiplier}x) to ${bet.walletAddress.slice(0, 8)}...`);
+      console.log(`[TREASURY] Profit so far: ${treasury.netProfit / 1e9} SOL`);
       
-      // Broadcast winner
       broadcast({
         type: 'bet_won',
         bet: {
           id: bet.id,
           user: `${bet.walletAddress.slice(0, 4)}...${bet.walletAddress.slice(-4)}`,
           amount: bet.amountSOL,
-          winnings: bet.winnings / 1000000000,
+          multiplier: bet.multiplier,
+          winnings: bet.winnings / 1e9,
           borough: bet.borough,
-          incidentType: incident.incidentType
+          incidentType: bet.incidentType
         },
         incident: {
           id: incident.id,
@@ -1420,7 +1471,6 @@ function checkBetsForIncident(incident) {
   });
 }
 
-// Leaderboard with SOL winnings
 app.get('/bet/leaderboard', (req, res) => {
   const leaders = Array.from(userProfiles.values())
     .sort((a, b) => b.totalWinnings - a.totalWinnings)
@@ -1429,7 +1479,7 @@ app.get('/bet/leaderboard', (req, res) => {
       displayName: p.displayName,
       wins: p.wins,
       totalBets: p.totalBets,
-      winnings: p.totalWinnings / 1000000000, // in SOL
+      winnings: p.totalWinnings / 1e9,
       winRate: p.totalBets > 0 ? ((p.wins / p.totalBets) * 100).toFixed(1) + '%' : '0%'
     }));
   
@@ -1445,7 +1495,6 @@ app.get('/health', (req, res) => {
 // GAMIFICATION & ANALYSIS ENDPOINTS
 // ============================================
 
-// Get AI pattern analysis
 app.get('/analysis/patterns', async (req, res) => {
   if (recentIncidentsForAnalysis.length < 3) {
     return res.json({ patterns: [], message: 'Not enough data yet' });
@@ -1470,7 +1519,6 @@ app.get('/analysis/patterns', async (req, res) => {
   }
 });
 
-// Get incident statistics
 app.get('/stats', (req, res) => {
   const now = new Date();
   const hourAgo = new Date(now - 60 * 60 * 1000);
@@ -1501,7 +1549,6 @@ app.get('/stats', (req, res) => {
   });
 });
 
-// Prediction game - submit a prediction
 const predictions = new Map();
 
 app.post('/game/predict', express.json(), (req, res) => {
@@ -1515,7 +1562,7 @@ app.post('/game/predict', express.json(), (req, res) => {
     userId,
     borough,
     incidentType: incidentType || 'any',
-    timeWindow: timeWindow || 30, // minutes
+    timeWindow: timeWindow || 30,
     createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + (timeWindow || 30) * 60 * 1000).toISOString(),
     status: 'PENDING'
@@ -1527,7 +1574,6 @@ app.post('/game/predict', express.json(), (req, res) => {
   res.json({ predictionId, prediction });
 });
 
-// Check prediction results
 app.get('/game/predictions/:userId', (req, res) => {
   const userPredictions = [];
   predictions.forEach((pred, id) => {
@@ -1538,7 +1584,6 @@ app.get('/game/predictions/:userId', (req, res) => {
   res.json(userPredictions);
 });
 
-// Leaderboard
 const userScores = new Map();
 
 app.get('/game/leaderboard', (req, res) => {
@@ -1550,50 +1595,18 @@ app.get('/game/leaderboard', (req, res) => {
   res.json(leaderboard);
 });
 
-// Get challenges
 app.get('/game/challenges', (req, res) => {
   const challenges = [
-    {
-      id: 'night_owl',
-      name: 'Night Owl',
-      description: 'Monitor 10 incidents after midnight',
-      points: 100,
-      icon: '🦉'
-    },
-    {
-      id: 'eagle_eye', 
-      name: 'Eagle Eye',
-      description: 'Spot a HIGH priority incident within 30 seconds',
-      points: 50,
-      icon: '🦅'
-    },
-    {
-      id: 'analyst',
-      name: 'Crime Analyst',
-      description: 'Correctly predict 5 incident locations',
-      points: 200,
-      icon: '🔍'
-    },
-    {
-      id: 'manhattan_expert',
-      name: 'Manhattan Expert',
-      description: 'Track 50 incidents in Manhattan',
-      points: 150,
-      icon: '🏙️'
-    },
-    {
-      id: 'pattern_spotter',
-      name: 'Pattern Spotter',
-      description: 'Identify a linked case before the AI',
-      points: 500,
-      icon: '🧠'
-    }
+    { id: 'night_owl', name: 'Night Owl', description: 'Monitor 10 incidents after midnight', points: 100, icon: '🦉' },
+    { id: 'eagle_eye', name: 'Eagle Eye', description: 'Spot a HIGH priority incident within 30 seconds', points: 50, icon: '🦅' },
+    { id: 'analyst', name: 'Crime Analyst', description: 'Correctly predict 5 incident locations', points: 200, icon: '🔍' },
+    { id: 'manhattan_expert', name: 'Manhattan Expert', description: 'Track 50 incidents in Manhattan', points: 150, icon: '🏙️' },
+    { id: 'pattern_spotter', name: 'Pattern Spotter', description: 'Identify a linked case before the AI', points: 500, icon: '🧠' }
   ];
   
   res.json(challenges);
 });
 
-// Debug endpoint for scanner status
 app.get('/debug', (req, res) => {
   res.json({
     scanner: {
@@ -1606,6 +1619,9 @@ app.get('/debug', (req, res) => {
     connections: clients.size,
     incidents: incidents.length,
     cameras: cameras.length,
+    treasury: {
+      netProfitSOL: treasury.netProfit / 1e9
+    },
     uptime: process.uptime() + 's'
   });
 });
@@ -1617,6 +1633,8 @@ server.listen(PORT, '0.0.0.0', () => {
   
      DISPATCH - Police Scanner Intelligence
      Running on port ${PORT}
+     Treasury: ${TREASURY_WALLET.slice(0, 8)}...
+     House Edge: ${HOUSE_EDGE * 100}%
   
      WebSocket: ws://localhost:${PORT}
      REST API:  http://localhost:${PORT}
