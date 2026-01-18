@@ -769,35 +769,70 @@ fetchNYCCameras();
 // Broadcastify Scanner
 const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
-const NYPD_FEEDS = [
-  { id: '40184', name: 'NYPD Citywide 1' },
-  { id: '40185', name: 'NYPD Citywide 2' },
-  { id: '40186', name: 'NYPD Citywide 3' },
-  { id: '8498', name: 'NYPD Manhattan South' },
-  { id: '8499', name: 'NYPD Manhattan North' },
-  { id: '31371', name: 'NYPD Brooklyn North' },
-  { id: '31372', name: 'NYPD Brooklyn South' },
-  { id: '9275', name: 'NYPD Queens North' },
-  { id: '31373', name: 'NYPD Bronx' },
+
+// NYPD and NYC area feeds only
+const SCANNER_FEEDS = [
+  // NYPD Citywide
+  { id: '40184', name: 'NYPD Citywide 1', area: 'Citywide' },
+  { id: '40185', name: 'NYPD Citywide 2', area: 'Citywide' },
+  { id: '40186', name: 'NYPD Citywide 3', area: 'Citywide' },
+  // NYPD Borough
+  { id: '8498', name: 'NYPD Manhattan South', area: 'Manhattan' },
+  { id: '8499', name: 'NYPD Manhattan North', area: 'Manhattan' },
+  { id: '31371', name: 'NYPD Brooklyn North', area: 'Brooklyn' },
+  { id: '31372', name: 'NYPD Brooklyn South', area: 'Brooklyn' },
+  { id: '9275', name: 'NYPD Queens North', area: 'Queens' },
+  { id: '31373', name: 'NYPD Bronx', area: 'Bronx' },
+  // NYC EMS/Fire for more activity
+  { id: '8464', name: 'FDNY Citywide', area: 'Citywide' },
+  { id: '30875', name: 'NYC EMS', area: 'Citywide' },
+  // Transit
+  { id: '31653', name: 'NYPD Transit 1-2', area: 'Transit' },
+  { id: '31654', name: 'NYPD Transit 3-4', area: 'Transit' },
 ];
+
+// Keep NYPD_FEEDS reference for backwards compatibility
+const NYPD_FEEDS = SCANNER_FEEDS;
 
 let currentFeedIndex = 0;
 let lastProcessTime = Date.now();
-let consecutivePSAs = 0; // Track PSA-only chunks to switch feeds
-let currentStream = null; // Track current stream for forced reconnect
+let consecutivePSAs = 0;
+let currentStream = null;
+let feedAttempts = new Map();
 
-// INCREASED from 10 seconds to 20 seconds to capture full transmissions
 const CHUNK_DURATION = 20000;
 
-// Force switch to next feed (called when too many PSAs detected)
+// Detect when Whisper hallucinates/echoes the prompt (happens on silence)
+function isPromptEcho(text) {
+  const lower = text.toLowerCase();
+  // If it contains multiple 10-codes in a row without other content, it's likely an echo
+  if (lower.includes('10-4, 10-13, 10-85')) return true;
+  if (lower.includes('10-4 10-13 10-85')) return true;
+  if (lower.includes('forthwith, precinct, sector, central')) return true;
+  // Very short repeated phrases
+  if (lower.match(/^(10-\d+[,\s]*){3,}$/)) return true;
+  return false;
+}
+
 function forceNextFeed() {
   console.log(`[SCANNER] Force switching to next feed...`);
   if (currentStream) {
-    try {
-      currentStream.destroy();
-    } catch (e) {}
+    try { currentStream.destroy(); } catch (e) {}
   }
-  currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+  
+  feedAttempts.set(currentFeedIndex, (feedAttempts.get(currentFeedIndex) || 0) + 1);
+  
+  let attempts = 0;
+  do {
+    currentFeedIndex = (currentFeedIndex + 1) % SCANNER_FEEDS.length;
+    attempts++;
+  } while (feedAttempts.get(currentFeedIndex) >= 3 && attempts < SCANNER_FEEDS.length);
+  
+  if (feedAttempts.size > 10) {
+    feedAttempts.clear();
+    console.log('[SCANNER] Reset feed attempt counters');
+  }
+  
   consecutivePSAs = 0;
   setTimeout(startBroadcastifyStream, 1000);
 }
@@ -825,8 +860,8 @@ async function startBroadcastifyStream() {
     scannerStats.currentFeed = 'DISABLED - No password';
     return; 
   }
-  const feed = NYPD_FEEDS[currentFeedIndex];
-  console.log(`[SCANNER] Connecting to: ${feed.name} (feed ${feed.id})`);
+  const feed = SCANNER_FEEDS[currentFeedIndex];
+  console.log(`[SCANNER] Connecting to: ${feed.name} (${feed.area}) - feed ${feed.id}`);
 
   const options = {
     hostname: 'audio.broadcastify.com', port: 443, path: `/${feed.id}.mp3`, method: 'GET',
@@ -838,7 +873,7 @@ async function startBroadcastifyStream() {
     console.log(`[SCANNER] Response status: ${res.statusCode}`);
     if (res.statusCode !== 200) {
       console.log(`[SCANNER] Feed ${feed.name} returned ${res.statusCode}, trying next feed...`);
-      currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+      currentFeedIndex = (currentFeedIndex + 1) % SCANNER_FEEDS.length;
       setTimeout(startBroadcastifyStream, 5000);
       return;
     }
@@ -846,7 +881,7 @@ async function startBroadcastifyStream() {
   });
   req.on('error', (err) => { 
     console.error(`[SCANNER] Connection error: ${err.message}`);
-    currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length; 
+    currentFeedIndex = (currentFeedIndex + 1) % SCANNER_FEEDS.length; 
     setTimeout(startBroadcastifyStream, 10000); 
   });
   req.end();
@@ -1104,12 +1139,23 @@ async function processAudioFromStream(buffer, feedName) {
     console.log(`[SCANNER] Filtered: noise word`);
     return;
   }
+  
+  // Detect Whisper hallucinating/echoing the prompt (happens on silence)
+  if (isPromptEcho(clean)) {
+    console.log(`[SCANNER] Filtered: Whisper prompt echo (silence detected)`);
+    consecutivePSAs++;
+    if (consecutivePSAs >= 3) {
+      console.log(`[SCANNER] Too much silence on ${SCANNER_FEEDS[currentFeedIndex].name}, forcing feed switch...`);
+      forceNextFeed();
+    }
+    return;
+  }
+  
   if (lower.includes('broadcastify') || lower.includes('fema.gov') || lower.includes('fema gov') || lower.includes('for more information')) {
     console.log(`[SCANNER] Filtered: PSA/ad content`);
     consecutivePSAs++;
-    // If we get 3+ consecutive PSAs, switch to next feed
     if (consecutivePSAs >= 3) {
-      console.log(`[SCANNER] Too many PSAs on ${NYPD_FEEDS[currentFeedIndex].name}, forcing feed switch...`);
+      console.log(`[SCANNER] Too many PSAs on ${SCANNER_FEEDS[currentFeedIndex].name}, forcing feed switch...`);
       forceNextFeed();
     }
     return;
@@ -1324,7 +1370,12 @@ app.get('/incidents', (req, res) => res.json(incidents));
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 app.get('/audio/:id', (req, res) => { const buffer = audioClips.get(req.params.id); if (!buffer) return res.status(404).json({ error: 'Not found' }); res.set('Content-Type', 'audio/mpeg'); res.send(buffer); });
 app.get('/camera-image/:id', async (req, res) => { try { const response = await fetch(`https://webcams.nyctmc.org/api/cameras/${req.params.id}/image`); const buffer = await response.arrayBuffer(); res.set('Content-Type', 'image/jpeg'); res.send(Buffer.from(buffer)); } catch (e) { res.status(500).json({ error: 'Failed' }); } });
-app.get('/stream/feeds', (req, res) => res.json({ feeds: NYPD_FEEDS, currentFeed: NYPD_FEEDS[currentFeedIndex], streamUrl: '/stream/live' }));
+app.get('/stream/feeds', (req, res) => res.json({ 
+  feeds: SCANNER_FEEDS.map(f => ({ name: f.name, area: f.area, id: f.id })), 
+  currentFeed: SCANNER_FEEDS[currentFeedIndex], 
+  currentFeedIndex,
+  streamUrl: '/stream/live' 
+}));
 app.get('/debug', (req, res) => res.json({ 
   scanner: {
     ...scannerStats,
@@ -1332,7 +1383,9 @@ app.get('/debug', (req, res) => res.json({
     chunkDuration: CHUNK_DURATION,
     consecutivePSAs,
     currentFeedIndex,
-    availableFeeds: NYPD_FEEDS.map(f => f.name)
+    currentFeed: SCANNER_FEEDS[currentFeedIndex],
+    totalFeeds: SCANNER_FEEDS.length,
+    feedAttempts: Object.fromEntries(feedAttempts)
   }, 
   connections: clients.size, 
   incidents: incidents.length,
@@ -1380,15 +1433,16 @@ app.post('/test/incident', async (req, res) => {
 
 // Manually switch to next feed
 app.post('/test/next-feed', (req, res) => {
-  const oldFeed = NYPD_FEEDS[currentFeedIndex].name;
+  const oldFeed = SCANNER_FEEDS[currentFeedIndex].name;
   forceNextFeed();
-  const newFeed = NYPD_FEEDS[currentFeedIndex].name;
+  const newFeed = SCANNER_FEEDS[currentFeedIndex].name;
   console.log(`[TEST] Manually switched from ${oldFeed} to ${newFeed}`);
   res.json({ 
     success: true, 
     previousFeed: oldFeed, 
     currentFeed: newFeed,
-    availableFeeds: NYPD_FEEDS.map(f => f.name)
+    currentFeedIndex,
+    availableFeeds: SCANNER_FEEDS.map(f => ({ name: f.name, area: f.area }))
   });
 });
 
@@ -1402,7 +1456,7 @@ wss.on('connection', (ws) => {
     incidents: incidents.slice(0, 30), // More incidents for new users
     cameras,
     transcripts: recentTranscripts.slice(0, 30), // More transcripts
-    currentFeed: NYPD_FEEDS[currentFeedIndex]?.name,
+    currentFeed: SCANNER_FEEDS[currentFeedIndex]?.name,
     agents: detectiveBureau.getAgentStatuses(),
     predictions: detectiveBureau.getPredictionStats(),
     patterns: detectiveBureau.memory.patterns.filter(p => p.status === 'active').slice(0, 10),
