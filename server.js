@@ -712,16 +712,18 @@ async function parseTranscript(transcript) {
       max_tokens: 800,
       system: `You are an expert NYPD radio parser. Your PRIMARY job is to extract LOCATION information.
 
+CRITICAL: If you cannot determine a specific location or borough from the transcript, you MUST return hasIncident: false. Do NOT guess or default to any borough.
+
 LOCATION EXTRACTION RULES:
 1. Look for street addresses: "123 West 45th Street" → location: "123 W 45th St"
 2. Look for intersections: "42nd and Lexington", "at the corner of Broadway and 125th" → location: "42nd St & Lexington Ave"
 3. Look for landmarks: "Times Square", "Penn Station", "Grand Central", "Port Authority" → use landmark name
-4. Look for precinct references: "the 7-5", "75 precinct", "seven-five" → location: "75th Precinct", borough: "Brooklyn"
+4. Look for precinct references: "the 7-5", "75 precinct", "seven-five" → location: "75th Precinct area", borough: "Brooklyn"
 5. Look for sector/Adam/Boy/Charlie designations with location context
 6. Look for highways: "FDR at 96th", "BQE", "Cross Bronx" → use highway location
 7. Look for project names, building names, park names
 
-PRECINCT TO BOROUGH MAPPING:
+PRECINCT TO BOROUGH MAPPING (only use when precinct is clearly mentioned):
 - 1-34: Manhattan
 - 40-52: Bronx  
 - 60-94: Brooklyn
@@ -730,8 +732,13 @@ PRECINCT TO BOROUGH MAPPING:
 
 When you hear "the 7-5" or "75" or "seven-five" in context of a precinct, that's the 75th Precinct in Brooklyn.
 When you hear "the 4-4" or "44", that's the 44th Precinct in the Bronx.
+When you hear "121" or "one-two-one", that's the 121st Precinct in Staten Island.
 
-If NO location can be determined, set location to null (not "Unknown").
+CRITICAL RULES:
+- If the transcript is just routine chatter without a specific incident, return hasIncident: false
+- If the transcript mentions no specific location, return hasIncident: false
+- NEVER default borough to "Staten Island" or any other borough - only set it if you can determine it from the transcript
+- If you can determine a precinct number but no specific address, use "Xth Precinct area" as location
 
 INCIDENT TYPE MAPPING:
 - 10-10: Possible crime
@@ -749,17 +756,17 @@ INCIDENT TYPE MAPPING:
 
 Respond ONLY with valid JSON:
 {
-  "hasIncident": boolean,
+  "hasIncident": boolean (FALSE if no clear incident or location),
   "incidentType": "string describing incident",
   "location": "specific location or null if none found",
-  "borough": "Manhattan/Brooklyn/Bronx/Queens/Staten Island/Unknown",
+  "borough": "Manhattan/Brooklyn/Bronx/Queens/Staten Island or null if unknown",
   "units": ["unit IDs mentioned"],
   "priority": "CRITICAL/HIGH/MEDIUM/LOW",
   "summary": "brief summary",
   "rawCodes": ["any 10-codes heard"],
   "precinctMentioned": "number or null"
 }`,
-      messages: [{ role: "user", content: `Parse this NYPD radio transmission and extract any location information:\n\n"${transcript}"` }]
+      messages: [{ role: "user", content: `Parse this NYPD radio transmission and extract any location information. If there's no clear incident or location, return hasIncident: false.\n\n"${transcript}"` }]
     });
     
     const text = response.content[0].text;
@@ -769,11 +776,11 @@ Respond ONLY with valid JSON:
       const parsed = JSON.parse(jsonMatch[0]);
       
       // If precinct mentioned but no borough, look it up
-      if (parsed.precinctMentioned && (!parsed.borough || parsed.borough === 'Unknown')) {
+      if (parsed.precinctMentioned && (!parsed.borough || parsed.borough === 'Unknown' || parsed.borough === null)) {
         const boroughFromPrecinct = getPrecinctBorough(parsed.precinctMentioned);
         if (boroughFromPrecinct) {
           parsed.borough = boroughFromPrecinct;
-          if (!parsed.location || parsed.location === 'Unknown') {
+          if (!parsed.location || parsed.location === 'Unknown' || parsed.location === null) {
             parsed.location = `${parsed.precinctMentioned}th Precinct area`;
           }
         }
@@ -782,6 +789,17 @@ Respond ONLY with valid JSON:
       // Convert null location to "Unknown" for backwards compatibility
       if (parsed.location === null) {
         parsed.location = 'Unknown';
+      }
+      
+      // Convert null borough to "Unknown"
+      if (parsed.borough === null) {
+        parsed.borough = 'Unknown';
+      }
+      
+      // If we still don't have a valid borough, don't treat this as an incident
+      if (parsed.borough === 'Unknown' && parsed.hasIncident) {
+        console.log('[PARSE] Incident detected but no borough - downgrading to monitoring');
+        parsed.hasIncident = false;
       }
       
       return parsed;
@@ -794,12 +812,45 @@ Respond ONLY with valid JSON:
 }
 
 function findNearestCamera(location, lat, lng, borough) {
-  if (cameras.length === 0) return null;
+  // Borough center coordinates as fallback
+  const BOROUGH_CENTERS = {
+    'Manhattan': { lat: 40.7831, lng: -73.9712 },
+    'Brooklyn': { lat: 40.6782, lng: -73.9442 },
+    'Bronx': { lat: 40.8448, lng: -73.8648 },
+    'Queens': { lat: 40.7282, lng: -73.7949 },
+    'Staten Island': { lat: 40.5795, lng: -74.1502 }
+  };
+
+  if (cameras.length === 0) {
+    // Return a fake camera with borough center coordinates
+    if (borough && BOROUGH_CENTERS[borough]) {
+      return {
+        id: `fallback_${borough}`,
+        location: `${borough} (approximate)`,
+        lat: BOROUGH_CENTERS[borough].lat,
+        lng: BOROUGH_CENTERS[borough].lng,
+        area: borough,
+        isFallback: true
+      };
+    }
+    return null;
+  }
+  
   let searchCameras = cameras;
   
   // First, try to match by borough
   if (borough && borough !== 'Unknown') {
-    const boroughCameras = cameras.filter(cam => cam.area?.toLowerCase().includes(borough.toLowerCase()));
+    const boroughCameras = cameras.filter(cam => {
+      const area = cam.area?.toLowerCase() || '';
+      const boroughLower = borough.toLowerCase();
+      // Handle variations like "SI" for Staten Island, "BK" for Brooklyn, etc.
+      return area.includes(boroughLower) || 
+             (boroughLower === 'staten island' && (area.includes('staten') || area.includes('richmond') || area === 'si')) ||
+             (boroughLower === 'brooklyn' && (area.includes('brooklyn') || area.includes('kings') || area === 'bk')) ||
+             (boroughLower === 'manhattan' && (area.includes('manhattan') || area.includes('new york') || area === 'mn')) ||
+             (boroughLower === 'bronx' && (area.includes('bronx') || area === 'bx')) ||
+             (boroughLower === 'queens' && (area.includes('queens') || area === 'qn'));
+    });
     if (boroughCameras.length > 0) searchCameras = boroughCameras;
   }
   
@@ -818,8 +869,24 @@ function findNearestCamera(location, lat, lng, borough) {
     }
   }
   
-  // Fallback to random camera in borough
-  return searchCameras[Math.floor(Math.random() * searchCameras.length)];
+  // Fallback to random camera in search set
+  if (searchCameras.length > 0) {
+    return searchCameras[Math.floor(Math.random() * searchCameras.length)];
+  }
+  
+  // Ultimate fallback: borough center coordinates
+  if (borough && BOROUGH_CENTERS[borough]) {
+    return {
+      id: `fallback_${borough}`,
+      location: `${borough} (approximate)`,
+      lat: BOROUGH_CENTERS[borough].lat,
+      lng: BOROUGH_CENTERS[borough].lng,
+      area: borough,
+      isFallback: true
+    };
+  }
+  
+  return cameras[Math.floor(Math.random() * cameras.length)];
 }
 
 async function processAudioFromStream(buffer, feedName) {
@@ -831,10 +898,13 @@ async function processAudioFromStream(buffer, feedName) {
   const clean = transcript.trim();
   const lower = clean.toLowerCase();
   
-  // Filter out noise
-  const noise = ['thank you', 'thanks for watching', 'subscribe', 'you', 'bye', 'music'];
+  // Filter out noise - expanded list
+  const noise = ['thank you', 'thanks for watching', 'subscribe', 'you', 'bye', 'music', 'for more'];
   if (noise.some(n => lower === n || lower === n + '.')) return;
   if (lower.includes('broadcastify') || lower.includes('fema.gov')) return;
+  if (lower.includes('www.') || lower.includes('.org') || lower.includes('.com') || lower.includes('.gov')) return;
+  if (lower.includes('un videos') || lower.includes('united nations')) return;
+  if (lower.includes('visit') && lower.includes('more')) return;
   
   scannerStats.lastTranscript = clean.substring(0, 200);
   scannerStats.successfulTranscripts++;
