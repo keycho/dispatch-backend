@@ -785,13 +785,27 @@ let scannerStats = { currentFeed: null, lastChunkTime: null, lastTranscript: nul
 
 function broadcast(data) {
   const message = JSON.stringify(data);
-  clients.forEach(client => { if (client.readyState === 1) client.send(message); });
+  let sentCount = 0;
+  clients.forEach(client => { 
+    if (client.readyState === 1) {
+      client.send(message);
+      sentCount++;
+    }
+  });
+  // Log broadcasts for transcripts and incidents
+  if (data.type === 'transcript' || data.type === 'incident') {
+    console.log(`[BROADCAST] ${data.type} sent to ${sentCount}/${clients.size} clients`);
+  }
 }
 
 async function startBroadcastifyStream() {
-  if (!BROADCASTIFY_PASSWORD) { console.log('BROADCASTIFY_PASSWORD not set'); return; }
+  if (!BROADCASTIFY_PASSWORD) { 
+    console.log('[SCANNER] BROADCASTIFY_PASSWORD not set - scanner disabled'); 
+    scannerStats.currentFeed = 'DISABLED - No password';
+    return; 
+  }
   const feed = NYPD_FEEDS[currentFeedIndex];
-  console.log(`Connecting to: ${feed.name}`);
+  console.log(`[SCANNER] Connecting to: ${feed.name} (feed ${feed.id})`);
 
   const options = {
     hostname: 'audio.broadcastify.com', port: 443, path: `/${feed.id}.mp3`, method: 'GET',
@@ -800,20 +814,27 @@ async function startBroadcastifyStream() {
   };
 
   const req = https.request(options, (res) => {
+    console.log(`[SCANNER] Response status: ${res.statusCode}`);
     if (res.statusCode !== 200) {
+      console.log(`[SCANNER] Feed ${feed.name} returned ${res.statusCode}, trying next feed...`);
       currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
       setTimeout(startBroadcastifyStream, 5000);
       return;
     }
     handleStream(res, feed);
   });
-  req.on('error', () => { currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length; setTimeout(startBroadcastifyStream, 10000); });
+  req.on('error', (err) => { 
+    console.error(`[SCANNER] Connection error: ${err.message}`);
+    currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length; 
+    setTimeout(startBroadcastifyStream, 10000); 
+  });
   req.end();
 }
 
 function handleStream(stream, feed) {
-  console.log(`Connected to ${feed.name}!`);
+  console.log(`[SCANNER] ✅ Connected to ${feed.name}!`);
   scannerStats.currentFeed = feed.name;
+  scannerStats.connectedAt = new Date().toISOString();
   let chunks = [];
   
   stream.on('data', (chunk) => {
@@ -824,12 +845,19 @@ function handleStream(stream, feed) {
       lastProcessTime = Date.now();
       scannerStats.lastChunkTime = new Date().toISOString();
       scannerStats.totalChunks++;
+      console.log(`[SCANNER] Processing chunk #${scannerStats.totalChunks} (${fullBuffer.length} bytes)`);
       processAudioFromStream(fullBuffer, feed.name);
     }
   });
   
-  stream.on('end', () => { setTimeout(startBroadcastifyStream, 2000); });
-  stream.on('error', () => { setTimeout(startBroadcastifyStream, 5000); });
+  stream.on('end', () => { 
+    console.log('[SCANNER] Stream ended, reconnecting...');
+    setTimeout(startBroadcastifyStream, 2000); 
+  });
+  stream.on('error', (err) => { 
+    console.error(`[SCANNER] Stream error: ${err.message}`);
+    setTimeout(startBroadcastifyStream, 5000); 
+  });
 }
 
 async function transcribeAudio(audioBuffer) {
@@ -1031,23 +1059,47 @@ function findNearestCamera(location, lat, lng, borough) {
 }
 
 async function processAudioFromStream(buffer, feedName) {
-  if (buffer.length < 5000) return;
+  if (buffer.length < 5000) {
+    console.log(`[SCANNER] Buffer too small: ${buffer.length} bytes`);
+    return;
+  }
   
+  console.log(`[SCANNER] Transcribing ${buffer.length} bytes...`);
   const transcript = await transcribeAudio(buffer);
-  if (!transcript || transcript.trim().length < 10) return;
+  if (!transcript || transcript.trim().length < 10) {
+    console.log(`[SCANNER] No transcript or too short`);
+    return;
+  }
   
   const clean = transcript.trim();
   const lower = clean.toLowerCase();
+  console.log(`[SCANNER] Got transcript: "${clean.substring(0, 50)}..."`);
   
   // Filter out noise - but don't be too aggressive
   const noise = ['thank you', 'thanks for watching', 'subscribe', 'bye', 'music'];
-  if (noise.some(n => lower === n || lower === n + '.')) return;
-  if (lower.includes('broadcastify') || lower.includes('fema.gov')) return;
-  if (lower.includes('un videos') || lower.includes('for more un videos')) return;
+  if (noise.some(n => lower === n || lower === n + '.')) {
+    console.log(`[SCANNER] Filtered: noise word`);
+    return;
+  }
+  if (lower.includes('broadcastify') || lower.includes('fema.gov')) {
+    console.log(`[SCANNER] Filtered: broadcastify/fema`);
+    return;
+  }
+  if (lower.includes('un videos') || lower.includes('for more un videos')) {
+    console.log(`[SCANNER] Filtered: UN videos`);
+    return;
+  }
   // Only filter URLs if they're the main content, not mentioned in passing
-  if (lower.startsWith('for more') && (lower.includes('.org') || lower.includes('.com'))) return;
-  if (clean.length < 15 && (lower.includes('www.') || lower.includes('.org'))) return;
+  if (lower.startsWith('for more') && (lower.includes('.org') || lower.includes('.com'))) {
+    console.log(`[SCANNER] Filtered: URL spam`);
+    return;
+  }
+  if (clean.length < 15 && (lower.includes('www.') || lower.includes('.org'))) {
+    console.log(`[SCANNER] Filtered: short URL`);
+    return;
+  }
   
+  console.log(`[SCANNER] ✅ Transcript passed filters, broadcasting...`);
   scannerStats.lastTranscript = clean.substring(0, 200);
   scannerStats.successfulTranscripts++;
   
@@ -1242,7 +1294,55 @@ app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().
 app.get('/audio/:id', (req, res) => { const buffer = audioClips.get(req.params.id); if (!buffer) return res.status(404).json({ error: 'Not found' }); res.set('Content-Type', 'audio/mpeg'); res.send(buffer); });
 app.get('/camera-image/:id', async (req, res) => { try { const response = await fetch(`https://webcams.nyctmc.org/api/cameras/${req.params.id}/image`); const buffer = await response.arrayBuffer(); res.set('Content-Type', 'image/jpeg'); res.send(Buffer.from(buffer)); } catch (e) { res.status(500).json({ error: 'Failed' }); } });
 app.get('/stream/feeds', (req, res) => res.json({ feeds: NYPD_FEEDS, currentFeed: NYPD_FEEDS[currentFeedIndex], streamUrl: '/stream/live' }));
-app.get('/debug', (req, res) => res.json({ scanner: scannerStats, connections: clients.size, incidents: incidents.length, cameras: cameras.length, agents: detectiveBureau.getAgentStatuses(), predictions: detectiveBureau.getPredictionStats() }));
+app.get('/debug', (req, res) => res.json({ 
+  scanner: {
+    ...scannerStats,
+    passwordSet: !!BROADCASTIFY_PASSWORD,
+    chunkDuration: CHUNK_DURATION
+  }, 
+  connections: clients.size, 
+  incidents: incidents.length,
+  transcripts: recentTranscripts.length,
+  cameras: cameras.length, 
+  agents: detectiveBureau.getAgentStatuses(), 
+  predictions: detectiveBureau.getPredictionStats() 
+}));
+
+// Test endpoint to verify WebSocket broadcast is working
+app.post('/test/broadcast', (req, res) => {
+  const testTranscript = {
+    type: "transcript",
+    text: `[TEST] Scanner test at ${new Date().toLocaleTimeString()} - this is a test broadcast`,
+    source: "Test",
+    timestamp: new Date().toISOString()
+  };
+  broadcast(testTranscript);
+  console.log(`[TEST] Broadcast sent to ${clients.size} clients`);
+  res.json({ success: true, clientCount: clients.size, message: testTranscript });
+});
+
+// Test endpoint to simulate an incident
+app.post('/test/incident', async (req, res) => {
+  const testIncident = {
+    id: ++incidentId,
+    hasIncident: true,
+    incidentType: "Test Incident",
+    location: "Times Square",
+    borough: "Manhattan",
+    priority: "HIGH",
+    summary: "This is a test incident for debugging",
+    lat: 40.758,
+    lng: -73.9855,
+    timestamp: new Date().toISOString()
+  };
+  
+  incidents.unshift(testIncident);
+  saveIncidents(incidents);
+  broadcast({ type: "incident", incident: testIncident });
+  
+  console.log(`[TEST] Incident broadcast sent to ${clients.size} clients`);
+  res.json({ success: true, clientCount: clients.size, incident: testIncident });
+});
 
 // WebSocket
 wss.on('connection', (ws) => {
