@@ -281,15 +281,26 @@ async function processAudioFromStream(buffer, feedName) {
     
     if (parsed.hasIncident) {
       incidentId++;
-      const camera = findNearestCamera(parsed.location || "");
+      const camera = findNearestCamera(parsed.location || "", null, null, parsed.borough);
+      
+      // Store audio clip
+      const audioId = `audio_${incidentId}_${Date.now()}`;
+      audioClips.set(audioId, buffer);
+      
+      // Cleanup old clips
+      if (audioClips.size > MAX_AUDIO_CLIPS) {
+        const firstKey = audioClips.keys().next().value;
+        audioClips.delete(firstKey);
+      }
       
       const incident = {
         id: incidentId,
         ...parsed,
+        transcript: cleanTranscript,
+        audioUrl: `/audio/${audioId}`,
         camera: camera,
         source: feedName,
-        timestamp: new Date().toISOString(),
-        status: "ACTIVE"
+        timestamp: new Date().toISOString()
       };
       
       incidents.unshift(incident);
@@ -304,11 +315,13 @@ async function processAudioFromStream(buffer, feedName) {
         broadcast({
           type: "camera_switch",
           camera: camera,
-          reason: `${parsed.incidentType} at ${parsed.location}`
+          reason: `${parsed.incidentType} at ${parsed.location}`,
+          priority: parsed.priority
         });
       }
       
-      console.log('Incident detected:', incident);
+      console.log('Incident detected:', incident.incidentType, '@', incident.location, '- Priority:', incident.priority);
+    }
     }
     
     broadcast({
@@ -332,6 +345,10 @@ setTimeout(startBroadcastifyStream, 5000);
 const incidents = [];
 let incidentId = 0;
 
+// Audio clip storage (for playback)
+const audioClips = new Map();
+const MAX_AUDIO_CLIPS = 50;
+
 // Broadcast to all connected clients
 function broadcast(data) {
   const message = JSON.stringify(data);
@@ -342,8 +359,8 @@ function broadcast(data) {
   });
 }
 
-// Find nearest camera to a location using text matching and coordinates
-function findNearestCamera(location, lat = null, lng = null) {
+// Find nearest camera to a location using text matching, coordinates, and borough
+function findNearestCamera(location, lat = null, lng = null, borough = null) {
   if (cameras.length === 0) {
     return null;
   }
@@ -365,11 +382,26 @@ function findNearestCamera(location, lat = null, lng = null) {
     return nearest;
   }
   
-  // Otherwise try text matching
+  // Filter by borough first if available
+  let searchCameras = cameras;
+  if (borough && borough !== 'Unknown') {
+    const boroughCameras = cameras.filter(cam => 
+      cam.area && cam.area.toLowerCase().includes(borough.toLowerCase())
+    );
+    if (boroughCameras.length > 0) {
+      searchCameras = boroughCameras;
+    }
+  }
+  
+  // Try text matching on location
   const locationLower = location.toLowerCase();
   
-  for (const cam of cameras) {
+  // Extract street numbers and names
+  const streetMatch = locationLower.match(/(\d+)(?:st|nd|rd|th)?\s*(street|st|avenue|ave|place|pl|road|rd|boulevard|blvd)/i);
+  
+  for (const cam of searchCameras) {
     const camLocationLower = cam.location.toLowerCase();
+    
     // Check if any part of the location matches
     const locationParts = locationLower.split(/[&@,\s]+/);
     for (const part of locationParts) {
@@ -379,8 +411,8 @@ function findNearestCamera(location, lat = null, lng = null) {
     }
   }
   
-  // Default to a random camera if no match
-  return cameras[Math.floor(Math.random() * cameras.length)];
+  // Return random camera from the borough, or any camera
+  return searchCameras[Math.floor(Math.random() * searchCameras.length)];
 }
 
 // Parse scanner transcript with Claude
@@ -388,29 +420,53 @@ async function parseTranscript(transcript) {
   try {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 500,
-      system: `You are a police scanner analyst. Extract incident information from radio transcripts.
-      
+      max_tokens: 600,
+      system: `You are an expert NYPD radio analyst. Parse radio transmissions and extract structured incident data.
+
+NYPD Radio Terminology:
+- K = Acknowledged
+- 10-13 = Officer needs assistance (URGENT)
+- 10-85 = Officer needs backup
+- 10-52/10-53 = Ambulance needed
+- 10-34 = Assault in progress
+- 10-30 = Robbery in progress
+- 10-31 = Crime in progress
+- EDP = Emotionally Disturbed Person
+- DOA = Dead on Arrival
+- RMP = Radio Motor Patrol (police car)
+- Aided = Person needing medical help
+- Forthwith = Immediately
+- Central = Dispatch
+
+Unit Format: [Number]-[Letter] (e.g., "85-David" = 85th precinct, David sector)
+
 Respond ONLY in this JSON format:
 {
   "hasIncident": true/false,
-  "incidentType": "string (e.g., 'Vehicle Collision', 'Robbery in Progress', 'Medical Emergency')",
-  "location": "string (cross streets or address)",
-  "units": "string (responding units if mentioned)",
-  "priority": "HIGH/MEDIUM/LOW",
-  "summary": "string (brief description)"
+  "incidentType": "string (be specific: 'Armed Robbery', 'Vehicle Collision with Injuries', 'Shots Fired', 'Domestic Dispute', 'Medical Emergency', 'Suspicious Person', 'Traffic Stop', etc.)",
+  "location": "string (cross streets or address in NYC format)",
+  "units": ["array of responding units"],
+  "priority": "CRITICAL/HIGH/MEDIUM/LOW",
+  "status": "DISPATCHED/EN_ROUTE/ON_SCENE/RESOLVED",
+  "summary": "string (dramatic but accurate 1-sentence description)",
+  "rawCodes": ["any 10-codes or signals mentioned"],
+  "borough": "Manhattan/Brooklyn/Bronx/Queens/Staten Island/Unknown"
 }
 
-If no clear incident, set hasIncident to false.
-Common codes: 10-50 = Accident, 10-31 = Crime in Progress, 10-52 = Medical, 10-34 = Assault`,
+Priority Guide:
+- CRITICAL: Officer down, shots fired, active shooter, pursuit
+- HIGH: Robbery in progress, assault, 10-13, 10-85
+- MEDIUM: Domestic, EDP, vehicle accident with injuries
+- LOW: Traffic stops, noise complaints, aided cases
+
+If no clear incident (just routine radio chatter), set hasIncident to false.`,
       messages: [{
         role: "user",
-        content: `Parse this scanner transcript:\n\n"${transcript}"`
+        content: `Parse this NYPD radio transmission:\n\n"${transcript}"`
       }]
     });
 
     const text = response.content[0].text;
-    // Extract JSON from response
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]);
@@ -431,7 +487,8 @@ async function transcribeAudio(audioBuffer) {
     const transcription = await openai.audio.transcriptions.create({
       file: file,
       model: "whisper-1",
-      language: "en"
+      language: "en",
+      prompt: "NYPD police radio dispatch. Units: Central, David, Adam, Boy, Charlie, Edward, Frank, George, Henry, Ida, John, King, Lincoln, Mary, Nora, Ocean, Peter, Queen, Robert, Sam, Tom, Union, Victor, William, X-ray, Young, Zebra. Codes: 10-4, 10-13, 10-85, 10-52, 10-53, 10-34, K, forthwith, precinct, sector, respond, en route, on scene, perp, EDP, aided, DOA, RMP."
     });
 
     return transcription.text;
@@ -615,6 +672,21 @@ app.get('/refresh-cameras', async (req, res) => {
 
 app.get('/incidents', (req, res) => {
   res.json(incidents);
+});
+
+// Serve audio clips for playback
+app.get('/audio/:id', (req, res) => {
+  const audioId = req.params.id;
+  const buffer = audioClips.get(audioId);
+  
+  if (!buffer) {
+    return res.status(404).json({ error: 'Audio clip not found or expired' });
+  }
+  
+  res.set('Content-Type', 'audio/mpeg');
+  res.set('Content-Length', buffer.length);
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.send(buffer);
 });
 
 // Health check
