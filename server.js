@@ -773,13 +773,34 @@ const NYPD_FEEDS = [
   { id: '40184', name: 'NYPD Citywide 1' },
   { id: '40185', name: 'NYPD Citywide 2' },
   { id: '40186', name: 'NYPD Citywide 3' },
+  { id: '8498', name: 'NYPD Manhattan South' },
+  { id: '8499', name: 'NYPD Manhattan North' },
+  { id: '31371', name: 'NYPD Brooklyn North' },
+  { id: '31372', name: 'NYPD Brooklyn South' },
+  { id: '9275', name: 'NYPD Queens North' },
+  { id: '31373', name: 'NYPD Bronx' },
 ];
 
 let currentFeedIndex = 0;
 let lastProcessTime = Date.now();
+let consecutivePSAs = 0; // Track PSA-only chunks to switch feeds
+let currentStream = null; // Track current stream for forced reconnect
 
 // INCREASED from 10 seconds to 20 seconds to capture full transmissions
 const CHUNK_DURATION = 20000;
+
+// Force switch to next feed (called when too many PSAs detected)
+function forceNextFeed() {
+  console.log(`[SCANNER] Force switching to next feed...`);
+  if (currentStream) {
+    try {
+      currentStream.destroy();
+    } catch (e) {}
+  }
+  currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+  consecutivePSAs = 0;
+  setTimeout(startBroadcastifyStream, 1000);
+}
 
 let scannerStats = { currentFeed: null, lastChunkTime: null, lastTranscript: null, totalChunks: 0, successfulTranscripts: 0 };
 
@@ -833,8 +854,10 @@ async function startBroadcastifyStream() {
 
 function handleStream(stream, feed) {
   console.log(`[SCANNER] ✅ Connected to ${feed.name}!`);
+  currentStream = stream; // Track for forced reconnect
   scannerStats.currentFeed = feed.name;
   scannerStats.connectedAt = new Date().toISOString();
+  consecutivePSAs = 0; // Reset on new connection
   let chunks = [];
   
   stream.on('data', (chunk) => {
@@ -1081,10 +1104,18 @@ async function processAudioFromStream(buffer, feedName) {
     console.log(`[SCANNER] Filtered: noise word`);
     return;
   }
-  if (lower.includes('broadcastify') || lower.includes('fema.gov')) {
-    console.log(`[SCANNER] Filtered: broadcastify/fema`);
+  if (lower.includes('broadcastify') || lower.includes('fema.gov') || lower.includes('fema gov') || lower.includes('for more information')) {
+    console.log(`[SCANNER] Filtered: PSA/ad content`);
+    consecutivePSAs++;
+    // If we get 3+ consecutive PSAs, switch to next feed
+    if (consecutivePSAs >= 3) {
+      console.log(`[SCANNER] Too many PSAs on ${NYPD_FEEDS[currentFeedIndex].name}, forcing feed switch...`);
+      forceNextFeed();
+    }
     return;
   }
+  // Reset PSA counter when we get real content
+  consecutivePSAs = 0;
   if (lower.includes('un videos') || lower.includes('for more un videos')) {
     console.log(`[SCANNER] Filtered: UN videos`);
     return;
@@ -1298,7 +1329,10 @@ app.get('/debug', (req, res) => res.json({
   scanner: {
     ...scannerStats,
     passwordSet: !!BROADCASTIFY_PASSWORD,
-    chunkDuration: CHUNK_DURATION
+    chunkDuration: CHUNK_DURATION,
+    consecutivePSAs,
+    currentFeedIndex,
+    availableFeeds: NYPD_FEEDS.map(f => f.name)
   }, 
   connections: clients.size, 
   incidents: incidents.length,
@@ -1342,6 +1376,20 @@ app.post('/test/incident', async (req, res) => {
   
   console.log(`[TEST] Incident broadcast sent to ${clients.size} clients`);
   res.json({ success: true, clientCount: clients.size, incident: testIncident });
+});
+
+// Manually switch to next feed
+app.post('/test/next-feed', (req, res) => {
+  const oldFeed = NYPD_FEEDS[currentFeedIndex].name;
+  forceNextFeed();
+  const newFeed = NYPD_FEEDS[currentFeedIndex].name;
+  console.log(`[TEST] Manually switched from ${oldFeed} to ${newFeed}`);
+  res.json({ 
+    success: true, 
+    previousFeed: oldFeed, 
+    currentFeed: newFeed,
+    availableFeeds: NYPD_FEEDS.map(f => f.name)
+  });
 });
 
 // WebSocket
