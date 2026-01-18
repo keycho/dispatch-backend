@@ -376,6 +376,37 @@ async function processAudioFromStream(buffer, feedName) {
       }
       
       console.log('Incident detected:', incident.incidentType, '@', incident.location, '- Priority:', incident.priority);
+      
+      // Generate Claude's detective commentary (async, don't block)
+      generateDetectiveCommentary(incident, recentIncidentsForAnalysis.slice(0, 5))
+        .then(commentary => {
+          if (commentary) {
+            broadcast({
+              type: "detective_commentary",
+              incidentId: incident.id,
+              commentary: commentary,
+              timestamp: new Date().toISOString()
+            });
+          }
+        });
+      
+      // If this incident is linked to others, build a case file
+      if (linkAnalysis && linkAnalysis.linkedIncidentIds?.length > 0) {
+        const linkedIncs = incidents.filter(i => 
+          linkAnalysis.linkedIncidentIds.includes(i.id) || i.id === incident.id
+        );
+        buildCaseFile(linkedIncs, linkAnalysis)
+          .then(caseFile => {
+            if (caseFile) {
+              broadcast({
+                type: "new_case",
+                caseFile: caseFile,
+                timestamp: new Date().toISOString()
+              });
+              console.log(`[Claude Detective] New case: ${caseFile.caseName}`);
+            }
+          });
+      }
     }
     
     broadcast({
@@ -516,6 +547,228 @@ Respond in JSON:
   
   return null;
 }
+
+// ============================================
+// CLAUDE DETECTIVE - AI Crime Investigation
+// ============================================
+
+// Active case files
+const caseFiles = new Map();
+let caseNumber = 0;
+
+// Generate detective commentary for new incidents
+async function generateDetectiveCommentary(incident, recentIncidents) {
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 300,
+      system: `You are Claude, an AI detective analyzing NYPD radio traffic in real-time. You speak like a seasoned detective - observant, analytical, sometimes dry wit. Keep responses to 2-3 sentences max.
+
+Your job:
+- Notice patterns others might miss
+- Make educated deductions about suspects/situations  
+- Connect dots between incidents
+- Provide insight a regular person wouldn't have
+
+Style: Think noir detective meets data analyst. Be specific, reference actual details from the incidents. Never be generic.`,
+      messages: [{
+        role: "user",
+        content: `New incident just came in:
+${JSON.stringify(incident, null, 2)}
+
+Recent incidents in the last hour:
+${JSON.stringify(recentIncidents.slice(0, 5), null, 2)}
+
+Give your detective's take on this - what do you notice? Any connections? What should we watch for?`
+      }]
+    });
+
+    return response.content[0].text;
+  } catch (error) {
+    console.error('[Claude Detective] Commentary error:', error.message);
+    return null;
+  }
+}
+
+// Build a case file when pattern detected
+async function buildCaseFile(linkedIncidents, linkAnalysis) {
+  try {
+    caseNumber++;
+    
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 600,
+      system: `You are Claude, an AI detective. Create a case file for linked crimes.
+
+Return JSON:
+{
+  "caseName": "string (creative name like 'The Bronx Phantom' or 'Midtown Smash & Grab Ring')",
+  "summary": "string (2-3 sentence executive summary)",
+  "suspectProfile": "string (what we can deduce about the perpetrator)",
+  "modus_operandi": "string (how they operate)",
+  "predictedNextMove": "string (where/when they might strike next)",
+  "recommendedAction": "string (what police should do)",
+  "confidenceLevel": "HIGH/MEDIUM/LOW",
+  "threatLevel": "CRITICAL/HIGH/MEDIUM/LOW"
+}`,
+      messages: [{
+        role: "user",
+        content: `Build a case file for these linked incidents:
+${JSON.stringify(linkedIncidents, null, 2)}
+
+Link analysis: ${JSON.stringify(linkAnalysis)}`
+      }]
+    });
+
+    const text = response.content[0].text;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    
+    if (jsonMatch) {
+      const caseData = JSON.parse(jsonMatch[0]);
+      
+      const caseFile = {
+        id: caseNumber,
+        ...caseData,
+        incidents: linkedIncidents.map(i => i.id),
+        incidentCount: linkedIncidents.length,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        status: 'OPEN'
+      };
+      
+      caseFiles.set(caseNumber, caseFile);
+      
+      return caseFile;
+    }
+  } catch (error) {
+    console.error('[Claude Detective] Case file error:', error.message);
+  }
+  return null;
+}
+
+// Let users ask Claude about cases/incidents
+app.post('/detective/ask', express.json(), async (req, res) => {
+  const { question, incidentId, caseId } = req.body;
+  
+  if (!question) {
+    return res.status(400).json({ error: 'Question required' });
+  }
+  
+  // Get context
+  let context = '';
+  
+  if (incidentId) {
+    const incident = incidents.find(i => i.id === incidentId);
+    if (incident) {
+      context += `\nIncident in question:\n${JSON.stringify(incident, null, 2)}`;
+    }
+  }
+  
+  if (caseId) {
+    const caseFile = caseFiles.get(parseInt(caseId));
+    if (caseFile) {
+      context += `\nCase file:\n${JSON.stringify(caseFile, null, 2)}`;
+      // Add linked incidents
+      const linkedIncs = incidents.filter(i => caseFile.incidents.includes(i.id));
+      context += `\nLinked incidents:\n${JSON.stringify(linkedIncs, null, 2)}`;
+    }
+  }
+  
+  // Add recent incidents for general context
+  context += `\nRecent incidents:\n${JSON.stringify(incidents.slice(0, 10), null, 2)}`;
+  
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 500,
+      system: `You are Claude, an AI detective working with the NYPD. You have access to real-time scanner data and incident reports.
+
+Your personality:
+- Analytical and observant
+- Confident but not arrogant
+- Sometimes darkly humorous
+- You care about public safety
+- You notice patterns and details others miss
+
+Answer questions about crimes, incidents, and patterns. Be specific and reference actual data when possible. If you don't know something, say so - don't make things up.`,
+      messages: [{
+        role: "user",
+        content: `Context:${context}
+
+User's question: ${question}`
+      }]
+    });
+
+    res.json({
+      answer: response.content[0].text,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all case files
+app.get('/detective/cases', (req, res) => {
+  const cases = Array.from(caseFiles.values())
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  res.json(cases);
+});
+
+// Get specific case file
+app.get('/detective/cases/:id', (req, res) => {
+  const caseFile = caseFiles.get(parseInt(req.params.id));
+  if (!caseFile) {
+    return res.status(404).json({ error: 'Case not found' });
+  }
+  
+  // Include full incident details
+  const fullIncidents = incidents.filter(i => caseFile.incidents.includes(i.id));
+  res.json({ ...caseFile, fullIncidents });
+});
+
+// Get Claude's daily briefing
+app.get('/detective/briefing', async (req, res) => {
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 600,
+      system: `You are Claude, an AI detective providing a daily briefing. Be concise, insightful, and actionable.`,
+      messages: [{
+        role: "user",
+        content: `Give me a detective's briefing based on recent activity:
+
+Total incidents: ${incidents.length}
+Open cases: ${caseFiles.size}
+
+Recent incidents:
+${JSON.stringify(incidents.slice(0, 15), null, 2)}
+
+Active cases:
+${JSON.stringify(Array.from(caseFiles.values()).slice(0, 5), null, 2)}
+
+Provide:
+1. Overall assessment of current crime activity
+2. Top concerns/hotspots
+3. Patterns you've noticed
+4. Predictions for the next few hours
+5. Recommendations`
+      }]
+    });
+
+    res.json({
+      briefing: response.content[0].text,
+      stats: {
+        totalIncidents: incidents.length,
+        openCases: caseFiles.size,
+        highPriorityIncidents: incidents.filter(i => ['CRITICAL', 'HIGH'].includes(i.priority)).length
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Incident log
 const incidents = [];
