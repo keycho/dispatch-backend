@@ -5,10 +5,18 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
+import cors from 'cors';
 
 dotenv.config();
 
 const app = express();
+
+// CORS configuration - allow all origins for now
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
