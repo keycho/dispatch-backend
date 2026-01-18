@@ -103,7 +103,7 @@ let scannerStats = {
 let currentFeedIndex = 0;
 let audioBuffer = [];
 let lastProcessTime = Date.now();
-const CHUNK_DURATION = 30000; // Process every 30 seconds for more content
+const CHUNK_DURATION = 10000; // Process every 10 seconds for fast updates
 
 async function startBroadcastifyStream() {
   if (!BROADCASTIFY_PASSWORD) {
@@ -268,12 +268,19 @@ async function processAudioFromStream(buffer, feedName) {
     
     console.log(`[${feedName}] Transcript:`, transcript);
     
-    // Broadcast transcript
-    broadcast({
-      type: "transcript",
+    // Store transcript for new clients
+    const transcriptEntry = {
       text: transcript,
       source: feedName,
       timestamp: new Date().toISOString()
+    };
+    recentTranscripts.unshift(transcriptEntry);
+    if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
+    
+    // Broadcast transcript
+    broadcast({
+      type: "transcript",
+      ...transcriptEntry
     });
     
     // Parse with Claude
@@ -309,6 +316,33 @@ async function processAudioFromStream(buffer, feedName) {
       incidents.unshift(incident);
       if (incidents.length > 50) incidents.pop();
       
+      // Store for pattern analysis
+      recentIncidentsForAnalysis.unshift({
+        id: incident.id,
+        type: incident.incidentType,
+        location: incident.location,
+        borough: incident.borough,
+        priority: incident.priority,
+        timestamp: incident.timestamp,
+        lat: incident.lat,
+        lng: incident.lng
+      });
+      if (recentIncidentsForAnalysis.length > MAX_ANALYSIS_INCIDENTS) {
+        recentIncidentsForAnalysis.pop();
+      }
+      
+      // Check for linked incidents
+      const linkAnalysis = await checkForLinkedIncidents(incident);
+      if (linkAnalysis) {
+        incident.linkedCase = linkAnalysis;
+        broadcast({
+          type: "linked_case",
+          incident: incident,
+          analysis: linkAnalysis,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
       broadcast({
         type: "incident",
         incident: incident
@@ -343,9 +377,135 @@ async function processAudioFromStream(buffer, feedName) {
 console.log('Starting Broadcastify scanner in 5 seconds...');
 setTimeout(startBroadcastifyStream, 5000);
 
+// ============================================
+// AI CRIME ANALYST - Pattern Detection
+// ============================================
+
+// Store recent incidents for pattern analysis
+const recentIncidentsForAnalysis = [];
+const MAX_ANALYSIS_INCIDENTS = 100;
+
+// Analyze patterns every 5 minutes
+setInterval(analyzePatterns, 5 * 60 * 1000);
+
+async function analyzePatterns() {
+  if (recentIncidentsForAnalysis.length < 5) return;
+  
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 800,
+      system: `You are an NYPD crime analyst AI. Analyze recent incidents for patterns.
+
+Look for:
+1. Geographic clusters (multiple incidents in same area)
+2. Temporal patterns (same time of day)
+3. Similar MO (method of operation)
+4. Possible connections between incidents
+5. Emerging hotspots
+
+Respond in JSON:
+{
+  "patterns": [
+    {
+      "type": "CLUSTER|TEMPORAL|MO_MATCH|LINKED_CASE|HOTSPOT",
+      "title": "string",
+      "description": "string",
+      "incidentIds": [1, 2, 3],
+      "confidence": "HIGH|MEDIUM|LOW",
+      "recommendation": "string"
+    }
+  ],
+  "hotspots": [
+    { "area": "string", "riskLevel": "HIGH|MEDIUM|LOW", "reason": "string" }
+  ],
+  "summary": "string (1-2 sentence overview)"
+}`,
+      messages: [{
+        role: "user",
+        content: `Analyze these ${recentIncidentsForAnalysis.length} recent incidents for patterns:\n\n${JSON.stringify(recentIncidentsForAnalysis.slice(0, 50), null, 2)}`
+      }]
+    });
+
+    const text = response.content[0].text;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    
+    if (jsonMatch) {
+      const analysis = JSON.parse(jsonMatch[0]);
+      
+      // Broadcast pattern alerts to clients
+      if (analysis.patterns && analysis.patterns.length > 0) {
+        broadcast({
+          type: "pattern_alert",
+          analysis: analysis,
+          timestamp: new Date().toISOString()
+        });
+        
+        console.log(`[AI Analyst] Found ${analysis.patterns.length} patterns`);
+      }
+    }
+  } catch (error) {
+    console.error('[AI Analyst] Pattern analysis error:', error.message);
+  }
+}
+
+// Link related incidents in real-time
+async function checkForLinkedIncidents(newIncident) {
+  const recentSimilar = recentIncidentsForAnalysis.filter(inc => {
+    const timeDiff = new Date(newIncident.timestamp) - new Date(inc.timestamp);
+    const isRecent = timeDiff < 30 * 60 * 1000; // Within 30 minutes
+    const sameBorough = inc.borough === newIncident.borough;
+    return isRecent && sameBorough && inc.id !== newIncident.id;
+  });
+
+  if (recentSimilar.length < 1) return null;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 400,
+      system: `You are a crime analyst. Determine if these incidents might be related (same perpetrator, connected events, etc.)
+
+Respond in JSON:
+{
+  "isLinked": true/false,
+  "confidence": "HIGH|MEDIUM|LOW",
+  "linkType": "SAME_SUSPECT|PURSUIT|RELATED_CRIMES|UNRELATED",
+  "explanation": "string"
+}`,
+      messages: [{
+        role: "user",
+        content: `New incident:\n${JSON.stringify(newIncident)}\n\nRecent nearby incidents:\n${JSON.stringify(recentSimilar)}`
+      }]
+    });
+
+    const text = response.content[0].text;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    
+    if (jsonMatch) {
+      const linkAnalysis = JSON.parse(jsonMatch[0]);
+      
+      if (linkAnalysis.isLinked && linkAnalysis.confidence !== 'LOW') {
+        return {
+          ...linkAnalysis,
+          linkedIncidentIds: recentSimilar.map(i => i.id)
+        };
+      }
+    }
+  } catch (error) {
+    console.error('[AI Analyst] Link check error:', error.message);
+  }
+  
+  return null;
+}
+
 // Incident log
 const incidents = [];
 let incidentId = 0;
+
+// Recent transcripts for new clients
+const recentTranscripts = [];
+const MAX_TRANSCRIPTS = 20;
 
 // Audio clip storage (for playback)
 const audioClips = new Map();
@@ -566,11 +726,13 @@ wss.on('connection', (ws) => {
   console.log('Client connected');
   clients.add(ws);
 
-  // Send current state
+  // Send current state with recent transcripts
   ws.send(JSON.stringify({
     type: "init",
     incidents: incidents.slice(0, 20),
-    cameras: cameras
+    cameras: cameras,
+    transcripts: recentTranscripts.slice(0, 10),
+    currentFeed: NYPD_FEEDS[currentFeedIndex]?.name || 'NYPD Citywide 1'
   }));
 
   ws.on('close', () => {
@@ -774,6 +936,158 @@ app.get('/stream/feeds', (req, res) => {
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ============================================
+// GAMIFICATION & ANALYSIS ENDPOINTS
+// ============================================
+
+// Get AI pattern analysis
+app.get('/analysis/patterns', async (req, res) => {
+  if (recentIncidentsForAnalysis.length < 3) {
+    return res.json({ patterns: [], message: 'Not enough data yet' });
+  }
+  
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 800,
+      system: `Analyze these incidents for crime patterns. Return JSON with patterns, hotspots, and insights.`,
+      messages: [{
+        role: "user",
+        content: `Analyze: ${JSON.stringify(recentIncidentsForAnalysis.slice(0, 30))}`
+      }]
+    });
+    
+    const text = response.content[0].text;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    res.json(jsonMatch ? JSON.parse(jsonMatch[0]) : { patterns: [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get incident statistics
+app.get('/stats', (req, res) => {
+  const now = new Date();
+  const hourAgo = new Date(now - 60 * 60 * 1000);
+  const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+  
+  const lastHour = incidents.filter(i => new Date(i.timestamp) > hourAgo);
+  const lastDay = incidents.filter(i => new Date(i.timestamp) > dayAgo);
+  
+  const byBorough = {};
+  const byType = {};
+  const byPriority = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  
+  incidents.forEach(inc => {
+    byBorough[inc.borough || 'Unknown'] = (byBorough[inc.borough || 'Unknown'] || 0) + 1;
+    byType[inc.incidentType || 'Unknown'] = (byType[inc.incidentType || 'Unknown'] || 0) + 1;
+    if (inc.priority) byPriority[inc.priority]++;
+  });
+  
+  res.json({
+    total: incidents.length,
+    lastHour: lastHour.length,
+    lastDay: lastDay.length,
+    byBorough,
+    byType,
+    byPriority,
+    hottest: Object.entries(byBorough).sort((a, b) => b[1] - a[1])[0],
+    mostCommon: Object.entries(byType).sort((a, b) => b[1] - a[1])[0]
+  });
+});
+
+// Prediction game - submit a prediction
+const predictions = new Map();
+
+app.post('/game/predict', express.json(), (req, res) => {
+  const { userId, borough, incidentType, timeWindow } = req.body;
+  
+  if (!userId || !borough) {
+    return res.status(400).json({ error: 'userId and borough required' });
+  }
+  
+  const prediction = {
+    userId,
+    borough,
+    incidentType: incidentType || 'any',
+    timeWindow: timeWindow || 30, // minutes
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + (timeWindow || 30) * 60 * 1000).toISOString(),
+    status: 'PENDING'
+  };
+  
+  const predictionId = `pred_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  predictions.set(predictionId, prediction);
+  
+  res.json({ predictionId, prediction });
+});
+
+// Check prediction results
+app.get('/game/predictions/:userId', (req, res) => {
+  const userPredictions = [];
+  predictions.forEach((pred, id) => {
+    if (pred.userId === req.params.userId) {
+      userPredictions.push({ id, ...pred });
+    }
+  });
+  res.json(userPredictions);
+});
+
+// Leaderboard
+const userScores = new Map();
+
+app.get('/game/leaderboard', (req, res) => {
+  const leaderboard = Array.from(userScores.entries())
+    .map(([userId, data]) => ({ userId, ...data }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 20);
+  
+  res.json(leaderboard);
+});
+
+// Get challenges
+app.get('/game/challenges', (req, res) => {
+  const challenges = [
+    {
+      id: 'night_owl',
+      name: 'Night Owl',
+      description: 'Monitor 10 incidents after midnight',
+      points: 100,
+      icon: '🦉'
+    },
+    {
+      id: 'eagle_eye', 
+      name: 'Eagle Eye',
+      description: 'Spot a HIGH priority incident within 30 seconds',
+      points: 50,
+      icon: '🦅'
+    },
+    {
+      id: 'analyst',
+      name: 'Crime Analyst',
+      description: 'Correctly predict 5 incident locations',
+      points: 200,
+      icon: '🔍'
+    },
+    {
+      id: 'manhattan_expert',
+      name: 'Manhattan Expert',
+      description: 'Track 50 incidents in Manhattan',
+      points: 150,
+      icon: '🏙️'
+    },
+    {
+      id: 'pattern_spotter',
+      name: 'Pattern Spotter',
+      description: 'Identify a linked case before the AI',
+      points: 500,
+      icon: '🧠'
+    }
+  ];
+  
+  res.json(challenges);
 });
 
 // Debug endpoint for scanner status
