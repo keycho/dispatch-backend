@@ -70,6 +70,139 @@ async function fetchNYCCameras() {
 // Fetch cameras on startup
 fetchNYCCameras();
 
+// ============================================
+// OpenMHz Scanner Scraper - Auto-fetch NYPD calls
+// ============================================
+
+let lastCallTime = Date.now();
+const OPENMHZ_SYSTEM = 'nypd'; // NYPD system on OpenMHz
+const POLL_INTERVAL = 15000; // Poll every 15 seconds
+
+async function fetchNewCalls() {
+  try {
+    // Convert timestamp to OpenMHz format (milliseconds as integer)
+    const timeParam = lastCallTime;
+    const url = `https://api.openmhz.com/${OPENMHZ_SYSTEM}/calls/newer?time=${timeParam}`;
+    
+    const response = await fetch(url);
+    if (!response.ok) {
+      console.log('OpenMHz API error:', response.status);
+      return;
+    }
+    
+    const data = await response.json();
+    const calls = data.calls || [];
+    
+    if (calls.length === 0) {
+      return;
+    }
+    
+    console.log(`Fetched ${calls.length} new calls from OpenMHz`);
+    
+    // Update last call time to most recent
+    if (calls.length > 0) {
+      const mostRecent = calls[0];
+      lastCallTime = new Date(mostRecent.time).getTime();
+    }
+    
+    // Process each call
+    for (const call of calls.slice(0, 5)) { // Limit to 5 per poll to avoid overload
+      await processOpenMHzCall(call);
+    }
+    
+  } catch (error) {
+    console.error('OpenMHz fetch error:', error.message);
+  }
+}
+
+async function processOpenMHzCall(call) {
+  try {
+    // Download the audio file
+    const audioUrl = call.url;
+    if (!audioUrl) return;
+    
+    console.log(`Processing call from talkgroup ${call.talkgroupNum}: ${audioUrl}`);
+    
+    const audioResponse = await fetch(audioUrl);
+    if (!audioResponse.ok) return;
+    
+    const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+    
+    // Transcribe with Whisper
+    const transcript = await transcribeAudio(audioBuffer);
+    if (!transcript || transcript.trim().length < 10) {
+      console.log('Transcript too short, skipping');
+      return;
+    }
+    
+    console.log('Transcript:', transcript);
+    
+    // Broadcast transcript to all clients
+    broadcast({
+      type: "transcript",
+      text: transcript,
+      talkgroup: call.talkgroupNum,
+      timestamp: call.time || new Date().toISOString()
+    });
+    
+    // Parse with Claude for incidents
+    const parsed = await parseTranscript(transcript);
+    
+    if (parsed.hasIncident) {
+      incidentId++;
+      const camera = findNearestCamera(parsed.location || "");
+      
+      const incident = {
+        id: incidentId,
+        ...parsed,
+        camera: camera,
+        talkgroup: call.talkgroupNum,
+        audioUrl: audioUrl,
+        timestamp: call.time || new Date().toISOString(),
+        status: "ACTIVE"
+      };
+      
+      incidents.unshift(incident);
+      if (incidents.length > 50) incidents.pop();
+      
+      // Broadcast incident
+      broadcast({
+        type: "incident",
+        incident: incident
+      });
+      
+      // Broadcast camera switch
+      if (camera) {
+        broadcast({
+          type: "camera_switch",
+          camera: camera,
+          reason: `${parsed.incidentType} at ${parsed.location}`
+        });
+      }
+      
+      console.log('Incident detected:', incident);
+    }
+    
+    // Broadcast AI analysis
+    broadcast({
+      type: "analysis",
+      text: parsed.hasIncident 
+        ? `[INCIDENT] ${parsed.incidentType} at ${parsed.location}. Priority: ${parsed.priority}.`
+        : `[MONITORING] ${transcript.substring(0, 100)}...`,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('Error processing OpenMHz call:', error.message);
+  }
+}
+
+// Start polling OpenMHz
+console.log('Starting OpenMHz scanner scraper...');
+setInterval(fetchNewCalls, POLL_INTERVAL);
+// Initial fetch
+setTimeout(fetchNewCalls, 5000);
+
 // Incident log
 const incidents = [];
 let incidentId = 0;
