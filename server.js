@@ -34,17 +34,41 @@ const openai = new OpenAI({
 // Store connected clients
 const clients = new Set();
 
-// NYC Traffic Camera database (sample - expand as needed)
-const cameras = [
-  { id: "1", location: "42nd St & Lexington Ave", lat: 40.7527, lng: -73.9772, url: "https://webcams.nyctmc.org/google_popup.php?cid=1" },
-  { id: "2", location: "Times Square - 42nd & Broadway", lat: 40.7580, lng: -73.9855, url: "https://webcams.nyctmc.org/google_popup.php?cid=2" },
-  { id: "3", location: "34th St & 5th Ave", lat: 40.7484, lng: -73.9857, url: "https://webcams.nyctmc.org/google_popup.php?cid=3" },
-  { id: "4", location: "14th St & Union Square", lat: 40.7359, lng: -73.9906, url: "https://webcams.nyctmc.org/google_popup.php?cid=4" },
-  { id: "5", location: "125th St & Lenox Ave", lat: 40.8094, lng: -73.9392, url: "https://webcams.nyctmc.org/google_popup.php?cid=5" },
-  { id: "6", location: "Canal St & Broadway", lat: 40.7193, lng: -74.0020, url: "https://webcams.nyctmc.org/google_popup.php?cid=6" },
-  { id: "7", location: "Brooklyn Bridge", lat: 40.7061, lng: -73.9969, url: "https://webcams.nyctmc.org/google_popup.php?cid=7" },
-  { id: "8", location: "FDR Drive & 42nd St", lat: 40.7489, lng: -73.9680, url: "https://webcams.nyctmc.org/google_popup.php?cid=8" },
-];
+// NYC Traffic Camera database - fetched from NYC DOT API
+let cameras = [];
+
+// Fetch cameras from NYC DOT on startup
+async function fetchNYCCameras() {
+  try {
+    const response = await fetch('https://webcams.nyctmc.org/api/cameras');
+    const data = await response.json();
+    
+    // Transform to our format and filter online cameras
+    cameras = data
+      .filter(cam => cam.isOnline === true || cam.isOnline === "true")
+      .map(cam => ({
+        id: cam.id,
+        location: cam.name,
+        lat: cam.latitude,
+        lng: cam.longitude,
+        area: cam.area || "NYC",
+        imageUrl: `https://webcams.nyctmc.org/api/cameras/${cam.id}/image`,
+        isOnline: true
+      }));
+    
+    console.log(`Loaded ${cameras.length} NYC traffic cameras`);
+  } catch (error) {
+    console.error("Failed to fetch NYC cameras:", error);
+    // Fallback to some default cameras
+    cameras = [
+      { id: "07b8616e-373e-4ec9-89cc-11cad7d59fcb", location: "Worth St @ Centre St", lat: 40.715157, lng: -74.00213, area: "Manhattan", imageUrl: "https://webcams.nyctmc.org/api/cameras/07b8616e-373e-4ec9-89cc-11cad7d59fcb/image", isOnline: true },
+      { id: "8d2b3ae9-da68-4d37-8ae2-d3bc014f827b", location: "WBB - Bedford Ave & S 5 St", lat: 40.710983, lng: -73.963168, area: "Brooklyn", imageUrl: "https://webcams.nyctmc.org/api/cameras/8d2b3ae9-da68-4d37-8ae2-d3bc014f827b/image", isOnline: true },
+    ];
+  }
+}
+
+// Fetch cameras on startup
+fetchNYCCameras();
 
 // Incident log
 const incidents = [];
@@ -60,15 +84,36 @@ function broadcast(data) {
   });
 }
 
-// Find nearest camera to a location
-function findNearestCamera(location) {
-  // Simple keyword matching for now
+// Find nearest camera to a location using text matching and coordinates
+function findNearestCamera(location, lat = null, lng = null) {
+  if (cameras.length === 0) {
+    return null;
+  }
+  
+  // If we have coordinates, find nearest by distance
+  if (lat && lng) {
+    let nearest = cameras[0];
+    let minDist = Infinity;
+    
+    for (const cam of cameras) {
+      const dist = Math.sqrt(
+        Math.pow(cam.lat - lat, 2) + Math.pow(cam.lng - lng, 2)
+      );
+      if (dist < minDist) {
+        minDist = dist;
+        nearest = cam;
+      }
+    }
+    return nearest;
+  }
+  
+  // Otherwise try text matching
   const locationLower = location.toLowerCase();
   
   for (const cam of cameras) {
     const camLocationLower = cam.location.toLowerCase();
     // Check if any part of the location matches
-    const locationParts = locationLower.split(/[&,\s]+/);
+    const locationParts = locationLower.split(/[&@,\s]+/);
     for (const part of locationParts) {
       if (part.length > 2 && camLocationLower.includes(part)) {
         return cam;
@@ -76,8 +121,8 @@ function findNearestCamera(location) {
     }
   }
   
-  // Default to Times Square if no match
-  return cameras[1];
+  // Default to a random camera if no match
+  return cameras[Math.floor(Math.random() * cameras.length)];
 }
 
 // Parse scanner transcript with Claude
@@ -287,6 +332,27 @@ app.get('/', (req, res) => {
 
 app.get('/cameras', (req, res) => {
   res.json(cameras);
+});
+
+// Proxy endpoint for camera images (to avoid CORS issues)
+app.get('/camera-image/:id', async (req, res) => {
+  try {
+    const imageUrl = `https://webcams.nyctmc.org/api/cameras/${req.params.id}/image`;
+    const response = await fetch(imageUrl);
+    const buffer = await response.arrayBuffer();
+    
+    res.set('Content-Type', 'image/jpeg');
+    res.set('Cache-Control', 'no-cache');
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch camera image' });
+  }
+});
+
+// Refresh cameras endpoint
+app.get('/refresh-cameras', async (req, res) => {
+  await fetchNYCCameras();
+  res.json({ count: cameras.length, message: 'Cameras refreshed' });
 });
 
 app.get('/incidents', (req, res) => {
