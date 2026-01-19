@@ -1078,53 +1078,56 @@ async function fetch311NearFacilities() {
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     
     // 311 complaints in Queens near Rikers (zip codes 11370, 11372)
-    const rikersResponse = await fetch(
-      `https://data.cityofnewyork.us/resource/erm2-nwe9.json?$where=created_date>='${yesterday}'&incident_zip=11370&$limit=50`,
-      { headers: { 'Accept': 'application/json' } }
-    );
+    const rikersUrl = `https://data.cityofnewyork.us/resource/erm2-nwe9.json?$where=created_date%3E%3D'${yesterday}'&incident_zip=11370&$limit=50`;
+    const rikersResponse = await fetch(rikersUrl, { 
+      headers: { 'Accept': 'application/json' },
+      timeout: 10000
+    }).catch(e => null);
     
-    if (rikersResponse.ok) {
+    if (rikersResponse && rikersResponse.ok) {
       const rikersData = await rikersResponse.json();
-      facilityIntelligence.complaints311.nearRikers = rikersData.map(c => ({
-        type: c.complaint_type,
-        descriptor: c.descriptor,
-        address: c.incident_address,
+      facilityIntelligence.complaints311.nearRikers = (rikersData || []).map(c => ({
+        type: c.complaint_type || 'Unknown',
+        descriptor: c.descriptor || '',
+        address: c.incident_address || '',
         created: c.created_date,
-        status: c.status
+        status: c.status || ''
       })).slice(0, 20);
     }
     
     // 311 complaints in Manhattan near The Tombs (zip 10013)
-    const tombsResponse = await fetch(
-      `https://data.cityofnewyork.us/resource/erm2-nwe9.json?$where=created_date>='${yesterday}'&incident_zip=10013&$limit=50`,
-      { headers: { 'Accept': 'application/json' } }
-    );
+    const tombsUrl = `https://data.cityofnewyork.us/resource/erm2-nwe9.json?$where=created_date%3E%3D'${yesterday}'&incident_zip=10013&$limit=50`;
+    const tombsResponse = await fetch(tombsUrl, { 
+      headers: { 'Accept': 'application/json' },
+      timeout: 10000
+    }).catch(e => null);
     
-    if (tombsResponse.ok) {
+    if (tombsResponse && tombsResponse.ok) {
       const tombsData = await tombsResponse.json();
-      facilityIntelligence.complaints311.nearTombs = tombsData.map(c => ({
-        type: c.complaint_type,
-        descriptor: c.descriptor,
-        address: c.incident_address,
+      facilityIntelligence.complaints311.nearTombs = (tombsData || []).map(c => ({
+        type: c.complaint_type || 'Unknown',
+        descriptor: c.descriptor || '',
+        address: c.incident_address || '',
         created: c.created_date,
-        status: c.status
+        status: c.status || ''
       })).slice(0, 20);
     }
     
     // Brooklyn near detention (zip 11201)
-    const brooklynResponse = await fetch(
-      `https://data.cityofnewyork.us/resource/erm2-nwe9.json?$where=created_date>='${yesterday}'&incident_zip=11201&$limit=50`,
-      { headers: { 'Accept': 'application/json' } }
-    );
+    const brooklynUrl = `https://data.cityofnewyork.us/resource/erm2-nwe9.json?$where=created_date%3E%3D'${yesterday}'&incident_zip=11201&$limit=50`;
+    const brooklynResponse = await fetch(brooklynUrl, { 
+      headers: { 'Accept': 'application/json' },
+      timeout: 10000
+    }).catch(e => null);
     
-    if (brooklynResponse.ok) {
+    if (brooklynResponse && brooklynResponse.ok) {
       const brooklynData = await brooklynResponse.json();
-      facilityIntelligence.complaints311.nearBrooklyn = brooklynData.map(c => ({
-        type: c.complaint_type,
-        descriptor: c.descriptor,
-        address: c.incident_address,
+      facilityIntelligence.complaints311.nearBrooklyn = (brooklynData || []).map(c => ({
+        type: c.complaint_type || 'Unknown',
+        descriptor: c.descriptor || '',
+        address: c.incident_address || '',
         created: c.created_date,
-        status: c.status
+        status: c.status || ''
       })).slice(0, 20);
     }
     
@@ -1148,33 +1151,38 @@ async function fetchArrestData() {
     // NYPD Arrests Data (Year to Date)
     const response = await fetch(
       'https://data.cityofnewyork.us/resource/uip8-fykc.json?$limit=100&$order=arrest_date%20DESC',
-      { headers: { 'Accept': 'application/json' } }
-    );
+      { 
+        headers: { 'Accept': 'application/json' },
+        timeout: 10000
+      }
+    ).catch(e => null);
     
-    if (response.ok) {
+    if (response && response.ok) {
       const data = await response.json();
       
-      // Group by precinct
-      const byPrecinct = {};
-      data.forEach(arrest => {
-        const pct = arrest.arrest_precinct || 'Unknown';
-        byPrecinct[pct] = (byPrecinct[pct] || 0) + 1;
-      });
-      
-      facilityIntelligence.arrests = {
-        lastFetch: new Date().toISOString(),
-        byPrecinct,
-        total7d: data.length,
-        recentArrests: data.slice(0, 20).map(a => ({
-          date: a.arrest_date,
-          precinct: a.arrest_precinct,
-          offense: a.ofns_desc,
-          borough: a.arrest_boro
-        })),
-        trend: 'stable'
-      };
-      
-      console.log(`[FACILITIES] Arrest data: ${data.length} recent arrests`);
+      if (data && Array.isArray(data)) {
+        // Group by precinct
+        const byPrecinct = {};
+        data.forEach(arrest => {
+          const pct = arrest.arrest_precinct || 'Unknown';
+          byPrecinct[pct] = (byPrecinct[pct] || 0) + 1;
+        });
+        
+        facilityIntelligence.arrests = {
+          lastFetch: new Date().toISOString(),
+          byPrecinct,
+          total7d: data.length,
+          recentArrests: data.slice(0, 20).map(a => ({
+            date: a.arrest_date || '',
+            precinct: a.arrest_precinct || '',
+            offense: a.ofns_desc || '',
+            borough: a.arrest_boro || ''
+          })),
+          trend: 'stable'
+        };
+        
+        console.log(`[FACILITIES] Arrest data: ${data.length} recent arrests`);
+      }
     }
   } catch (error) {
     console.error(`[FACILITIES] Arrest fetch error: ${error.message}`);
@@ -2300,40 +2308,7 @@ app.get('/facilities/arrests', (req, res) => {
   });
 });
 
-// Specific facility by ID
-app.get('/facilities/:id', (req, res) => {
-  const facility = NYC_CORRECTIONAL_FACILITIES.find(f => f.id === req.params.id);
-  if (!facility) return res.status(404).json({ error: 'Facility not found' });
-  
-  // Add specific data for Rikers
-  let additionalData = {};
-  if (facility.id === 'rikers_island') {
-    additionalData = {
-      q100: {
-        nextBuses: getNextQ100Buses(5),
-        note: 'Q100 is the only way off the island'
-      },
-      complaints311: facilityIntelligence.complaints311.nearRikers.slice(0, 5)
-    };
-  } else if (facility.id === 'manhattan_detention') {
-    additionalData = {
-      complaints311: facilityIntelligence.complaints311.nearTombs.slice(0, 5)
-    };
-  } else if (facility.id === 'brooklyn_detention') {
-    additionalData = {
-      complaints311: facilityIntelligence.complaints311.nearBrooklyn.slice(0, 5)
-    };
-  }
-  
-  res.json({ 
-    facility, 
-    population: facilityPopulation,
-    releaseWindowActive: isDuringReleaseHours(),
-    ...additionalData
-  });
-});
-
-// Nearby facility check
+// Nearby facility check (must be before :id route)
 app.get('/facilities/nearby/:lat/:lng', (req, res) => {
   const lat = parseFloat(req.params.lat);
   const lng = parseFloat(req.params.lng);
@@ -2369,6 +2344,41 @@ app.post('/facilities/refresh', async (req, res) => {
   res.json({ 
     success: true, 
     intelligence: getFacilityStatus()
+  });
+});
+
+// Specific facility by ID (MUST BE LAST - catches all /facilities/:anything)
+app.get('/facilities/:id', (req, res) => {
+  const facility = NYC_CORRECTIONAL_FACILITIES.find(f => f.id === req.params.id);
+  if (!facility) return res.status(404).json({ error: 'Facility not found' });
+  
+  // Add specific data for Rikers
+  let additionalData = {};
+  if (facility.id === 'rikers_island') {
+    additionalData = {
+      q100: {
+        nextBuses: getNextQ100Buses(5),
+        note: 'Q100 is the only way off the island'
+      },
+      complaints311: facilityIntelligence.complaints311.nearRikers.slice(0, 5)
+    };
+  } else if (facility.id === 'manhattan_detention') {
+    additionalData = {
+      complaints311: facilityIntelligence.complaints311.nearTombs.slice(0, 5)
+    };
+  } else if (facility.id === 'brooklyn_detention') {
+    additionalData = {
+      complaints311: facilityIntelligence.complaints311.nearBrooklyn.slice(0, 5)
+    };
+  }
+  
+  res.json({ 
+    facility, 
+    population: facilityPopulation,
+    releaseWindowActive: isDuringReleaseHours(),
+    ...additionalData
+  });
+});
   });
 });
 
