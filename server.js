@@ -1014,33 +1014,95 @@ setTimeout(startFacilityFetching, 10000);
 // ============================================
 
 const TREASURY_WALLET = process.env.TREASURY_WALLET || 'YOUR_SOLANA_WALLET_HERE';
-const HOUSE_EDGE = 0.05;
+const HOUSE_EDGE = 0.08; // 8% house edge
 
 const oddsEngine = {
-  boroughRates: { 'Manhattan': 12.5, 'Brooklyn': 9.8, 'Bronx': 7.2, 'Queens': 6.1, 'Staten Island': 1.4 },
-  incidentTypeRarity: { 'any': 1.0, 'traffic': 0.25, 'medical': 0.20, 'domestic': 0.15, 'assault': 0.12, 'suspicious': 0.10, 'theft': 0.08, 'robbery': 0.05, 'pursuit': 0.03, 'shots fired': 0.02 },
-  timeMultipliers: { 0: 0.7, 1: 0.5, 2: 0.4, 3: 0.3, 4: 0.4, 5: 0.5, 6: 0.7, 7: 0.9, 8: 1.0, 9: 1.0, 10: 1.0, 11: 1.1, 12: 1.2, 13: 1.1, 14: 1.0, 15: 1.1, 16: 1.2, 17: 1.3, 18: 1.4, 19: 1.5, 20: 1.6, 21: 1.5, 22: 1.3, 23: 1.0 },
+  // Base rates: expected DETECTED incidents per hour per borough
+  // These are much lower than actual incidents because:
+  // 1. Scanner doesn't catch everything
+  // 2. AI must classify it correctly
+  // 3. Location must be parsed successfully
+  boroughRates: { 
+    'Manhattan': 2.5,      // ~2-3 detected incidents/hour
+    'Brooklyn': 2.0, 
+    'Bronx': 1.8, 
+    'Queens': 1.2, 
+    'Staten Island': 0.3   // Much quieter
+  },
+  
+  // Incident type probability relative to "any"
+  // These multiply against base rate - lower = rarer = higher payout
+  incidentTypeRarity: { 
+    'any': 1.0,            // Any detected incident
+    'traffic': 0.20,       // 20% of incidents are traffic
+    'medical': 0.15,       // 15% medical
+    'domestic': 0.12,      // 12% domestic
+    'assault': 0.08,       // 8% assault  
+    'suspicious': 0.10,    // 10% suspicious person/vehicle
+    'theft': 0.06,         // 6% theft/larceny
+    'robbery': 0.03,       // 3% robbery (rarer, higher payout)
+    'pursuit': 0.02,       // 2% pursuit/chase
+    'shots fired': 0.01    // 1% shots fired (very rare, big payout)
+  },
+  
+  // Time of day multipliers (crime patterns)
+  timeMultipliers: { 
+    0: 0.8, 1: 0.5, 2: 0.4, 3: 0.3, 4: 0.3, 5: 0.4,   // Late night - quieter
+    6: 0.6, 7: 0.8, 8: 1.0, 9: 1.0, 10: 1.0, 11: 1.0, // Morning rush
+    12: 1.1, 13: 1.0, 14: 1.0, 15: 1.1, 16: 1.2,      // Afternoon
+    17: 1.3, 18: 1.4, 19: 1.5, 20: 1.6, 21: 1.5,      // Evening peak
+    22: 1.3, 23: 1.0                                    // Late evening
+  },
   
   calculateProbability(borough, incidentType = 'any', windowMinutes = 30) {
     const hour = new Date().getHours();
-    const baseRate = this.boroughRates[borough] || 5.0;
-    const timeAdjusted = baseRate * this.timeMultipliers[hour];
-    const typeMultiplier = this.incidentTypeRarity[incidentType.toLowerCase()] || 0.1;
-    const adjusted = timeAdjusted * typeMultiplier;
-    const expected = (adjusted / 60) * windowMinutes;
-    return Math.min(0.95, 1 - Math.exp(-expected));
+    const baseRate = this.boroughRates[borough] || 1.0;
+    const timeAdjusted = baseRate * (this.timeMultipliers[hour] || 1.0);
+    const typeMultiplier = this.incidentTypeRarity[incidentType.toLowerCase()] || 0.05;
+    
+    // Expected incidents in the time window
+    const expectedIncidents = (timeAdjusted * typeMultiplier / 60) * windowMinutes;
+    
+    // Poisson probability of at least 1 incident: 1 - e^(-lambda)
+    // Cap at 85% to ensure house edge always works
+    const probability = Math.min(0.85, 1 - Math.exp(-expectedIncidents));
+    
+    // Floor at 2% (minimum probability for very rare events)
+    return Math.max(0.02, probability);
   },
   
   calculateMultiplier(probability) {
-    const fair = 1 / probability;
-    const withEdge = fair * (1 - HOUSE_EDGE);
-    return Math.max(1.1, Math.min(50.0, Math.round(withEdge * 100) / 100));
+    // Fair odds = 1 / probability
+    // With house edge: fair * (1 - edge)
+    const fairOdds = 1 / probability;
+    const withEdge = fairOdds * (1 - HOUSE_EDGE);
+    
+    // Round to 1 decimal place, min 1.1x, max 45x
+    return Math.max(1.1, Math.min(45.0, Math.round(withEdge * 10) / 10));
+  },
+  
+  // Calculate expected value for the player (should be negative = house wins)
+  calculateExpectedValue(probability, multiplier) {
+    // EV = (prob * multiplier) - 1
+    // Negative EV = house edge working
+    return (probability * multiplier) - 1;
   },
   
   getOdds(borough, incidentType = 'any', windowMinutes = 30) {
     const prob = this.calculateProbability(borough, incidentType, windowMinutes);
     const mult = this.calculateMultiplier(prob);
-    return { borough, incidentType, windowMinutes, probability: Math.round(prob * 1000) / 10, multiplier: mult };
+    const ev = this.calculateExpectedValue(prob, mult);
+    
+    return { 
+      borough, 
+      incidentType, 
+      windowMinutes, 
+      probability: Math.round(prob * 100),     // Show as whole percentage (e.g., 45 for 45%)
+      probabilityRaw: prob,                     // Raw decimal for calculations
+      multiplier: mult,
+      expectedValue: Math.round(ev * 1000) / 1000, // House edge check (should be negative)
+      houseEdge: `${HOUSE_EDGE * 100}%`
+    };
   }
 };
 
@@ -1663,11 +1725,39 @@ app.get('/bet/odds', (req, res) => {
 });
 app.get('/bet/all-odds', (req, res) => {
   const { window = 30 } = req.query;
+  const windowMinutes = parseInt(window);
   const boroughs = ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
-  const types = ['any', 'assault', 'robbery', 'traffic', 'shots fired'];
+  const types = ['any', 'assault', 'robbery', 'theft', 'pursuit', 'shots fired'];
   const odds = {};
-  boroughs.forEach(b => { odds[b] = {}; types.forEach(t => { odds[b][t] = oddsEngine.getOdds(b, t, parseInt(window)); }); });
-  res.json({ timestamp: new Date().toISOString(), windowMinutes: parseInt(window), houseEdge: `${HOUSE_EDGE * 100}%`, odds, treasury: { totalReceivedSOL: treasury.totalReceived / 1e9, totalPaidOutSOL: treasury.totalPaidOut / 1e9, netProfitSOL: treasury.netProfit / 1e9 } });
+  
+  boroughs.forEach(b => { 
+    odds[b] = {}; 
+    types.forEach(t => { 
+      odds[b][t] = oddsEngine.getOdds(b, t, windowMinutes); 
+    }); 
+  });
+  
+  // Calculate some summary stats
+  const allOdds = Object.values(odds).flatMap(b => Object.values(b));
+  const avgMultiplier = allOdds.reduce((s, o) => s + o.multiplier, 0) / allOdds.length;
+  
+  res.json({ 
+    timestamp: new Date().toISOString(), 
+    windowMinutes,
+    houseEdge: `${HOUSE_EDGE * 100}%`,
+    currentHour: new Date().getHours(),
+    summary: {
+      avgMultiplier: Math.round(avgMultiplier * 10) / 10,
+      lowestOdds: Math.min(...allOdds.map(o => o.multiplier)),
+      highestOdds: Math.max(...allOdds.map(o => o.multiplier))
+    },
+    odds, 
+    treasury: { 
+      totalReceivedSOL: treasury.totalReceived / 1e9, 
+      totalPaidOutSOL: treasury.totalPaidOut / 1e9, 
+      netProfitSOL: treasury.netProfit / 1e9 
+    } 
+  });
 });
 app.get('/bet/treasury', (req, res) => res.json({ wallet: TREASURY_WALLET, totalReceivedSOL: treasury.totalReceived / 1e9, totalPaidOutSOL: treasury.totalPaidOut / 1e9, netProfitSOL: treasury.netProfit / 1e9, activeBets: activeBets.size, houseEdge: `${HOUSE_EDGE * 100}%` }));
 app.get('/bet/pool', (req, res) => {
