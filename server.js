@@ -1313,6 +1313,157 @@ app.get('/facilities/q100', (req, res) => {
   });
 });
 
+// Get incidents near all facilities
+app.get('/facilities/nearby-incidents', (req, res) => {
+  const radiusKm = parseFloat(req.query.radius) || 1;
+  
+  const result = NYC_FACILITIES.map(facility => {
+    // Find incidents within radius
+    const nearbyIncidents = incidents.filter(inc => {
+      if (!inc.lat || !inc.lng) return false;
+      const distance = Math.sqrt(
+        Math.pow((facility.lat - inc.lat) * 111, 2) +
+        Math.pow((facility.lng - inc.lng) * 85, 2)
+      );
+      return distance <= radiusKm;
+    });
+    
+    return {
+      facilityId: facility.id,
+      facilityName: facility.shortName,
+      lat: facility.lat,
+      lng: facility.lng,
+      incidentCount: nearbyIncidents.length,
+      incidents: nearbyIncidents.slice(0, 10).map(i => ({
+        id: i.id,
+        type: i.incidentType,
+        location: i.location,
+        timestamp: i.timestamp,
+        priority: i.priority
+      }))
+    };
+  });
+  
+  res.json({
+    radiusKm,
+    facilities: result,
+    totalNearbyIncidents: result.reduce((sum, f) => sum + f.incidentCount, 0),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Q100 Live Bus Tracking (MTA BusTime API)
+// Note: For production, get free API key from https://bustime.mta.info/wiki/Developers/Index
+const MTA_API_KEY = process.env.MTA_API_KEY || null;
+
+app.get('/facilities/q100/live', async (req, res) => {
+  // Return schedule-based data if no MTA API key
+  if (!MTA_API_KEY) {
+    const schedule = getQ100Schedule(5);
+    return res.json({
+      live: false,
+      message: 'Live tracking unavailable - showing scheduled times',
+      schedule,
+      nextBusIn: `${schedule[0].minutesUntil} min`,
+      route: {
+        name: 'Q100',
+        origin: { name: 'Rikers Island', lat: 40.7932, lng: -73.8860 },
+        destination: { name: 'Queens Plaza', lat: 40.7505, lng: -73.9375 }
+      }
+    });
+  }
+  
+  try {
+    // MTA BusTime SIRI API
+    const response = await fetch(
+      `https://bustime.mta.info/api/siri/vehicle-monitoring.json?key=${MTA_API_KEY}&LineRef=Q100&VehicleMonitoringDetailLevel=calls`,
+      { timeout: 5000 }
+    );
+    
+    if (!response.ok) throw new Error('MTA API error');
+    
+    const data = await response.json();
+    const vehicles = data?.Siri?.ServiceDelivery?.VehicleMonitoringDelivery?.[0]?.VehicleActivity || [];
+    
+    const buses = vehicles.map(v => {
+      const journey = v.MonitoredVehicleJourney;
+      const location = journey?.VehicleLocation;
+      const call = journey?.MonitoredCall;
+      
+      return {
+        vehicleId: journey?.VehicleRef,
+        lat: parseFloat(location?.Latitude),
+        lng: parseFloat(location?.Longitude),
+        direction: journey?.DirectionRef, // 0 = to Queens, 1 = to Rikers
+        nextStop: call?.StopPointName,
+        expectedArrival: call?.ExpectedArrivalTime,
+        distanceFromStop: call?.DistanceFromStop
+      };
+    }).filter(b => b.lat && b.lng);
+    
+    res.json({
+      live: true,
+      buses,
+      busCount: buses.length,
+      route: {
+        name: 'Q100',
+        origin: { name: 'Rikers Island', lat: 40.7932, lng: -73.8860 },
+        destination: { name: 'Queens Plaza', lat: 40.7505, lng: -73.9375 }
+      },
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('[Q100] Live tracking error:', error.message);
+    const schedule = getQ100Schedule(5);
+    res.json({
+      live: false,
+      error: error.message,
+      schedule,
+      nextBusIn: `${schedule[0].minutesUntil} min`
+    });
+  }
+});
+
+// Facilities summary for dashboard
+app.get('/facilities/summary', (req, res) => {
+  const hour = new Date().getHours();
+  const releaseWindowActive = hour >= 5 && hour <= 10;
+  
+  const totalPopulation = NYC_FACILITIES.reduce((sum, f) => sum + f.currentPopulation, 0);
+  const totalCapacity = NYC_FACILITIES.reduce((sum, f) => sum + f.capacity, 0);
+  
+  const dayOfWeek = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date().getDay()];
+  const dayMultipliers = { Sun: 0.75, Mon: 0.95, Tue: 1.0, Wed: 1.05, Thu: 1.1, Fri: 1.2, Sat: 0.85 };
+  
+  const totalEstimatedReleases = NYC_FACILITIES.reduce((sum, f) => {
+    return sum + Math.round(f.avgDailyReleases * dayMultipliers[dayOfWeek]);
+  }, 0);
+  
+  const q100 = getQ100Schedule(1)[0];
+  
+  res.json({
+    totalPopulation,
+    totalCapacity,
+    capacityPercent: Math.round((totalPopulation / totalCapacity) * 100),
+    estimatedReleasesToday: totalEstimatedReleases,
+    dayOfWeek,
+    releaseWindow: {
+      active: releaseWindowActive,
+      status: releaseWindowActive ? 'ACTIVE' : 'CLOSED',
+      hours: '5:00 AM - 10:00 AM',
+      progress: releaseWindowActive ? Math.round(((hour - 5) / 5) * 100) : 0
+    },
+    q100: {
+      nextBusIn: `${q100.minutesUntil} min`,
+      isPeak: q100.isPeak
+    },
+    facilityCount: NYC_FACILITIES.length,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Facility by ID - MUST BE LAST (catches all /facilities/:anything)
 app.get('/facilities/:id', (req, res) => {
   const intel = getFacilityIntelligence(req.params.id);
   if (!intel) {
