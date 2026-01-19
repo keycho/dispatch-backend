@@ -530,7 +530,17 @@ Are these connected? Is this part of an existing pattern or a new one forming? G
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const result = JSON.parse(jsonMatch[0]);
-        if (result.isPattern) {
+        
+        // Validate pattern before storing
+        const isValidPattern = result.isPattern && 
+          result.patternName && 
+          result.patternName.trim() !== '' &&
+          result.patternName.toLowerCase() !== 'unknown pattern' &&
+          result.patternName.toLowerCase() !== 'unknown' &&
+          Array.isArray(result.linkedIncidentIds) &&
+          result.linkedIncidentIds.length > 0;
+        
+        if (isValidPattern) {
           const pattern = {
             ...result,
             id: `pattern_${Date.now()}`,
@@ -552,11 +562,16 @@ Are these connected? Is this part of an existing pattern or a new one forming? G
             };
           } else {
             this.memory.patterns.unshift(pattern);
+            console.log(`[PATTERN] New pattern detected: "${result.patternName}" with ${result.linkedIncidentIds.length} linked incidents`);
           }
           
           if (this.memory.patterns.length > 100) this.memory.patterns.pop();
+        } else if (result.isPattern) {
+          // Log why pattern was rejected
+          console.log(`[PATTERN] Rejected invalid pattern: name="${result.patternName}", linkedIds=${result.linkedIncidentIds?.length || 0}`);
         }
-        return result;
+        
+        return { ...result, isPattern: isValidPattern };
       }
       return { isPattern: false, analysis: text };
     } catch (error) {
@@ -830,8 +845,21 @@ Based on patterns, hotspots, time of day, and your learning from past prediction
   // PUBLIC METHODS - NEW DETECTIVE ENDPOINTS
   // ============================================
 
+  // Helper to filter valid patterns
+  getValidPatterns() {
+    return this.memory.patterns.filter(p => 
+      p.patternName && 
+      p.patternName.trim() !== '' &&
+      p.patternName.toLowerCase() !== 'unknown pattern' &&
+      p.patternName.toLowerCase() !== 'unknown' &&
+      p.incidentCount > 0
+    );
+  }
+
   // Overview endpoint - combined status of all agents
   getOverview() {
+    const validPatterns = this.getValidPatterns();
+    
     return {
       agents: this.getAgentStatuses(),
       predictions: {
@@ -841,8 +869,8 @@ Based on patterns, hotspots, time of day, and your learning from past prediction
         pending: this.predictionStats.pending.length
       },
       patterns: {
-        active: this.memory.patterns.filter(p => p.status === 'active').length,
-        total: this.memory.patterns.length
+        active: validPatterns.filter(p => p.status === 'active').length,
+        total: validPatterns.length
       },
       memory: {
         incidents: this.memory.incidents.length,
@@ -888,17 +916,19 @@ Based on patterns, hotspots, time of day, and your learning from past prediction
 
   // PATTERN specific data
   getPatternData() {
+    const validPatterns = this.getValidPatterns();
+    
     return {
       agent: {
         ...this.agents.PATTERN,
         systemPrompt: undefined
       },
-      activePatterns: this.memory.patterns.filter(p => p.status === 'active'),
-      expiredPatterns: this.memory.patterns.filter(p => p.status === 'expired').slice(0, 20),
+      activePatterns: validPatterns.filter(p => p.status === 'active'),
+      expiredPatterns: validPatterns.filter(p => p.status === 'expired').slice(0, 20),
       analysisHistory: this.agents.PATTERN.history.slice(0, 50),
       stats: this.agents.PATTERN.stats,
       // Pattern timeline for visualization
-      timeline: this.memory.patterns.slice(0, 50).map(p => ({
+      timeline: validPatterns.slice(0, 50).map(p => ({
         id: p.id,
         name: p.patternName,
         status: p.status,
@@ -1903,14 +1933,15 @@ app.get('/detective/pattern/:patternId', (req, res) => {
 
 app.get('/detective/patterns', (req, res) => {
   const { status = 'all' } = req.query;
-  let patterns = detectiveBureau.memory.patterns;
+  let patterns = detectiveBureau.getValidPatterns();
   if (status !== 'all') {
     patterns = patterns.filter(p => p.status === status);
   }
+  const validPatterns = detectiveBureau.getValidPatterns();
   res.json({ 
     patterns, 
-    active: detectiveBureau.memory.patterns.filter(p => p.status === 'active').length,
-    total: detectiveBureau.memory.patterns.length 
+    active: validPatterns.filter(p => p.status === 'active').length,
+    total: validPatterns.length 
   });
 });
 
@@ -2168,6 +2199,33 @@ app.get('/detective/export', (req, res) => {
   };
   
   res.json(data);
+});
+
+// Maintenance: Clean up invalid patterns from memory
+app.post('/detective/cleanup', (req, res) => {
+  const before = detectiveBureau.memory.patterns.length;
+  
+  // Remove invalid patterns
+  detectiveBureau.memory.patterns = detectiveBureau.memory.patterns.filter(p => 
+    p.patternName && 
+    p.patternName.trim() !== '' &&
+    p.patternName.toLowerCase() !== 'unknown pattern' &&
+    p.patternName.toLowerCase() !== 'unknown' &&
+    p.incidentCount > 0
+  );
+  
+  const after = detectiveBureau.memory.patterns.length;
+  const removed = before - after;
+  
+  console.log(`[CLEANUP] Removed ${removed} invalid patterns`);
+  
+  res.json({ 
+    success: true, 
+    removed, 
+    before, 
+    after,
+    message: `Cleaned up ${removed} invalid patterns`
+  });
 });
 
 // Betting endpoints
