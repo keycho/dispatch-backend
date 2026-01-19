@@ -1558,6 +1558,9 @@ const NYPD_FEEDS = [
   { id: '40184', name: 'NYPD Citywide 1' },
   { id: '40185', name: 'NYPD Citywide 2' },
   { id: '40186', name: 'NYPD Citywide 3' },
+  { id: '40187', name: 'NYPD Citywide 4' },
+  { id: '32119', name: 'NYPD Dispatch Citywide 1' },
+  { id: '9466', name: 'FDNY Citywide' }, // Fire adds more activity
 ];
 
 let currentFeedIndex = 0;
@@ -1574,9 +1577,12 @@ function broadcast(data) {
 }
 
 async function startBroadcastifyStream() {
-  if (!BROADCASTIFY_PASSWORD) { console.log('BROADCASTIFY_PASSWORD not set'); return; }
+  if (!BROADCASTIFY_PASSWORD) { 
+    console.log('[SCANNER] BROADCASTIFY_PASSWORD not set'); 
+    return; 
+  }
   const feed = NYPD_FEEDS[currentFeedIndex];
-  console.log(`Connecting to: ${feed.name}`);
+  console.log(`[SCANNER] Connecting to: ${feed.name} (${feed.id})`);
 
   const options = {
     hostname: 'audio.broadcastify.com', port: 443, path: `/${feed.id}.mp3`, method: 'GET',
@@ -1585,23 +1591,48 @@ async function startBroadcastifyStream() {
   };
 
   const req = https.request(options, (res) => {
+    console.log(`[SCANNER] Response status: ${res.statusCode}`);
+    if (res.statusCode === 401) {
+      console.error('[SCANNER] Authentication failed - check BROADCASTIFY_PASSWORD');
+      scannerStats.lastError = 'Authentication failed';
+      return;
+    }
     if (res.statusCode !== 200) {
+      console.log(`[SCANNER] Feed ${feed.id} returned ${res.statusCode}, trying next...`);
       currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
       setTimeout(startBroadcastifyStream, 5000);
       return;
     }
     handleStream(res, feed);
   });
-  req.on('error', () => { currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length; setTimeout(startBroadcastifyStream, 10000); });
+  req.on('error', (err) => { 
+    console.error('[SCANNER] Connection error:', err.message);
+    currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length; 
+    setTimeout(startBroadcastifyStream, 10000); 
+  });
   req.end();
 }
 
 function handleStream(stream, feed) {
-  console.log(`Connected to ${feed.name}!`);
+  console.log(`[SCANNER] Connected to ${feed.name}!`);
   scannerStats.currentFeed = feed.name;
+  scannerStats.connectedAt = new Date().toISOString();
   let chunks = [];
+  let lastDataTime = Date.now();
+  
+  // Heartbeat - check if stream is still alive every 30 seconds
+  const heartbeat = setInterval(() => {
+    const silentTime = Date.now() - lastDataTime;
+    if (silentTime > 60000) { // No data for 60 seconds
+      console.log(`[SCANNER] Stream silent for ${Math.round(silentTime/1000)}s, reconnecting...`);
+      clearInterval(heartbeat);
+      stream.destroy();
+      setTimeout(startBroadcastifyStream, 2000);
+    }
+  }, 30000);
   
   stream.on('data', (chunk) => {
+    lastDataTime = Date.now();
     chunks.push(chunk);
     if (Date.now() - lastProcessTime >= CHUNK_DURATION) {
       const fullBuffer = Buffer.concat(chunks);
@@ -1609,12 +1640,21 @@ function handleStream(stream, feed) {
       lastProcessTime = Date.now();
       scannerStats.lastChunkTime = new Date().toISOString();
       scannerStats.totalChunks++;
+      console.log(`[SCANNER] Processing chunk #${scannerStats.totalChunks} (${Math.round(fullBuffer.length/1024)}KB)`);
       processAudioFromStream(fullBuffer, feed.name);
     }
   });
   
-  stream.on('end', () => { setTimeout(startBroadcastifyStream, 2000); });
-  stream.on('error', () => { setTimeout(startBroadcastifyStream, 5000); });
+  stream.on('end', () => { 
+    console.log('[SCANNER] Stream ended, reconnecting...');
+    clearInterval(heartbeat);
+    setTimeout(startBroadcastifyStream, 2000); 
+  });
+  stream.on('error', (err) => { 
+    console.error('[SCANNER] Stream error:', err.message);
+    clearInterval(heartbeat);
+    setTimeout(startBroadcastifyStream, 5000); 
+  });
 }
 
 async function transcribeAudio(audioBuffer) {
@@ -1625,7 +1665,12 @@ async function transcribeAudio(audioBuffer) {
       prompt: "NYPD police radio dispatch with locations. 10-4, 10-13, 10-85, K, forthwith, precinct, sector, central, responding. Addresses like 123 Main Street, intersections like 42nd and Lex, landmarks like Times Square, Penn Station."
     });
     return transcription.text;
-  } catch (error) { return null; }
+  } catch (error) { 
+    console.error('[WHISPER] Transcription error:', error.message);
+    scannerStats.lastError = error.message;
+    scannerStats.errorCount = (scannerStats.errorCount || 0) + 1;
+    return null; 
+  }
 }
 
 // ============================================
@@ -1750,19 +1795,39 @@ function findNearestCamera(location, lat, lng, borough) {
 }
 
 async function processAudioFromStream(buffer, feedName) {
-  if (buffer.length < 5000) return;
+  if (buffer.length < 5000) {
+    scannerStats.filteredSmallBuffer = (scannerStats.filteredSmallBuffer || 0) + 1;
+    return;
+  }
   
   const transcript = await transcribeAudio(buffer);
-  if (!transcript || transcript.trim().length < 10) return;
+  if (!transcript) {
+    scannerStats.filteredNoTranscript = (scannerStats.filteredNoTranscript || 0) + 1;
+    return;
+  }
+  if (transcript.trim().length < 10) {
+    scannerStats.filteredTooShort = (scannerStats.filteredTooShort || 0) + 1;
+    console.log(`[SCANNER] Filtered short transcript: "${transcript.trim()}"`);
+    return;
+  }
   
   const clean = transcript.trim();
   const lower = clean.toLowerCase();
   
   // Filter out noise
   const noise = ['thank you', 'thanks for watching', 'subscribe', 'you', 'bye', 'music'];
-  if (noise.some(n => lower === n || lower === n + '.')) return;
-  if (lower.includes('broadcastify') || lower.includes('fema.gov')) return;
+  if (noise.some(n => lower === n || lower === n + '.')) {
+    scannerStats.filteredNoise = (scannerStats.filteredNoise || 0) + 1;
+    console.log(`[SCANNER] Filtered noise: "${clean}"`);
+    return;
+  }
+  if (lower.includes('broadcastify') || lower.includes('fema.gov')) {
+    scannerStats.filteredAd = (scannerStats.filteredAd || 0) + 1;
+    console.log(`[SCANNER] Filtered ad: "${clean}"`);
+    return;
+  }
   
+  console.log(`[SCANNER] Valid transcript: "${clean.substring(0, 100)}..."`);
   scannerStats.lastTranscript = clean.substring(0, 200);
   scannerStats.successfulTranscripts++;
   
@@ -2890,7 +2955,42 @@ app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().
 app.get('/audio/:id', (req, res) => { const buffer = audioClips.get(req.params.id); if (!buffer) return res.status(404).json({ error: 'Not found' }); res.set('Content-Type', 'audio/mpeg'); res.send(buffer); });
 app.get('/camera-image/:id', async (req, res) => { try { const response = await fetch(`https://webcams.nyctmc.org/api/cameras/${req.params.id}/image`); const buffer = await response.arrayBuffer(); res.set('Content-Type', 'image/jpeg'); res.send(Buffer.from(buffer)); } catch (e) { res.status(500).json({ error: 'Failed' }); } });
 app.get('/stream/feeds', (req, res) => res.json({ feeds: NYPD_FEEDS, currentFeed: NYPD_FEEDS[currentFeedIndex], streamUrl: '/stream/live' }));
-app.get('/debug', (req, res) => res.json({ scanner: scannerStats, connections: clients.size, incidents: incidents.length, cameras: cameras.length, agents: detectiveBureau.getAgentStatuses(), predictions: detectiveBureau.getPredictionStats() }));
+app.get('/debug', (req, res) => res.json({ 
+  scanner: {
+    ...scannerStats,
+    feedIndex: currentFeedIndex,
+    feeds: NYPD_FEEDS.map(f => f.name),
+    uptime: process.uptime()
+  }, 
+  connections: clients.size, 
+  incidents: incidents.length, 
+  cameras: cameras.length, 
+  agents: detectiveBureau.getAgentStatuses(), 
+  predictions: detectiveBureau.getPredictionStats() 
+}));
+
+// Scanner control endpoints
+app.post('/scanner/restart', (req, res) => {
+  console.log('[SCANNER] Manual restart triggered');
+  scannerStats.manualRestarts = (scannerStats.manualRestarts || 0) + 1;
+  startBroadcastifyStream();
+  res.json({ success: true, message: 'Scanner restart triggered', stats: scannerStats });
+});
+
+app.get('/scanner/status', (req, res) => {
+  const lastChunk = scannerStats.lastChunkTime ? new Date(scannerStats.lastChunkTime) : null;
+  const silentSeconds = lastChunk ? Math.round((Date.now() - lastChunk.getTime()) / 1000) : null;
+  
+  res.json({
+    ...scannerStats,
+    currentFeed: NYPD_FEEDS[currentFeedIndex],
+    silentSeconds,
+    isHealthy: silentSeconds !== null && silentSeconds < 60,
+    successRate: scannerStats.totalChunks > 0 
+      ? ((scannerStats.successfulTranscripts / scannerStats.totalChunks) * 100).toFixed(1) + '%'
+      : '0%'
+  });
+});
 
 // WebSocket
 wss.on('connection', (ws) => {
