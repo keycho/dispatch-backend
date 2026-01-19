@@ -99,6 +99,18 @@ function saveDetectiveState(bureau) {
         correct: bureau.predictionStats.correct
       },
       hotspots: Array.from(bureau.memory.hotspots.entries()).slice(0, 100),
+      agentInsights: {
+        CHASE: bureau.agents.CHASE.recentInsights.slice(0, 10),
+        PATTERN: bureau.agents.PATTERN.recentInsights.slice(0, 10),
+        PROPHET: bureau.agents.PROPHET.recentInsights.slice(0, 10),
+        HISTORIAN: bureau.agents.HISTORIAN.recentInsights.slice(0, 10)
+      },
+      agentLastActive: {
+        CHASE: bureau.agents.CHASE.lastActive,
+        PATTERN: bureau.agents.PATTERN.lastActive,
+        PROPHET: bureau.agents.PROPHET.lastActive,
+        HISTORIAN: bureau.agents.HISTORIAN.lastActive
+      },
       savedAt: new Date().toISOString()
     };
     fs.writeFileSync(DETECTIVE_FILE, JSON.stringify(state, null, 2));
@@ -181,6 +193,8 @@ class DetectiveBureau {
         icon: '🚔',
         role: 'Pursuit Specialist',
         status: 'idle',
+        lastActive: null,
+        recentInsights: [],
         triggers: ['pursuit', 'fled', 'fleeing', 'chase', 'vehicle pursuit', 'on foot', 'running', 'high speed', 'foot pursuit'],
         systemPrompt: `You are CHASE, a pursuit specialist AI. You predict escape routes, containment points, and track active pursuits across NYC. You know NYC street topology intimately - one-ways, dead ends, bridge/tunnel access. Keep responses to 2-3 sentences. Be tactical and specific.`
       },
@@ -190,6 +204,8 @@ class DetectiveBureau {
         icon: '🔍',
         role: 'Serial Crime Analyst',
         status: 'idle',
+        lastActive: null,
+        recentInsights: [],
         triggers: [],
         systemPrompt: `You are PATTERN, a serial crime analyst AI. You find connections between incidents - matching MOs, geographic clusters, temporal patterns, suspect descriptions. You name the patterns you discover. Keep responses to 2-3 sentences. Reference specific incident details.`
       },
@@ -199,6 +215,8 @@ class DetectiveBureau {
         icon: '🔮',
         role: 'Predictive Analyst',
         status: 'idle',
+        lastActive: null,
+        recentInsights: [],
         triggers: [],
         systemPrompt: `You are PROPHET, a predictive analyst AI. You make specific, testable predictions about where and when incidents will occur. Always include location, time window, incident type, and confidence percentage. Your accuracy is tracked publicly.`
       },
@@ -208,6 +226,8 @@ class DetectiveBureau {
         icon: '📚',
         role: 'Historical Context',
         status: 'idle',
+        lastActive: null,
+        recentInsights: [],
         triggers: [],
         systemPrompt: `You are HISTORIAN, the memory of the Detective Bureau. You remember every incident, every address, every suspect description. When new incidents occur, you surface relevant history - "this address had 4 calls this week", "suspect matches description from yesterday". Keep responses to 2-3 sentences.`
       }
@@ -254,6 +274,15 @@ class DetectiveBureau {
       const chaseInsight = await this.runChase(incident);
       if (chaseInsight) {
         insights.push(chaseInsight);
+        // Track agent activity
+        this.agents.CHASE.lastActive = new Date().toISOString();
+        this.agents.CHASE.recentInsights.unshift({
+          text: chaseInsight,
+          incidentId: incident.id,
+          timestamp: new Date().toISOString()
+        });
+        if (this.agents.CHASE.recentInsights.length > 10) this.agents.CHASE.recentInsights.pop();
+        
         broadcast({
           type: 'agent_insight',
           agent: 'CHASE',
@@ -273,6 +302,15 @@ class DetectiveBureau {
       const historianInsight = await this.runHistorian(incident, addressCount);
       if (historianInsight) {
         insights.push(historianInsight);
+        // Track agent activity
+        this.agents.HISTORIAN.lastActive = new Date().toISOString();
+        this.agents.HISTORIAN.recentInsights.unshift({
+          text: historianInsight,
+          incidentId: incident.id,
+          timestamp: new Date().toISOString()
+        });
+        if (this.agents.HISTORIAN.recentInsights.length > 10) this.agents.HISTORIAN.recentInsights.pop();
+        
         broadcast({
           type: 'agent_insight',
           agent: 'HISTORIAN',
@@ -292,6 +330,16 @@ class DetectiveBureau {
       const patternInsight = await this.runPattern(incident);
       if (patternInsight) {
         insights.push(patternInsight);
+        // Track agent activity
+        this.agents.PATTERN.lastActive = new Date().toISOString();
+        this.agents.PATTERN.recentInsights.unshift({
+          text: patternInsight.analysis,
+          incidentId: incident.id,
+          isPattern: patternInsight.isPattern,
+          timestamp: new Date().toISOString()
+        });
+        if (this.agents.PATTERN.recentInsights.length > 10) this.agents.PATTERN.recentInsights.pop();
+        
         broadcast({
           type: 'agent_insight',
           agent: 'PATTERN',
@@ -354,10 +402,21 @@ Predict escape routes and recommend containment.`
         (inc.location === incident.location || inc.borough === incident.borough)
       ).slice(0, 5);
 
+      // Check for nearby correctional facilities
+      const facilityContext = getFacilityContext(incident);
+      let facilityInfo = '';
+      if (facilityContext) {
+        facilityInfo = `\n\nCORRECTIONAL FACILITY PROXIMITY:
+- Nearby facility: ${facilityContext.facility} (${facilityContext.shortName})
+- Distance: ${facilityContext.distance}km
+- During release hours: ${facilityContext.duringReleaseHours ? 'YES (5-10 AM)' : 'No'}
+- Note: ${facilityContext.note}`;
+      }
+
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 200,
-        system: this.agents.HISTORIAN.systemPrompt,
+        max_tokens: 250,
+        system: this.agents.HISTORIAN.systemPrompt + `\n\nYou also track proximity to NYC correctional facilities (Rikers Island, The Tombs, Brooklyn House, Queens House, Vernon C. Bain). If an incident is near a facility during release hours (5-10 AM), note this as potentially relevant context.`,
         messages: [{
           role: "user",
           content: `NEW INCIDENT:
@@ -366,7 +425,7 @@ ${JSON.stringify(incident)}
 This address has had ${addressCount} calls recently.
 
 Related incidents at same location/borough:
-${JSON.stringify(relatedIncidents)}
+${JSON.stringify(relatedIncidents)}${facilityInfo}
 
 What historical context is relevant?`
         }]
@@ -468,9 +527,14 @@ Based on patterns and current activity, what incidents do you predict in the nex
         const result = JSON.parse(jsonMatch[0]);
         
         for (const pred of result.predictions || []) {
+          // Ensure confidence is a proper number between 0 and 1
+          const confidence = typeof pred.confidence === 'number' ? pred.confidence : 0.5;
+          
           const prediction = {
             id: `pred_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
             ...pred,
+            confidence: confidence, // Ensure it's set
+            confidencePercent: Math.round(confidence * 100), // Add percentage for display
             createdAt: new Date().toISOString(),
             expiresAt: new Date(Date.now() + (pred.timeWindowMinutes || 30) * 60 * 1000).toISOString(),
             status: 'pending'
@@ -478,6 +542,15 @@ Based on patterns and current activity, what incidents do you predict in the nex
           
           this.predictionStats.pending.push(prediction);
           this.predictionStats.total++;
+          
+          // Track PROPHET activity
+          this.agents.PROPHET.lastActive = new Date().toISOString();
+          this.agents.PROPHET.recentInsights.unshift({
+            text: `Predicted ${pred.incidentType} in ${pred.borough} (${prediction.confidencePercent}% confidence)`,
+            predictionId: prediction.id,
+            timestamp: new Date().toISOString()
+          });
+          if (this.agents.PROPHET.recentInsights.length > 10) this.agents.PROPHET.recentInsights.pop();
           
           broadcast({
             type: 'prophet_prediction',
@@ -487,7 +560,7 @@ Based on patterns and current activity, what incidents do you predict in the nex
             timestamp: new Date().toISOString()
           });
           
-          console.log(`[PROPHET] Prediction: ${pred.incidentType} at ${pred.location} (${(pred.confidence * 100).toFixed(0)}%)`);
+          console.log(`[PROPHET] Prediction: ${pred.incidentType} at ${pred.location} (${prediction.confidencePercent}%)`);
         }
       }
     } catch (error) {
@@ -572,7 +645,10 @@ Based on patterns and current activity, what incidents do you predict in the nex
       name: agent.name,
       icon: agent.icon,
       role: agent.role,
-      status: agent.status
+      status: agent.status,
+      lastActive: agent.lastActive,
+      recentInsights: agent.recentInsights.slice(0, 5),
+      insightCount: agent.recentInsights.length
     }));
   }
 
@@ -671,6 +747,26 @@ Pending predictions: ${JSON.stringify(this.predictionStats.pending)}`
         this.memory.hotspots = new Map(savedState.hotspots);
         console.log(`[DETECTIVE] Restored ${savedState.hotspots.length} hotspots`);
       }
+      
+      // Restore agent insights
+      if (savedState.agentInsights) {
+        for (const agentId of ['CHASE', 'PATTERN', 'PROPHET', 'HISTORIAN']) {
+          if (savedState.agentInsights[agentId] && Array.isArray(savedState.agentInsights[agentId])) {
+            this.agents[agentId].recentInsights = savedState.agentInsights[agentId];
+          }
+        }
+        console.log(`[DETECTIVE] Restored agent insights`);
+      }
+      
+      // Restore agent lastActive timestamps
+      if (savedState.agentLastActive) {
+        for (const agentId of ['CHASE', 'PATTERN', 'PROPHET', 'HISTORIAN']) {
+          if (savedState.agentLastActive[agentId]) {
+            this.agents[agentId].lastActive = savedState.agentLastActive[agentId];
+          }
+        }
+        console.log(`[DETECTIVE] Restored agent activity timestamps`);
+      }
     } catch (error) {
       console.error('[DETECTIVE] Error restoring state:', error.message);
     }
@@ -692,6 +788,226 @@ if (savedDetectiveState) {
 setInterval(() => {
   saveDetectiveState(detectiveBureau);
 }, 2 * 60 * 1000);
+
+// ============================================
+// NYC CORRECTIONAL FACILITIES INTEGRATION
+// ============================================
+
+// NYC DOC Facility Locations (static data)
+const NYC_CORRECTIONAL_FACILITIES = [
+  {
+    id: 'rikers_island',
+    name: 'Rikers Island Complex',
+    shortName: 'Rikers',
+    type: 'jail',
+    borough: 'Bronx', // Technically between Bronx/Queens
+    lat: 40.7932,
+    lng: -73.8860,
+    capacity: 10000,
+    description: 'Main NYC jail complex with multiple facilities',
+    facilities: [
+      'Anna M. Kross Center (AMKC)',
+      'Eric M. Taylor Center (EMTC)', 
+      'George R. Vierno Center (GRVC)',
+      'North Infirmary Command (NIC)',
+      'Otis Bantum Correctional Center (OBCC)',
+      'Robert N. Davoren Center (RNDC)',
+      'Rose M. Singer Center (RMSC) - Women',
+      'George Motchan Detention Center (GMDC)',
+      'West Facility (WF)'
+    ],
+    releaseInfo: {
+      typicalReleaseTime: '6:00 AM - 8:00 AM',
+      typicalDailyReleases: '50-150',
+      releaseLocation: 'Queens side of Rikers Island Bridge'
+    }
+  },
+  {
+    id: 'manhattan_detention',
+    name: 'Manhattan Detention Complex',
+    shortName: 'The Tombs',
+    type: 'jail',
+    borough: 'Manhattan',
+    lat: 40.7142,
+    lng: -74.0015,
+    capacity: 898,
+    description: 'Located at 125 White Street, adjacent to Manhattan Criminal Court',
+    releaseInfo: {
+      typicalReleaseTime: '24/7 releases',
+      typicalDailyReleases: '20-50',
+      releaseLocation: '125 White Street entrance'
+    }
+  },
+  {
+    id: 'brooklyn_detention',
+    name: 'Brooklyn Detention Complex',
+    shortName: 'Brooklyn House',
+    type: 'jail',
+    borough: 'Brooklyn',
+    lat: 40.6892,
+    lng: -73.9836,
+    capacity: 759,
+    description: 'Located at 275 Atlantic Avenue',
+    releaseInfo: {
+      typicalReleaseTime: '6:00 AM - 10:00 AM',
+      typicalDailyReleases: '15-40',
+      releaseLocation: 'Atlantic Avenue entrance'
+    }
+  },
+  {
+    id: 'queens_detention',
+    name: 'Queens Detention Facility',
+    shortName: 'Queens House',
+    type: 'jail',
+    borough: 'Queens',
+    lat: 40.7282,
+    lng: -73.8303,
+    capacity: 500,
+    description: 'Located at 126-02 82nd Avenue, Kew Gardens',
+    releaseInfo: {
+      typicalReleaseTime: '6:00 AM - 8:00 AM',
+      typicalDailyReleases: '10-30',
+      releaseLocation: '82nd Avenue entrance'
+    }
+  },
+  {
+    id: 'vernon_bain',
+    name: 'Vernon C. Bain Center',
+    shortName: 'The Boat',
+    type: 'jail',
+    borough: 'Bronx',
+    lat: 40.8058,
+    lng: -73.8778,
+    capacity: 800,
+    description: 'Floating detention facility (barge) at Hunts Point',
+    releaseInfo: {
+      typicalReleaseTime: '6:00 AM - 8:00 AM',
+      typicalDailyReleases: '10-25',
+      releaseLocation: 'Hunts Point dock'
+    }
+  }
+];
+
+// Population data storage
+let facilityPopulation = {
+  lastFetch: null,
+  facilities: {},
+  totalPopulation: 0,
+  dailyAdmissions: 0,
+  dailyReleases: 0,
+  fetchErrors: 0
+};
+
+// Fetch population data from NYC Open Data
+async function fetchFacilityPopulation() {
+  try {
+    // NYC DOC Daily Inmates In Custody dataset
+    const response = await fetch(
+      'https://data.cityofnewyork.us/resource/7479-ugqb.json?$order=date_of_data%20DESC&$limit=10',
+      { headers: { 'Accept': 'application/json' } }
+    );
+    
+    if (!response.ok) {
+      throw new Error(`NYC Open Data returned ${response.status}`);
+    }
+    
+    const data = await response.json();
+    
+    if (data && data.length > 0) {
+      const latest = data[0];
+      
+      facilityPopulation = {
+        lastFetch: new Date().toISOString(),
+        dataDate: latest.date_of_data,
+        totalPopulation: parseInt(latest.total_inmates) || 0,
+        adaPopulation: parseInt(latest.total_ada_inmates) || 0,
+        facilities: {},
+        fetchErrors: 0
+      };
+      
+      console.log(`[FACILITIES] Population data: ${facilityPopulation.totalPopulation} total inmates (as of ${latest.date_of_data})`);
+      
+      // Broadcast update
+      broadcast({
+        type: 'facility_update',
+        facilities: NYC_CORRECTIONAL_FACILITIES,
+        population: facilityPopulation,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    return facilityPopulation;
+  } catch (error) {
+    console.error(`[FACILITIES] Fetch error: ${error.message}`);
+    facilityPopulation.fetchErrors++;
+    return facilityPopulation;
+  }
+}
+
+// Get facility near a location
+function getNearbyFacility(lat, lng, radiusKm = 2) {
+  if (!lat || !lng) return null;
+  
+  for (const facility of NYC_CORRECTIONAL_FACILITIES) {
+    const distance = Math.sqrt(
+      Math.pow((facility.lat - lat) * 111, 2) + // 1 degree lat ≈ 111km
+      Math.pow((facility.lng - lng) * 85, 2)    // 1 degree lng ≈ 85km at NYC latitude
+    );
+    
+    if (distance <= radiusKm) {
+      return {
+        ...facility,
+        distanceKm: Math.round(distance * 10) / 10
+      };
+    }
+  }
+  
+  return null;
+}
+
+// Check if current time is during typical release hours
+function isDuringReleaseHours() {
+  const hour = new Date().getHours();
+  return hour >= 5 && hour <= 10; // 5 AM - 10 AM
+}
+
+// Get release context for an incident
+function getFacilityContext(incident) {
+  const nearbyFacility = getNearbyFacility(incident.lat, incident.lng);
+  
+  if (!nearbyFacility) return null;
+  
+  const context = {
+    facility: nearbyFacility.name,
+    shortName: nearbyFacility.shortName,
+    distance: nearbyFacility.distanceKm,
+    duringReleaseHours: isDuringReleaseHours()
+  };
+  
+  if (context.duringReleaseHours) {
+    context.note = `Incident ${context.distance}km from ${context.shortName} during typical release hours (${nearbyFacility.releaseInfo.typicalReleaseTime})`;
+  } else {
+    context.note = `Incident ${context.distance}km from ${context.shortName}`;
+  }
+  
+  return context;
+}
+
+// Start facility data fetch cycle
+async function startFacilityFetching() {
+  console.log('[FACILITIES] Starting facility data fetching...');
+  
+  // Initial fetch
+  await fetchFacilityPopulation();
+  
+  // Fetch every 30 minutes (data doesn't change that frequently)
+  setInterval(async () => {
+    await fetchFacilityPopulation();
+  }, 30 * 60 * 1000);
+}
+
+// Start fetching after server starts
+setTimeout(startFacilityFetching, 10000);
 
 // ============================================
 // BETTING SYSTEM
@@ -1401,9 +1717,40 @@ app.post('/auth/verify', (req, res) => {
 });
 
 // Core endpoints
-app.get('/', (req, res) => res.json({ name: "DISPATCH NYC", status: "operational", connections: clients.size, incidents: incidents.length, agents: detectiveBureau.getAgentStatuses(), predictionAccuracy: detectiveBureau.getAccuracy() }));
+app.get('/', (req, res) => res.json({ name: "DISPATCH NYC", status: "operational", connections: clients.size, incidents: incidents.length, facilities: NYC_CORRECTIONAL_FACILITIES.length, agents: detectiveBureau.getAgentStatuses(), predictionAccuracy: detectiveBureau.getAccuracy() }));
 app.get('/cameras', (req, res) => res.json(cameras));
 app.get('/incidents', (req, res) => res.json(incidents));
+
+// Correctional Facilities endpoints
+app.get('/facilities', (req, res) => res.json({
+  facilities: NYC_CORRECTIONAL_FACILITIES,
+  population: facilityPopulation,
+  timestamp: new Date().toISOString()
+}));
+app.get('/facilities/list', (req, res) => res.json(NYC_CORRECTIONAL_FACILITIES));
+app.get('/facilities/population', (req, res) => res.json(facilityPopulation));
+app.get('/facilities/:id', (req, res) => {
+  const facility = NYC_CORRECTIONAL_FACILITIES.find(f => f.id === req.params.id);
+  if (!facility) return res.status(404).json({ error: 'Facility not found' });
+  res.json({ facility, population: facilityPopulation });
+});
+app.get('/facilities/nearby/:lat/:lng', (req, res) => {
+  const lat = parseFloat(req.params.lat);
+  const lng = parseFloat(req.params.lng);
+  const radius = parseFloat(req.query.radius) || 2;
+  const nearby = getNearbyFacility(lat, lng, radius);
+  res.json({ 
+    nearby, 
+    duringReleaseHours: isDuringReleaseHours(),
+    currentHour: new Date().getHours()
+  });
+});
+app.post('/facilities/refresh', async (req, res) => {
+  console.log('[FACILITIES] Manual refresh requested');
+  const data = await fetchFacilityPopulation();
+  res.json({ success: true, population: data });
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 app.get('/audio/:id', (req, res) => { const buffer = audioClips.get(req.params.id); if (!buffer) return res.status(404).json({ error: 'Not found' }); res.set('Content-Type', 'audio/mpeg'); res.send(buffer); });
 app.get('/camera-image/:id', async (req, res) => { try { const response = await fetch(`https://webcams.nyctmc.org/api/cameras/${req.params.id}/image`); const buffer = await response.arrayBuffer(); res.set('Content-Type', 'image/jpeg'); res.send(Buffer.from(buffer)); } catch (e) { res.status(500).json({ error: 'Failed' }); } });
@@ -1488,13 +1835,34 @@ wss.on('connection', (ws) => {
   clients.add(ws);
   
   // Send comprehensive init data so new users see activity
+  // Build agent feed from all agent insights
+  const agentFeed = [];
+  for (const agent of Object.values(detectiveBureau.agents)) {
+    for (const insight of agent.recentInsights) {
+      agentFeed.push({
+        agent: agent.name,
+        agentIcon: agent.icon,
+        text: insight.text,
+        timestamp: insight.timestamp,
+        incidentId: insight.incidentId
+      });
+    }
+  }
+  agentFeed.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  
   const initData = {
     type: "init",
     incidents: incidents.slice(0, 30), // More incidents for new users
     cameras,
     transcripts: recentTranscripts.slice(0, 30), // More transcripts
+    facilities: {
+      list: NYC_CORRECTIONAL_FACILITIES,
+      population: facilityPopulation,
+      duringReleaseHours: isDuringReleaseHours()
+    },
     currentFeed: SCANNER_FEEDS[currentFeedIndex]?.name,
     agents: detectiveBureau.getAgentStatuses(),
+    agentFeed: agentFeed.slice(0, 20), // Recent agent activity for Feed tab
     predictions: detectiveBureau.getPredictionStats(),
     patterns: detectiveBureau.memory.patterns.filter(p => p.status === 'active').slice(0, 10),
     hotspots: Array.from(detectiveBureau.memory.hotspots.entries())
@@ -1506,6 +1874,8 @@ wss.on('connection', (ws) => {
       }),
     stats: {
       totalIncidents: incidents.length,
+      totalFacilities: NYC_CORRECTIONAL_FACILITIES.length,
+      jailPopulation: facilityPopulation.totalPopulation || 0,
       activePatterns: detectiveBureau.memory.patterns.filter(p => p.status === 'active').length,
       predictionAccuracy: detectiveBureau.getAccuracy(),
       uptime: process.uptime()
@@ -1513,7 +1883,7 @@ wss.on('connection', (ws) => {
   };
   
   ws.send(JSON.stringify(initData));
-  console.log(`[WS] New client connected. Sent ${initData.incidents.length} incidents, ${initData.transcripts.length} transcripts`);
+  console.log(`[WS] New client connected. Sent ${initData.incidents.length} incidents, ${initData.transcripts.length} transcripts, ${NYC_CORRECTIONAL_FACILITIES.length} facilities`);
   
   ws.on('close', () => clients.delete(ws));
   ws.on('message', async (message) => {
