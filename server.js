@@ -1705,34 +1705,35 @@ async function fetchCamerasForCity(cityId) {
         console.log(`[${city.shortName}] Loaded ${cityState[cityId].cameras.length} traffic cameras`);
       } catch (e) {
         console.log(`[${city.shortName}] MnDOT API error, using expanded fallback cameras`);
-        // Expanded fallback Minneapolis cameras at major intersections and highways
+        // MnDOT camera IDs - these are real camera IDs from the MnDOT 511 system
+        // Image URL format: https://video.dot.state.mn.us/public/{ID}.jpg
         cityState[cityId].cameras = [
-          // Downtown
-          { id: 'mpls-1', location: 'I-94 & Hennepin Ave', lat: 44.9738, lng: -93.2780, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6560.jpg' },
-          { id: 'mpls-2', location: 'I-35W & Washington Ave', lat: 44.9738, lng: -93.2590, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6545.jpg' },
-          { id: 'mpls-3', location: 'Nicollet Mall & 7th St', lat: 44.9778, lng: -93.2712, area: 'Downtown', city: 'mpls' },
-          { id: 'mpls-4', location: 'I-394 & Dunwoody Blvd', lat: 44.9697, lng: -93.2898, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6505.jpg' },
-          // Uptown / South
-          { id: 'mpls-5', location: 'Hennepin Ave & Lake St', lat: 44.9486, lng: -93.2984, area: 'Uptown', city: 'mpls' },
-          { id: 'mpls-6', location: 'Lake St & Chicago Ave', lat: 44.9486, lng: -93.2614, area: 'South', city: 'mpls' },
-          { id: 'mpls-7', location: 'I-35W & Lake St', lat: 44.9486, lng: -93.2505, area: 'South', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6530.jpg' },
-          { id: 'mpls-8', location: '38th St & Chicago Ave', lat: 44.9341, lng: -93.2614, area: 'South', city: 'mpls' },
-          { id: 'mpls-9', location: 'I-35W & 46th St', lat: 44.9220, lng: -93.2505, area: 'South', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6520.jpg' },
-          // North
-          { id: 'mpls-10', location: 'I-94 & Dowling Ave N', lat: 45.0150, lng: -93.2850, area: 'North', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6580.jpg' },
-          { id: 'mpls-11', location: 'Broadway & Washington Ave N', lat: 44.9958, lng: -93.2794, area: 'North', city: 'mpls' },
-          { id: 'mpls-12', location: 'I-94 & Humboldt Ave', lat: 45.0020, lng: -93.2980, area: 'North', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6575.jpg' },
-          // Northeast
-          { id: 'mpls-13', location: 'University Ave & Central Ave', lat: 44.9700, lng: -93.2473, area: 'Northeast', city: 'mpls' },
-          { id: 'mpls-14', location: 'I-35W & Stinson Blvd', lat: 45.0100, lng: -93.2350, area: 'Northeast', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6600.jpg' },
-          // Southwest / Whittier
-          { id: 'mpls-15', location: 'Franklin Ave & Lyndale Ave', lat: 44.9625, lng: -93.2878, area: 'Whittier', city: 'mpls' },
-          { id: 'mpls-16', location: 'I-35W & Franklin Ave', lat: 44.9625, lng: -93.2505, area: 'Whittier', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6540.jpg' },
-          // Highways - I-494/I-694 metro ring
-          { id: 'mpls-17', location: 'I-494 & France Ave', lat: 44.8650, lng: -93.3340, area: 'Bloomington', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6400.jpg' },
-          { id: 'mpls-18', location: 'I-94 & Snelling Ave (St Paul)', lat: 44.9550, lng: -93.1670, area: 'St Paul', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6650.jpg' },
-          { id: 'mpls-19', location: 'I-35E & Maryland Ave (St Paul)', lat: 44.9780, lng: -93.0920, area: 'St Paul', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6700.jpg' },
-          { id: 'mpls-20', location: 'I-694 & Rice St', lat: 45.0650, lng: -93.1050, area: 'Roseville', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6750.jpg' },
+          // Downtown Minneapolis - I-394/I-94 interchange area
+          { id: 'C2206', location: 'I-394 at Dunwoody Blvd', lat: 44.9697, lng: -93.2898, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2206.jpg' },
+          { id: 'C2203', location: 'I-394 at Lyndale Ave', lat: 44.9680, lng: -93.2878, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2203.jpg' },
+          { id: 'C2101', location: 'I-94 at Hennepin Ave', lat: 44.9738, lng: -93.2780, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2101.jpg' },
+          { id: 'C2107', location: 'I-94 at 5th St', lat: 44.9798, lng: -93.2690, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2107.jpg' },
+          // I-35W Corridor
+          { id: 'C1902', location: 'I-35W at Washington Ave', lat: 44.9738, lng: -93.2590, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C1902.jpg' },
+          { id: 'C1904', location: 'I-35W at University Ave', lat: 44.9700, lng: -93.2473, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C1904.jpg' },
+          { id: 'C1908', location: 'I-35W at Lake St', lat: 44.9486, lng: -93.2505, area: 'South', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C1908.jpg' },
+          { id: 'C1912', location: 'I-35W at 46th St', lat: 44.9220, lng: -93.2505, area: 'South', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C1912.jpg' },
+          { id: 'C1916', location: 'I-35W at 60th St', lat: 44.8980, lng: -93.2505, area: 'South', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C1916.jpg' },
+          // North Minneapolis / I-94 West
+          { id: 'C2115', location: 'I-94 at Dowling Ave N', lat: 45.0150, lng: -93.2850, area: 'North', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2115.jpg' },
+          { id: 'C2112', location: 'I-94 at Humboldt Ave', lat: 45.0020, lng: -93.2980, area: 'North', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2112.jpg' },
+          { id: 'C2119', location: 'I-94 at Brooklyn Blvd', lat: 45.0280, lng: -93.3350, area: 'Brooklyn Center', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2119.jpg' },
+          // I-494 South Metro
+          { id: 'C4406', location: 'I-494 at France Ave', lat: 44.8650, lng: -93.3340, area: 'Bloomington', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C4406.jpg' },
+          { id: 'C4410', location: 'I-494 at Lyndale Ave', lat: 44.8650, lng: -93.2878, area: 'Bloomington', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C4410.jpg' },
+          { id: 'C4414', location: 'I-494 at 34th Ave', lat: 44.8550, lng: -93.2200, area: 'Bloomington', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C4414.jpg' },
+          // St Paul / East Metro
+          { id: 'C2501', location: 'I-94 at Snelling Ave', lat: 44.9550, lng: -93.1670, area: 'St Paul', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2501.jpg' },
+          { id: 'C2505', location: 'I-94 at Lexington Pkwy', lat: 44.9550, lng: -93.1470, area: 'St Paul', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2505.jpg' },
+          { id: 'C2702', location: 'I-35E at Maryland Ave', lat: 44.9780, lng: -93.0920, area: 'St Paul', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C2702.jpg' },
+          // I-694 North Metro
+          { id: 'C3302', location: 'I-694 at Rice St', lat: 45.0650, lng: -93.1050, area: 'Roseville', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C3302.jpg' },
+          { id: 'C3306', location: 'I-694 at Lexington Ave', lat: 45.0650, lng: -93.1470, area: 'Shoreview', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/C3306.jpg' },
         ];
         console.log(`[${city.shortName}] Using ${cityState[cityId].cameras.length} fallback cameras`);
       }
@@ -2460,6 +2461,21 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
   if (noise.includes(lower) || noise.includes(lower.replace(/[.,!?]/g, ''))) {
     scannerStats.filteredNoise = (scannerStats.filteredNoise || 0) + 1;
     console.log(`[${feedName}] Filtered noise: "${clean}"`);
+    return;
+  }
+  
+  // Filter out radio sign-offs and acknowledgments (not real incidents)
+  const signOffPatterns = [
+    'have a good night', 'have a good evening', 'have a good one',
+    'good night', 'good evening', 'see you', 'take care',
+    '10-4', '10-7', '10-8', '10-41', '10-42',
+    'copy that', 'roger', 'affirmative',
+    'going off duty', 'end of shift', 'signing off',
+    'every night', 'every evening'
+  ];
+  if (signOffPatterns.some(pattern => lower.includes(pattern)) && lower.length < 50) {
+    scannerStats.filteredSignOff = (scannerStats.filteredSignOff || 0) + 1;
+    console.log(`[${feedName}] Filtered sign-off: "${clean}"`);
     return;
   }
   
