@@ -1838,7 +1838,6 @@ async function startOpenMHzPolling() {
       
       consecutiveErrors = 0;
       const data = await response.json();
-      const calls = data.calls || data || [];
       
       openMHzStats.lastPoll = new Date().toISOString();
       
@@ -1944,11 +1943,6 @@ let scannerStats = {
   successfulTranscripts: 0,
   feedStats: {}
 };
-
-function broadcast(data) {
-  const message = JSON.stringify(data);
-  clients.forEach(client => { if (client.readyState === 1) client.send(message); });
-}
 
 // Connect to a single feed
 function connectToFeed(feed) {
