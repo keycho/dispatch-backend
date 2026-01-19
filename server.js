@@ -75,8 +75,13 @@ function getPrecinctBorough(precinctNum) {
 // PERSISTENT MEMORY SYSTEM
 // ============================================
 
-const MEMORY_FILE = './detective_memory.json';
+const MEMORY_FILE = process.env.RAILWAY_VOLUME_MOUNT_PATH 
+  ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/detective_memory.json`
+  : './detective_memory.json';
 const MEMORY_SAVE_INTERVAL = 60000; // Save every minute
+
+console.log(`[MEMORY] Storage location: ${MEMORY_FILE}`);
+console.log(`[MEMORY] Railway volume: ${process.env.RAILWAY_VOLUME_MOUNT_PATH || 'NOT CONFIGURED'}`);
 
 function loadMemoryFromDisk() {
   try {
@@ -1814,14 +1819,27 @@ async function processAudioFromStream(buffer, feedName) {
   const clean = transcript.trim();
   const lower = clean.toLowerCase();
   
-  // Filter out noise
-  const noise = ['thank you', 'thanks for watching', 'subscribe', 'you', 'bye', 'music'];
-  if (noise.some(n => lower === n || lower === n + '.')) {
+  // Filter out Whisper prompt leakage (when it hallucinates the prompt back)
+  const promptLeakage = ['addresses like', 'intersections like', 'landmarks like', 'nypd police radio dispatch'];
+  if (promptLeakage.some(p => lower.includes(p))) {
+    scannerStats.filteredPromptLeak = (scannerStats.filteredPromptLeak || 0) + 1;
+    console.log(`[SCANNER] Filtered prompt leak: "${clean.substring(0, 50)}"`);
+    return;
+  }
+  
+  // Filter out noise - only exact matches
+  const noise = ['thank you', 'thanks for watching', 'subscribe', 'you', 'bye', 'music', 'you.', 'bye.'];
+  if (noise.includes(lower) || noise.includes(lower.replace(/[.,!?]/g, ''))) {
     scannerStats.filteredNoise = (scannerStats.filteredNoise || 0) + 1;
     console.log(`[SCANNER] Filtered noise: "${clean}"`);
     return;
   }
-  if (lower.includes('broadcastify') || lower.includes('fema.gov')) {
+  
+  // Filter out actual Broadcastify ads - but be more specific
+  if ((lower.includes('broadcastify') && lower.includes('premium')) || 
+      lower.includes('fema.gov') || 
+      lower.includes('support this feed') ||
+      lower.includes('become a subscriber')) {
     scannerStats.filteredAd = (scannerStats.filteredAd || 0) + 1;
     console.log(`[SCANNER] Filtered ad: "${clean}"`);
     return;
