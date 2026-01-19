@@ -2327,6 +2327,9 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
   recentTranscripts.unshift(transcriptEntry);
   if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
   
+  // Sync with cityState for multi-city WebSocket
+  cityState['nyc'].recentTranscripts = recentTranscripts;
+  
   broadcast({ type: "transcript", ...transcriptEntry });
   
   const parsed = await parseTranscript(clean);
@@ -2353,6 +2356,10 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     
     incidents.unshift(incident);
     if (incidents.length > 50) incidents.pop();
+    
+    // Also store in cityState for multi-city WebSocket
+    cityState['nyc'].incidents = incidents;
+    cityState['nyc'].recentTranscripts = recentTranscripts;
     
     // Track per-feed incidents
     if (feedId && scannerStats.feedStats[feedId]) {
