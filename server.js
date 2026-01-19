@@ -25,15 +25,9 @@ const CITIES = {
     mapZoom: 11,
     openmhz: { system: 'nypd', name: 'NYPD' },
     broadcastifyFeeds: [
-      { id: '30382', name: 'NYPD Manhattan North' },
-      { id: '30383', name: 'NYPD Manhattan South' },
-      { id: '30378', name: 'NYPD Brooklyn North' },
-      { id: '30379', name: 'NYPD Brooklyn South' },
-      { id: '30376', name: 'NYPD Bronx' },
-      { id: '30380', name: 'NYPD Queens North' },
-      { id: '30381', name: 'NYPD Queens South' },
-      { id: '29096', name: 'NYPD Staten Island' },
       { id: '40184', name: 'NYPD Citywide 1' },
+      { id: '40185', name: 'NYPD Citywide 2' },
+      { id: '40186', name: 'NYPD Citywide 3' },
       { id: '32119', name: 'NYPD Dispatch Citywide' },
     ],
     cameraApi: 'https://webcams.nyctmc.org/api/cameras',
@@ -89,7 +83,7 @@ Object.keys(CITIES).forEach(cityId => {
       feedStats: {}
     },
     openMHzStats: { callsFetched: 0, callsProcessed: 0, lastPoll: null, errors: 0, disabled: false, method: null },
-    lastOpenMHzTime: Date.now(),
+    lastOpenMHzTime: Date.now() - (5 * 60 * 1000), // Start 5 min ago
     clients: new Set() // WebSocket clients subscribed to this city
   };
 });
@@ -1717,17 +1711,10 @@ const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
 const NYPD_FEEDS = [
-  // High-activity borough feeds
-  { id: '30382', name: 'NYPD Manhattan North' },
-  { id: '30383', name: 'NYPD Manhattan South' },
-  { id: '30378', name: 'NYPD Brooklyn North' },
-  { id: '30379', name: 'NYPD Brooklyn South' },
-  { id: '30376', name: 'NYPD Bronx' },
-  { id: '30380', name: 'NYPD Queens North' },
-  { id: '30381', name: 'NYPD Queens South' },
-  { id: '29096', name: 'NYPD Staten Island' },
-  // Citywide dispatch
+  // These are verified working Broadcastify feed IDs
   { id: '40184', name: 'NYPD Citywide 1' },
+  { id: '40185', name: 'NYPD Citywide 2' },
+  { id: '40186', name: 'NYPD Citywide 3' },
   { id: '32119', name: 'NYPD Dispatch Citywide' },
 ];
 
@@ -1743,7 +1730,7 @@ const OPENMHZ_SYSTEM = 'nypd'; // Correct system name from openmhz.com/system/ny
 const OPENMHZ_POLL_INTERVAL = 20000;
 // Time format is weird: Unix seconds + 3 decimal places as integer
 // e.g., 1609533015.681 becomes 1609533015681
-let lastOpenMHzTime = Date.now(); 
+let lastOpenMHzTime = Date.now() - (5 * 60 * 1000); // Start 5 min ago to catch recent calls 
 let openMHzStats = { callsFetched: 0, callsProcessed: 0, lastPoll: null, errors: 0, disabled: false, method: null };
 
 // Socket.IO for real-time (preferred method)
@@ -1811,6 +1798,11 @@ async function startOpenMHzPolling() {
       // Try the /calls/newer endpoint with correct format
       const url = `https://api.openmhz.com/${OPENMHZ_SYSTEM}/calls/newer?time=${timeParam}`;
       
+      // Log first poll URL for debugging
+      if (!openMHzStats.method) {
+        console.log(`[OPENMHZ] Polling: ${url}`);
+      }
+      
       const response = await fetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -1823,6 +1815,11 @@ async function startOpenMHzPolling() {
       if (!response.ok) {
         consecutiveErrors++;
         openMHzStats.errors++;
+        
+        // Log first few errors for debugging
+        if (consecutiveErrors <= 3) {
+          console.log(`[OPENMHZ] API error ${response.status}: ${response.statusText}`);
+        }
         
         if (consecutiveErrors >= 5 && !openMHzStats.disabled) {
           console.log(`[OPENMHZ] API unavailable (${response.status}) - disabled`);
@@ -1843,6 +1840,11 @@ async function startOpenMHzPolling() {
       
       // Process all calls from the NYPD system
       const calls = Array.isArray(data.calls || data) ? (data.calls || data) : [];
+      
+      // Log poll result
+      if (openMHzStats.callsFetched === 0 && calls.length === 0) {
+        console.log(`[OPENMHZ] Polling... (waiting for new calls)`);
+      }
       
       if (calls.length > 0) {
         console.log(`[OPENMHZ] Processing ${calls.length} NYPD calls`);
