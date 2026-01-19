@@ -2,6 +2,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import https from 'https';
+import fs from 'fs';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI, { toFile } from 'openai';
 import fetch from 'node-fetch';
@@ -69,100 +70,256 @@ function getPrecinctBorough(precinctNum) {
   return PRECINCT_TO_BOROUGH[num] || null;
 }
 
+
+// ============================================
+// PERSISTENT MEMORY SYSTEM
+// ============================================
+
+const MEMORY_FILE = './detective_memory.json';
+const MEMORY_SAVE_INTERVAL = 60000; // Save every minute
+
+function loadMemoryFromDisk() {
+  try {
+    if (fs.existsSync(MEMORY_FILE)) {
+      const data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
+      console.log('[MEMORY] Loaded from disk:', data.incidents?.length || 0, 'incidents,', data.predictionStats?.total || 0, 'predictions');
+      return data;
+    }
+  } catch (error) {
+    console.error('[MEMORY] Load error:', error.message);
+  }
+  return null;
+}
+
+function saveMemoryToDisk(memory, predictionStats, agents) {
+  try {
+    const serializable = {
+      incidents: memory.incidents,
+      predictions: memory.predictions,
+      predictionHistory: memory.predictionHistory,
+      patterns: memory.patterns,
+      suspectProfiles: memory.suspectProfiles,
+      agentInsights: memory.agentInsights,
+      collaborations: memory.collaborations,
+      hotspots: Array.from(memory.hotspots.entries()),
+      addressHistory: Array.from(memory.addressHistory.entries()),
+      cases: Array.from(memory.cases.entries()),
+      predictionStats: {
+        total: predictionStats.total,
+        correct: predictionStats.correct,
+        pending: predictionStats.pending,
+        accuracyHistory: predictionStats.accuracyHistory
+      },
+      agentStats: Object.fromEntries(
+        Object.entries(agents).map(([k, v]) => [k, { stats: v.stats, history: v.history.slice(-100) }])
+      ),
+      savedAt: new Date().toISOString()
+    };
+    fs.writeFileSync(MEMORY_FILE, JSON.stringify(serializable, null, 2));
+  } catch (error) {
+    console.error('[MEMORY] Save error:', error.message);
+  }
+}
+
 // ============================================
 // DETECTIVE BUREAU - 4 SPECIALIZED AGENTS
+// Enhanced with persistent memory, collaboration, and feedback tracking
 // ============================================
 
 class DetectiveBureau {
   constructor(anthropicClient) {
     this.anthropic = anthropicClient;
     
+    const savedMemory = loadMemoryFromDisk();
+    const savedAgentStats = savedMemory?.agentStats || {};
+    
     this.agents = {
       CHASE: {
         id: 'CHASE',
         name: 'CHASE',
-        icon: 'ðŸš”',
+        icon: '🚔',
         role: 'Pursuit Specialist',
         status: 'idle',
-        triggers: ['pursuit', 'fled', 'fleeing', 'chase', 'vehicle pursuit', 'on foot', 'running', 'high speed', 'foot pursuit'],
-        systemPrompt: `You are CHASE, a pursuit specialist AI. You predict escape routes, containment points, and track active pursuits across NYC. You know NYC street topology intimately - one-ways, dead ends, bridge/tunnel access. Keep responses to 2-3 sentences. Be tactical and specific.`
+        triggers: ['pursuit', 'fled', 'fleeing', 'chase', 'vehicle pursuit', 'on foot', 'running', 'high speed', 'foot pursuit', '10-13'],
+        systemPrompt: `You are CHASE, a pursuit specialist AI. You predict escape routes, containment points, and track active pursuits across NYC. You know NYC street topology intimately - one-ways, dead ends, bridge/tunnel access. Keep responses to 2-3 sentences. Be tactical and specific.`,
+        stats: savedAgentStats.CHASE?.stats || { activations: 0, insights: 0, successfulContainments: 0 },
+        history: savedAgentStats.CHASE?.history || []
       },
       PATTERN: {
         id: 'PATTERN',
         name: 'PATTERN',
-        icon: 'ðŸ”',
+        icon: '🔗',
         role: 'Serial Crime Analyst',
         status: 'idle',
         triggers: [],
-        systemPrompt: `You are PATTERN, a serial crime analyst AI. You find connections between incidents - matching MOs, geographic clusters, temporal patterns, suspect descriptions. You name the patterns you discover. Keep responses to 2-3 sentences. Reference specific incident details.`
+        systemPrompt: `You are PATTERN, a serial crime analyst AI. You find connections between incidents - matching MOs, geographic clusters, temporal patterns, suspect descriptions. You name the patterns you discover. Keep responses to 2-3 sentences. Reference specific incident details.`,
+        stats: savedAgentStats.PATTERN?.stats || { activations: 0, patternsFound: 0, linkedIncidents: 0 },
+        history: savedAgentStats.PATTERN?.history || []
       },
       PROPHET: {
         id: 'PROPHET',
         name: 'PROPHET',
-        icon: 'ðŸ”®',
+        icon: '🔮',
         role: 'Predictive Analyst',
         status: 'idle',
         triggers: [],
-        systemPrompt: `You are PROPHET, a predictive analyst AI. You make specific, testable predictions about where and when incidents will occur. Always include location, time window, incident type, and confidence percentage. Your accuracy is tracked publicly.`
+        systemPrompt: `You are PROPHET, a predictive analyst AI. You make specific, testable predictions about where and when incidents will occur. Always include location, time window, incident type, and confidence percentage. Your accuracy is tracked publicly. Learn from your hits and misses.`,
+        stats: savedAgentStats.PROPHET?.stats || { activations: 0, totalPredictions: 0, hits: 0, misses: 0 },
+        history: savedAgentStats.PROPHET?.history || []
       },
       HISTORIAN: {
         id: 'HISTORIAN',
         name: 'HISTORIAN',
-        icon: 'ðŸ“š',
+        icon: '📚',
         role: 'Historical Context',
         status: 'idle',
         triggers: [],
-        systemPrompt: `You are HISTORIAN, the memory of the Detective Bureau. You remember every incident, every address, every suspect description. When new incidents occur, you surface relevant history - "this address had 4 calls this week", "suspect matches description from yesterday". Keep responses to 2-3 sentences.`
+        systemPrompt: `You are HISTORIAN, the memory of the Detective Bureau. You remember every incident, every address, every suspect description. When new incidents occur, you surface relevant history - "this address had 4 calls this week", "suspect matches description from yesterday". Keep responses to 2-3 sentences.`,
+        stats: savedAgentStats.HISTORIAN?.stats || { activations: 0, contextsProvided: 0, repeatAddresses: 0 },
+        history: savedAgentStats.HISTORIAN?.history || []
       }
     };
 
+    // Load persistent memory or initialize fresh
     this.memory = {
-      incidents: [],
-      cases: new Map(),
-      predictions: [],
-      patterns: [],
-      suspectProfiles: [],
-      hotspots: new Map(),
-      addressHistory: new Map()
+      incidents: savedMemory?.incidents || [],
+      cases: new Map(savedMemory?.cases || []),
+      predictions: savedMemory?.predictions || [],
+      predictionHistory: savedMemory?.predictionHistory || [],
+      patterns: savedMemory?.patterns || [],
+      suspectProfiles: savedMemory?.suspectProfiles || [],
+      hotspots: new Map(savedMemory?.hotspots || []),
+      addressHistory: new Map(savedMemory?.addressHistory || []),
+      agentInsights: savedMemory?.agentInsights || [],
+      collaborations: savedMemory?.collaborations || []
     };
 
     this.predictionStats = {
-      total: 0,
-      correct: 0,
-      pending: []
+      total: savedMemory?.predictionStats?.total || 0,
+      correct: savedMemory?.predictionStats?.correct || 0,
+      pending: savedMemory?.predictionStats?.pending || [],
+      accuracyHistory: savedMemory?.predictionStats?.accuracyHistory || []
     };
+
+    // Start memory persistence
+    setInterval(() => {
+      saveMemoryToDisk(this.memory, this.predictionStats, this.agents);
+    }, MEMORY_SAVE_INTERVAL);
 
     this.startProphetCycle();
     this.startPatternCycle();
+    
+    console.log('[DETECTIVE] Bureau initialized with', this.memory.incidents.length, 'historical incidents');
   }
+
+  // ============================================
+  // AGENT COLLABORATION
+  // ============================================
+  
+  async consultAgent(agentId, question, context = {}) {
+    const agent = this.agents[agentId];
+    if (!agent) return null;
+    
+    try {
+      const response = await this.anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 300,
+        system: agent.systemPrompt,
+        messages: [{
+          role: "user",
+          content: `${question}\n\nContext: ${JSON.stringify(context)}`
+        }]
+      });
+      return response.content[0].text;
+    } catch (error) {
+      console.error(`[${agentId}] Consultation error:`, error.message);
+      return null;
+    }
+  }
+
+  async crossReference(incident, sourceAgent, targetAgent) {
+    const source = this.agents[sourceAgent];
+    const target = this.agents[targetAgent];
+    
+    if (!source || !target) return null;
+    
+    const question = `Based on your expertise as ${target.role}, what context can you provide about this incident that might help with ${source.role.toLowerCase()} analysis?`;
+    
+    const insight = await this.consultAgent(targetAgent, question, { incident });
+    
+    if (insight) {
+      const collaboration = {
+        id: `collab_${Date.now()}`,
+        sourceAgent,
+        targetAgent,
+        incidentId: incident.id,
+        question,
+        insight,
+        timestamp: new Date().toISOString()
+      };
+      
+      this.memory.collaborations.unshift(collaboration);
+      if (this.memory.collaborations.length > 200) this.memory.collaborations.pop();
+      
+      return collaboration;
+    }
+    
+    return null;
+  }
+
+  // ============================================
+  // INCIDENT PROCESSING
+  // ============================================
 
   async processIncident(incident, broadcast) {
     const insights = [];
     
+    // Store incident (increased limit for better pattern analysis)
     this.memory.incidents.unshift(incident);
-    if (this.memory.incidents.length > 200) this.memory.incidents.pop();
+    if (this.memory.incidents.length > 500) this.memory.incidents.pop();
     
+    // Update address history
     const addressKey = incident.location?.toLowerCase() || 'unknown';
     const addressCount = (this.memory.addressHistory.get(addressKey) || 0) + 1;
     this.memory.addressHistory.set(addressKey, addressCount);
     
+    // Update hotspots
     const hotspotKey = `${incident.borough}-${incident.location}`;
     this.memory.hotspots.set(hotspotKey, (this.memory.hotspots.get(hotspotKey) || 0) + 1);
     
+    // Check prediction hits
     this.checkPredictionHit(incident, broadcast);
 
     // CHASE - Activates on pursuits
     if (this.shouldActivateChase(incident)) {
       this.agents.CHASE.status = 'active';
+      this.agents.CHASE.stats.activations++;
+      
       const chaseInsight = await this.runChase(incident);
       if (chaseInsight) {
-        insights.push(chaseInsight);
+        insights.push({ agent: 'CHASE', insight: chaseInsight });
+        this.agents.CHASE.stats.insights++;
+        
+        // Store in agent history
+        this.agents.CHASE.history.unshift({
+          incidentId: incident.id,
+          location: incident.location,
+          borough: incident.borough,
+          insight: chaseInsight,
+          timestamp: new Date().toISOString()
+        });
+        if (this.agents.CHASE.history.length > 100) this.agents.CHASE.history.pop();
+        
+        // Cross-reference with HISTORIAN for location history
+        const historianContext = await this.crossReference(incident, 'CHASE', 'HISTORIAN');
+        
         broadcast({
           type: 'agent_insight',
           agent: 'CHASE',
-          agentIcon: 'ðŸš”',
+          agentIcon: '🚔',
           incidentId: incident.id,
           analysis: chaseInsight,
+          collaboration: historianContext,
           urgency: 'critical',
           timestamp: new Date().toISOString()
         });
@@ -170,18 +327,37 @@ class DetectiveBureau {
       this.agents.CHASE.status = 'idle';
     }
 
-    // HISTORIAN - Always runs (but only for incidents with locations)
+    // HISTORIAN - Always runs for known locations
     if (incident.location && incident.location !== 'Unknown') {
       this.agents.HISTORIAN.status = 'analyzing';
+      this.agents.HISTORIAN.stats.activations++;
+      
       const historianInsight = await this.runHistorian(incident, addressCount);
       if (historianInsight) {
-        insights.push(historianInsight);
+        insights.push({ agent: 'HISTORIAN', insight: historianInsight });
+        this.agents.HISTORIAN.stats.contextsProvided++;
+        
+        if (addressCount > 1) {
+          this.agents.HISTORIAN.stats.repeatAddresses++;
+        }
+        
+        this.agents.HISTORIAN.history.unshift({
+          incidentId: incident.id,
+          address: incident.location,
+          borough: incident.borough,
+          addressCount,
+          insight: historianInsight,
+          timestamp: new Date().toISOString()
+        });
+        if (this.agents.HISTORIAN.history.length > 100) this.agents.HISTORIAN.history.pop();
+        
         broadcast({
           type: 'agent_insight',
           agent: 'HISTORIAN',
-          agentIcon: 'ðŸ“š',
+          agentIcon: '📚',
           incidentId: incident.id,
           analysis: historianInsight,
+          addressCount,
           urgency: addressCount > 3 ? 'high' : 'medium',
           timestamp: new Date().toISOString()
         });
@@ -192,30 +368,58 @@ class DetectiveBureau {
     // PATTERN - Check for connections
     if (this.memory.incidents.length >= 3) {
       this.agents.PATTERN.status = 'analyzing';
+      this.agents.PATTERN.stats.activations++;
+      
       const patternInsight = await this.runPattern(incident);
       if (patternInsight) {
-        insights.push(patternInsight);
+        insights.push({ agent: 'PATTERN', insight: patternInsight });
+        
+        if (patternInsight.isPattern) {
+          this.agents.PATTERN.stats.patternsFound++;
+          this.agents.PATTERN.stats.linkedIncidents += (patternInsight.linkedIncidentIds?.length || 0);
+          
+          // Cross-reference with PROPHET for prediction
+          const prophetContext = await this.crossReference(incident, 'PATTERN', 'PROPHET');
+          
+          broadcast({
+            type: 'pattern_detected',
+            agent: 'PATTERN',
+            agentIcon: '🔗',
+            pattern: patternInsight,
+            collaboration: prophetContext,
+            timestamp: new Date().toISOString()
+          });
+        }
+        
+        this.agents.PATTERN.history.unshift({
+          incidentId: incident.id,
+          isPattern: patternInsight.isPattern,
+          patternName: patternInsight.patternName,
+          linkedCount: patternInsight.linkedIncidentIds?.length || 0,
+          timestamp: new Date().toISOString()
+        });
+        if (this.agents.PATTERN.history.length > 100) this.agents.PATTERN.history.pop();
+        
         broadcast({
           type: 'agent_insight',
           agent: 'PATTERN',
-          agentIcon: 'ðŸ”',
+          agentIcon: '🔗',
           incidentId: incident.id,
           analysis: patternInsight.analysis,
           urgency: patternInsight.confidence === 'HIGH' ? 'high' : 'medium',
           timestamp: new Date().toISOString()
         });
-        
-        if (patternInsight.isPattern) {
-          broadcast({
-            type: 'pattern_detected',
-            agent: 'PATTERN',
-            pattern: patternInsight,
-            timestamp: new Date().toISOString()
-          });
-        }
       }
       this.agents.PATTERN.status = 'idle';
     }
+
+    // Store all insights for this incident
+    this.memory.agentInsights.unshift({
+      incidentId: incident.id,
+      insights,
+      timestamp: new Date().toISOString()
+    });
+    if (this.memory.agentInsights.length > 500) this.memory.agentInsights.pop();
 
     return insights;
   }
@@ -227,10 +431,15 @@ class DetectiveBureau {
 
   async runChase(incident) {
     try {
+      // Get recent pursuits in same area for context
+      const recentPursuits = this.agents.CHASE.history
+        .filter(h => h.timestamp > new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+        .slice(0, 5);
+      
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 300,
-        system: this.agents.CHASE.systemPrompt,
+        max_tokens: 400,
+        system: this.agents.CHASE.systemPrompt + `\n\nYou have access to recent pursuit history for pattern analysis.`,
         messages: [{
           role: "user",
           content: `ACTIVE PURSUIT:
@@ -240,7 +449,10 @@ Borough: ${incident.borough}
 Details: ${incident.summary}
 Units: ${JSON.stringify(incident.units)}
 
-Predict escape routes and recommend containment.`
+Recent pursuits in area (last 24h):
+${JSON.stringify(recentPursuits)}
+
+Predict escape routes and recommend containment. Consider historical escape patterns.`
         }]
       });
       return response.content[0].text;
@@ -255,23 +467,23 @@ Predict escape routes and recommend containment.`
       const relatedIncidents = this.memory.incidents.filter(inc => 
         inc.id !== incident.id && 
         (inc.location === incident.location || inc.borough === incident.borough)
-      ).slice(0, 5);
+      ).slice(0, 10);
 
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 200,
-        system: this.agents.HISTORIAN.systemPrompt,
+        max_tokens: 300,
+        system: this.agents.HISTORIAN.systemPrompt + `\n\nYou have access to complete incident history. Flag repeat problem locations and escalation patterns.`,
         messages: [{
           role: "user",
           content: `NEW INCIDENT:
 ${JSON.stringify(incident)}
 
-This address has had ${addressCount} calls recently.
+This address has had ${addressCount} calls total.
 
 Related incidents at same location/borough:
 ${JSON.stringify(relatedIncidents)}
 
-What historical context is relevant?`
+Is this a problem location? Any escalation pattern?`
         }]
       });
       return response.content[0].text;
@@ -286,25 +498,31 @@ What historical context is relevant?`
       const recentSimilar = this.memory.incidents.filter(inc => {
         if (inc.id === incident.id) return false;
         const timeDiff = new Date(incident.timestamp) - new Date(inc.timestamp);
-        const isRecent = timeDiff < 2 * 60 * 60 * 1000;
+        const isRecent = timeDiff < 4 * 60 * 60 * 1000; // 4 hours
         return isRecent;
-      }).slice(0, 10);
+      }).slice(0, 15);
 
       if (recentSimilar.length < 2) return null;
 
+      // Include active patterns for context
+      const activePatterns = this.memory.patterns.filter(p => p.status === 'active').slice(0, 5);
+
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 400,
-        system: this.agents.PATTERN.systemPrompt + `\n\nRespond in JSON: { "isPattern": true/false, "patternName": "string", "analysis": "string", "linkedIncidentIds": [numbers], "confidence": "HIGH/MEDIUM/LOW", "prediction": { "location": "string", "timeWindow": "string", "type": "string" } }`,
+        max_tokens: 500,
+        system: this.agents.PATTERN.systemPrompt + `\n\nRespond in JSON: { "isPattern": true/false, "patternName": "string (be creative and specific)", "analysis": "string", "linkedIncidentIds": [numbers], "confidence": "HIGH/MEDIUM/LOW", "prediction": { "location": "string", "timeWindow": "string", "type": "string" }, "suspectDescription": "string or null" }`,
         messages: [{
           role: "user",
           content: `NEW INCIDENT:
 ${JSON.stringify(incident)}
 
-RECENT INCIDENTS (last 2 hours):
+RECENT INCIDENTS (last 4 hours):
 ${JSON.stringify(recentSimilar)}
 
-Are these connected? Is there a pattern forming?`
+ACTIVE PATTERNS:
+${JSON.stringify(activePatterns)}
+
+Are these connected? Is this part of an existing pattern or a new one forming? Give the pattern a memorable name if found.`
         }]
       });
 
@@ -313,8 +531,30 @@ Are these connected? Is there a pattern forming?`
       if (jsonMatch) {
         const result = JSON.parse(jsonMatch[0]);
         if (result.isPattern) {
-          this.memory.patterns.unshift({ ...result, detectedAt: new Date().toISOString(), status: 'active' });
-          if (this.memory.patterns.length > 50) this.memory.patterns.pop();
+          const pattern = {
+            ...result,
+            id: `pattern_${Date.now()}`,
+            detectedAt: new Date().toISOString(),
+            status: 'active',
+            incidentCount: (result.linkedIncidentIds?.length || 0) + 1
+          };
+          
+          // Check if this updates an existing pattern
+          const existingIndex = this.memory.patterns.findIndex(p => 
+            p.patternName === result.patternName && p.status === 'active'
+          );
+          
+          if (existingIndex >= 0) {
+            this.memory.patterns[existingIndex] = {
+              ...this.memory.patterns[existingIndex],
+              ...pattern,
+              incidentCount: this.memory.patterns[existingIndex].incidentCount + 1
+            };
+          } else {
+            this.memory.patterns.unshift(pattern);
+          }
+          
+          if (this.memory.patterns.length > 100) this.memory.patterns.pop();
         }
         return result;
       }
@@ -325,11 +565,17 @@ Are these connected? Is there a pattern forming?`
     }
   }
 
+  // ============================================
+  // PROPHET PREDICTIONS WITH FEEDBACK TRACKING
+  // ============================================
+
   startProphetCycle() {
+    // Run every 15 minutes
     setInterval(async () => {
       await this.runProphet();
     }, 15 * 60 * 1000);
     
+    // Initial run after 2 minutes
     setTimeout(() => this.runProphet(), 2 * 60 * 1000);
   }
 
@@ -337,30 +583,41 @@ Are these connected? Is there a pattern forming?`
     if (this.memory.incidents.length < 5) return;
     
     this.agents.PROPHET.status = 'analyzing';
+    this.agents.PROPHET.stats.activations++;
     
     try {
-      const recentIncidents = this.memory.incidents.slice(0, 20);
+      const recentIncidents = this.memory.incidents.slice(0, 30);
       const hotspots = Array.from(this.memory.hotspots.entries())
         .sort((a, b) => b[1] - a[1])
-        .slice(0, 10);
+        .slice(0, 15);
+      
+      // Include prediction history for learning
+      const recentPredictions = this.predictionStats.accuracyHistory.slice(0, 20);
+      const activePatterns = this.memory.patterns.filter(p => p.status === 'active');
 
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 500,
-        system: this.agents.PROPHET.systemPrompt + `\n\nRespond in JSON: { "predictions": [{ "location": "specific NYC location", "borough": "string", "incidentType": "string", "timeWindowMinutes": number, "confidence": 0.0-1.0, "reasoning": "string" }] }. Make 1-3 specific predictions.`,
+        max_tokens: 600,
+        system: this.agents.PROPHET.systemPrompt + `\n\nYou have access to your prediction history. Learn from hits and misses. Respond in JSON: { "predictions": [{ "location": "specific NYC location", "borough": "string", "incidentType": "string", "timeWindowMinutes": number, "confidence": 0.0-1.0, "reasoning": "string", "basedOnPattern": "pattern name or null" }] }. Make 1-3 specific predictions.`,
         messages: [{
           role: "user",
           content: `Current time: ${new Date().toISOString()}
 Hour: ${new Date().getHours()}
 Day: ${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][new Date().getDay()]}
 
-RECENT INCIDENTS:
-${JSON.stringify(recentIncidents)}
+RECENT INCIDENTS (${recentIncidents.length}):
+${JSON.stringify(recentIncidents.slice(0, 15))}
 
-CURRENT HOTSPOTS:
+HOTSPOTS:
 ${JSON.stringify(hotspots)}
 
-Based on patterns and current activity, what incidents do you predict in the next 30-60 minutes?`
+ACTIVE PATTERNS:
+${JSON.stringify(activePatterns)}
+
+YOUR RECENT PREDICTION PERFORMANCE (learn from this):
+${JSON.stringify(recentPredictions)}
+
+Based on patterns, hotspots, time of day, and your learning from past predictions, what incidents do you predict in the next 30-60 minutes? Be specific about location.`
         }]
       });
 
@@ -381,14 +638,25 @@ Based on patterns and current activity, what incidents do you predict in the nex
           
           this.predictionStats.pending.push(prediction);
           this.predictionStats.total++;
+          this.agents.PROPHET.stats.totalPredictions++;
           
-          broadcast({
-            type: 'prophet_prediction',
-            agent: 'PROPHET',
-            agentIcon: 'ðŸ”®',
-            prediction,
+          // Store in full history
+          this.memory.predictionHistory.unshift({
+            ...prediction,
+            outcome: 'pending'
+          });
+          if (this.memory.predictionHistory.length > 500) this.memory.predictionHistory.pop();
+          
+          this.agents.PROPHET.history.unshift({
+            predictionId: prediction.id,
+            location: pred.location,
+            borough: pred.borough,
+            type: pred.incidentType,
+            confidence: pred.confidence,
+            basedOnPattern: pred.basedOnPattern,
             timestamp: new Date().toISOString()
           });
+          if (this.agents.PROPHET.history.length > 100) this.agents.PROPHET.history.pop();
           
           console.log(`[PROPHET] Prediction: ${pred.incidentType} at ${pred.location} (${(pred.confidence * 100).toFixed(0)}%)`);
         }
@@ -406,28 +674,61 @@ Based on patterns and current activity, what incidents do you predict in the nex
     this.predictionStats.pending = this.predictionStats.pending.filter(pred => {
       const expiresAt = new Date(pred.expiresAt);
       
+      // Check expiration
       if (now > expiresAt) {
         pred.status = 'expired';
+        this.agents.PROPHET.stats.misses++;
+        
+        // Update full history
+        const historyEntry = this.memory.predictionHistory.find(h => h.id === pred.id);
+        if (historyEntry) {
+          historyEntry.outcome = 'miss';
+          historyEntry.resolvedAt = now.toISOString();
+        }
+        
+        // Record in accuracy history for learning
+        this.recordAccuracy('miss', pred);
+        
         return false;
       }
       
+      // Check for hit
       const boroughMatch = incident.borough?.toLowerCase() === pred.borough?.toLowerCase();
       const typeMatch = incident.incidentType?.toLowerCase().includes(pred.incidentType?.toLowerCase()) ||
                        pred.incidentType?.toLowerCase().includes(incident.incidentType?.toLowerCase());
       
+      // Check location proximity
+      const locationWords = pred.location?.toLowerCase().split(/[\s,]+/) || [];
+      const incidentLocation = incident.location?.toLowerCase() || '';
+      const locationMatch = locationWords.some(word => word.length > 3 && incidentLocation.includes(word));
+      
       if (boroughMatch && typeMatch) {
         pred.status = 'hit';
         pred.matchedIncidentId = incident.id;
+        pred.matchQuality = locationMatch ? 'exact' : 'borough';
         this.predictionStats.correct++;
+        this.agents.PROPHET.stats.hits++;
+        
+        // Update full history
+        const historyEntry = this.memory.predictionHistory.find(h => h.id === pred.id);
+        if (historyEntry) {
+          historyEntry.outcome = 'hit';
+          historyEntry.matchedIncidentId = incident.id;
+          historyEntry.matchQuality = pred.matchQuality;
+          historyEntry.resolvedAt = now.toISOString();
+        }
+        
+        // Record in accuracy history for learning
+        this.recordAccuracy('hit', pred, incident);
         
         broadcast({
           type: 'prediction_hit',
           agent: 'PROPHET',
-          agentIcon: 'ðŸ”®',
+          agentIcon: '🔮',
           prediction: pred,
           matchedIncident: incident,
           accuracy: this.getAccuracy(),
-          timestamp: new Date().toISOString()
+          timestamp: now.toISOString()
         });
         
         console.log(`[PROPHET] PREDICTION HIT! ${pred.incidentType} at ${pred.location}`);
@@ -438,6 +739,28 @@ Based on patterns and current activity, what incidents do you predict in the nex
     });
   }
 
+  recordAccuracy(outcome, prediction, matchedIncident = null) {
+    this.predictionStats.accuracyHistory.unshift({
+      predictionId: prediction.id,
+      outcome,
+      confidence: prediction.confidence,
+      location: prediction.location,
+      borough: prediction.borough,
+      type: prediction.incidentType,
+      matchedIncidentId: matchedIncident?.id,
+      matchQuality: prediction.matchQuality,
+      timestamp: new Date().toISOString()
+    });
+    
+    if (this.predictionStats.accuracyHistory.length > 200) {
+      this.predictionStats.accuracyHistory.pop();
+    }
+  }
+
+  // ============================================
+  // PATTERN BACKGROUND ANALYSIS
+  // ============================================
+
   startPatternCycle() {
     setInterval(async () => {
       if (this.memory.incidents.length < 10) return;
@@ -445,13 +768,22 @@ Based on patterns and current activity, what incidents do you predict in the nex
       this.agents.PATTERN.status = 'analyzing';
       
       try {
+        // Expire old patterns (24 hours)
+        this.memory.patterns = this.memory.patterns.map(p => {
+          const age = Date.now() - new Date(p.detectedAt).getTime();
+          if (age > 24 * 60 * 60 * 1000 && p.status === 'active') {
+            return { ...p, status: 'expired' };
+          }
+          return p;
+        });
+        
         const response = await this.anthropic.messages.create({
           model: "claude-sonnet-4-20250514",
           max_tokens: 600,
           system: this.agents.PATTERN.systemPrompt,
           messages: [{
             role: "user",
-            content: `Analyze the last 50 incidents for patterns:\n${JSON.stringify(this.memory.incidents.slice(0, 50))}`
+            content: `Background analysis of last 50 incidents for emerging patterns:\n${JSON.stringify(this.memory.incidents.slice(0, 50))}`
           }]
         });
         
@@ -464,6 +796,10 @@ Based on patterns and current activity, what incidents do you predict in the nex
     }, 5 * 60 * 1000);
   }
 
+  // ============================================
+  // PUBLIC METHODS - BASIC
+  // ============================================
+
   getAccuracy() {
     if (this.predictionStats.total === 0) return '0%';
     return `${((this.predictionStats.correct / this.predictionStats.total) * 100).toFixed(1)}%`;
@@ -475,7 +811,8 @@ Based on patterns and current activity, what incidents do you predict in the nex
       name: agent.name,
       icon: agent.icon,
       role: agent.role,
-      status: agent.status
+      status: agent.status,
+      stats: agent.stats
     }));
   }
 
@@ -484,7 +821,302 @@ Based on patterns and current activity, what incidents do you predict in the nex
       total: this.predictionStats.total,
       correct: this.predictionStats.correct,
       accuracy: this.getAccuracy(),
-      pending: this.predictionStats.pending
+      pending: this.predictionStats.pending,
+      recentHistory: this.predictionStats.accuracyHistory.slice(0, 20)
+    };
+  }
+
+  // ============================================
+  // PUBLIC METHODS - NEW DETECTIVE ENDPOINTS
+  // ============================================
+
+  // Overview endpoint - combined status of all agents
+  getOverview() {
+    return {
+      agents: this.getAgentStatuses(),
+      predictions: {
+        total: this.predictionStats.total,
+        correct: this.predictionStats.correct,
+        accuracy: this.getAccuracy(),
+        pending: this.predictionStats.pending.length
+      },
+      patterns: {
+        active: this.memory.patterns.filter(p => p.status === 'active').length,
+        total: this.memory.patterns.length
+      },
+      memory: {
+        incidents: this.memory.incidents.length,
+        insights: this.memory.agentInsights.length,
+        collaborations: this.memory.collaborations.length,
+        addressesTracked: this.memory.addressHistory.size
+      },
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  // CHASE specific data
+  getChaseData() {
+    const recentPursuits = this.memory.incidents
+      .filter(inc => this.shouldActivateChase(inc))
+      .slice(0, 30);
+    
+    return {
+      agent: {
+        ...this.agents.CHASE,
+        systemPrompt: undefined // Don't expose
+      },
+      recentPursuits,
+      analysisHistory: this.agents.CHASE.history.slice(0, 50),
+      stats: this.agents.CHASE.stats,
+      // Hot pursuit zones based on history
+      hotZones: this.calculatePursuitHotZones(),
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  calculatePursuitHotZones() {
+    const zones = {};
+    this.agents.CHASE.history.forEach(h => {
+      const key = h.borough || 'Unknown';
+      zones[key] = (zones[key] || 0) + 1;
+    });
+    return Object.entries(zones)
+      .map(([borough, count]) => ({ borough, count }))
+      .sort((a, b) => b.count - a.count);
+  }
+
+  // PATTERN specific data
+  getPatternData() {
+    return {
+      agent: {
+        ...this.agents.PATTERN,
+        systemPrompt: undefined
+      },
+      activePatterns: this.memory.patterns.filter(p => p.status === 'active'),
+      expiredPatterns: this.memory.patterns.filter(p => p.status === 'expired').slice(0, 20),
+      analysisHistory: this.agents.PATTERN.history.slice(0, 50),
+      stats: this.agents.PATTERN.stats,
+      // Pattern timeline for visualization
+      timeline: this.memory.patterns.slice(0, 50).map(p => ({
+        id: p.id,
+        name: p.patternName,
+        status: p.status,
+        incidentCount: p.incidentCount,
+        detectedAt: p.detectedAt,
+        confidence: p.confidence
+      })),
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  // PROPHET specific data with accuracy charts
+  getProphetData() {
+    return {
+      agent: {
+        ...this.agents.PROPHET,
+        systemPrompt: undefined
+      },
+      pendingPredictions: this.predictionStats.pending,
+      predictionHistory: this.memory.predictionHistory.slice(0, 100),
+      stats: this.agents.PROPHET.stats,
+      // Accuracy over time for charts
+      accuracyOverTime: this.calculateAccuracyOverTime(),
+      // Accuracy by type
+      accuracyByType: this.calculateAccuracyByType(),
+      // Accuracy by borough
+      accuracyByBorough: this.calculateAccuracyByBorough(),
+      // Confidence calibration
+      confidenceCalibration: this.calculateConfidenceCalibration(),
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  calculateAccuracyOverTime() {
+    const history = this.predictionStats.accuracyHistory;
+    const windows = [];
+    
+    for (let i = 0; i < Math.min(10, Math.ceil(history.length / 10)); i++) {
+      const slice = history.slice(i * 10, (i + 1) * 10);
+      if (slice.length === 0) continue;
+      
+      const hits = slice.filter(h => h.outcome === 'hit').length;
+      const total = slice.length;
+      
+      windows.push({
+        period: i,
+        accuracy: total > 0 ? (hits / total) * 100 : 0,
+        hits,
+        misses: total - hits,
+        total,
+        oldestTimestamp: slice[slice.length - 1]?.timestamp
+      });
+    }
+    
+    return windows;
+  }
+
+  calculateAccuracyByType() {
+    const byType = {};
+    this.predictionStats.accuracyHistory.forEach(h => {
+      const type = h.type || 'unknown';
+      if (!byType[type]) byType[type] = { hits: 0, total: 0 };
+      byType[type].total++;
+      if (h.outcome === 'hit') byType[type].hits++;
+    });
+    
+    return Object.entries(byType).map(([type, data]) => ({
+      type,
+      hits: data.hits,
+      total: data.total,
+      accuracy: data.total > 0 ? ((data.hits / data.total) * 100).toFixed(1) : '0'
+    })).sort((a, b) => b.total - a.total);
+  }
+
+  calculateAccuracyByBorough() {
+    const byBorough = {};
+    this.predictionStats.accuracyHistory.forEach(h => {
+      const borough = h.borough || 'unknown';
+      if (!byBorough[borough]) byBorough[borough] = { hits: 0, total: 0 };
+      byBorough[borough].total++;
+      if (h.outcome === 'hit') byBorough[borough].hits++;
+    });
+    
+    return Object.entries(byBorough).map(([borough, data]) => ({
+      borough,
+      hits: data.hits,
+      total: data.total,
+      accuracy: data.total > 0 ? ((data.hits / data.total) * 100).toFixed(1) : '0'
+    })).sort((a, b) => b.total - a.total);
+  }
+
+  calculateConfidenceCalibration() {
+    // Group by confidence buckets and check actual accuracy
+    const buckets = { low: [], medium: [], high: [] };
+    
+    this.predictionStats.accuracyHistory.forEach(h => {
+      const conf = h.confidence || 0;
+      if (conf < 0.4) buckets.low.push(h);
+      else if (conf < 0.7) buckets.medium.push(h);
+      else buckets.high.push(h);
+    });
+    
+    return Object.entries(buckets).map(([bucket, items]) => {
+      const hits = items.filter(i => i.outcome === 'hit').length;
+      const avgConf = items.length > 0 
+        ? items.reduce((sum, i) => sum + (i.confidence || 0), 0) / items.length 
+        : 0;
+      
+      return {
+        bucket,
+        avgConfidence: (avgConf * 100).toFixed(1),
+        actualAccuracy: items.length > 0 ? ((hits / items.length) * 100).toFixed(1) : '0',
+        total: items.length,
+        // Calibration = how close predicted confidence is to actual accuracy
+        calibrationError: items.length > 0 
+          ? Math.abs(avgConf * 100 - (hits / items.length) * 100).toFixed(1)
+          : '0'
+      };
+    });
+  }
+
+  // HISTORIAN specific data
+  getHistorianData() {
+    const problemAddresses = Array.from(this.memory.addressHistory.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 50)
+      .map(([address, count]) => ({ address, count }));
+    
+    const hotspots = Array.from(this.memory.hotspots.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 50)
+      .map(([key, count]) => {
+        const [borough, ...locationParts] = key.split('-');
+        return { borough, location: locationParts.join('-'), count };
+      });
+    
+    return {
+      agent: {
+        ...this.agents.HISTORIAN,
+        systemPrompt: undefined
+      },
+      problemAddresses,
+      hotspots,
+      analysisHistory: this.agents.HISTORIAN.history.slice(0, 50),
+      stats: this.agents.HISTORIAN.stats,
+      totalAddressesTracked: this.memory.addressHistory.size,
+      // Repeat offender locations
+      repeatLocations: problemAddresses.filter(a => a.count >= 3),
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  // Collaboration data
+  getCollaborationData() {
+    const byPair = {};
+    
+    this.memory.collaborations.forEach(c => {
+      const key = `${c.sourceAgent}→${c.targetAgent}`;
+      byPair[key] = (byPair[key] || 0) + 1;
+    });
+    
+    return {
+      recent: this.memory.collaborations.slice(0, 50),
+      byPair: Object.entries(byPair).map(([pair, count]) => ({ pair, count })),
+      total: this.memory.collaborations.length,
+      // Collaboration graph edges for visualization
+      graph: {
+        nodes: Object.keys(this.agents).map(id => ({
+          id,
+          name: this.agents[id].name,
+          icon: this.agents[id].icon
+        })),
+        edges: Object.entries(byPair).map(([pair, count]) => {
+          const [source, target] = pair.split('→');
+          return { source, target, weight: count };
+        })
+      },
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  // Manual prediction feedback (for user corrections)
+  recordManualFeedback(predictionId, outcome, notes = '') {
+    const historyEntry = this.memory.predictionHistory.find(h => h.id === predictionId);
+    if (!historyEntry) return { error: 'Prediction not found' };
+    
+    const wasHit = historyEntry.outcome === 'hit';
+    const isNowHit = outcome === 'hit';
+    
+    // Update stats if outcome changed
+    if (wasHit !== isNowHit) {
+      if (isNowHit) {
+        this.predictionStats.correct++;
+        this.agents.PROPHET.stats.hits++;
+        this.agents.PROPHET.stats.misses--;
+      } else {
+        this.predictionStats.correct--;
+        this.agents.PROPHET.stats.hits--;
+        this.agents.PROPHET.stats.misses++;
+      }
+    }
+    
+    historyEntry.outcome = outcome;
+    historyEntry.manualFeedback = true;
+    historyEntry.feedbackNotes = notes;
+    historyEntry.feedbackAt = new Date().toISOString();
+    
+    // Also update accuracy history
+    const accEntry = this.predictionStats.accuracyHistory.find(h => h.predictionId === predictionId);
+    if (accEntry) {
+      accEntry.outcome = outcome;
+      accEntry.manualFeedback = true;
+    }
+    
+    return { 
+      success: true, 
+      prediction: historyEntry,
+      newAccuracy: this.getAccuracy()
     };
   }
 
@@ -521,21 +1153,25 @@ Based on patterns and current activity, what incidents do you predict in the nex
       totalIncidents: this.memory.incidents.length,
       patterns: this.memory.patterns.filter(p => p.status === 'active').length,
       predictions: this.predictionStats,
-      hotspots: Array.from(this.memory.hotspots.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5)
+      hotspots: Array.from(this.memory.hotspots.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5),
+      agentStats: Object.fromEntries(
+        Object.entries(this.agents).map(([k, v]) => [k, v.stats])
+      )
     };
 
     try {
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 600,
-        system: `You are the Detective Bureau briefing officer. Summarize current activity, patterns, predictions, and recommendations. Be concise and actionable.`,
+        max_tokens: 800,
+        system: `You are the Detective Bureau briefing officer. Summarize current activity, patterns, predictions, and recommendations. Be concise and actionable. Include agent performance metrics.`,
         messages: [{
           role: "user",
           content: `Generate briefing:
 Stats: ${JSON.stringify(stats)}
 Recent incidents: ${JSON.stringify(this.memory.incidents.slice(0, 15))}
 Active patterns: ${JSON.stringify(this.memory.patterns.filter(p => p.status === 'active'))}
-Pending predictions: ${JSON.stringify(this.predictionStats.pending)}`
+Pending predictions: ${JSON.stringify(this.predictionStats.pending)}
+Recent collaborations: ${JSON.stringify(this.memory.collaborations.slice(0, 5))}`
         }]
       });
 
@@ -548,6 +1184,28 @@ Pending predictions: ${JSON.stringify(this.predictionStats.pending)}`
     } catch (error) {
       return { error: error.message, stats, agents: this.getAgentStatuses() };
     }
+  }
+
+  // Alias for endpoints
+  getAgentOverview() {
+    return this.getOverview();
+  }
+
+  getAgentDetail(agentId) {
+    const agent = this.agents[agentId];
+    if (!agent) return null;
+    
+    return {
+      id: agent.id,
+      name: agent.name,
+      icon: agent.icon,
+      role: agent.role,
+      status: agent.status,
+      stats: agent.stats,
+      triggers: agent.triggers,
+      recentHistory: agent.history.slice(0, 50),
+      timestamp: new Date().toISOString()
+    };
   }
 }
 
@@ -1171,10 +1829,244 @@ function checkBetsForIncident(incident) {
 // API ROUTES
 // ============================================
 
-// Detective Bureau endpoints
+// ============================================
+// DETECTIVE BUREAU ENDPOINTS (Enhanced)
+// ============================================
+
+// Overview - Combined stats for all agents
+app.get('/detective/overview', (req, res) => {
+  res.json(detectiveBureau.getAgentOverview());
+});
+
+// All agent statuses (legacy compatible)
 app.get('/detective/agents', (req, res) => res.json(detectiveBureau.getAgentStatuses()));
+
+// Individual agent detail
+app.get('/detective/agent/:agentId', (req, res) => {
+  const { agentId } = req.params;
+  const detail = detectiveBureau.getAgentDetail(agentId.toUpperCase());
+  if (!detail) return res.status(404).json({ error: 'Agent not found' });
+  res.json(detail);
+});
+
+// CHASE - Pursuit Specialist endpoints
+app.get('/detective/chase', (req, res) => {
+  res.json(detectiveBureau.getChaseData());
+});
+
+app.get('/detective/chase/history', (req, res) => {
+  const { limit = 50 } = req.query;
+  res.json({
+    history: detectiveBureau.agents.CHASE.history.slice(0, parseInt(limit)),
+    stats: detectiveBureau.agents.CHASE.stats
+  });
+});
+
+app.get('/detective/chase/active', (req, res) => {
+  // Get incidents from last 30 minutes that triggered CHASE
+  const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const activePursuits = detectiveBureau.memory.incidents
+    .filter(inc => {
+      if (inc.timestamp < thirtyMinAgo) return false;
+      const text = `${inc.incidentType} ${inc.summary || ''}`.toLowerCase();
+      return detectiveBureau.agents.CHASE.triggers.some(t => text.includes(t));
+    });
+  res.json({ active: activePursuits, count: activePursuits.length });
+});
+
+// PATTERN - Serial Crime Analyst endpoints
+app.get('/detective/pattern', (req, res) => {
+  res.json(detectiveBureau.getPatternData());
+});
+
+app.get('/detective/pattern/active', (req, res) => {
+  const activePatterns = detectiveBureau.memory.patterns.filter(p => p.status === 'active');
+  res.json({
+    patterns: activePatterns,
+    count: activePatterns.length,
+    stats: detectiveBureau.agents.PATTERN.stats
+  });
+});
+
+app.get('/detective/pattern/:patternId', (req, res) => {
+  const { patternId } = req.params;
+  const pattern = detectiveBureau.memory.patterns.find(p => p.id === patternId);
+  if (!pattern) return res.status(404).json({ error: 'Pattern not found' });
+  
+  // Get linked incidents
+  const linkedIncidents = pattern.linkedIncidentIds
+    ? detectiveBureau.memory.incidents.filter(inc => pattern.linkedIncidentIds.includes(inc.id))
+    : [];
+  
+  res.json({ pattern, linkedIncidents });
+});
+
+app.get('/detective/patterns', (req, res) => {
+  const { status = 'all' } = req.query;
+  let patterns = detectiveBureau.memory.patterns;
+  if (status !== 'all') {
+    patterns = patterns.filter(p => p.status === status);
+  }
+  res.json({ 
+    patterns, 
+    active: detectiveBureau.memory.patterns.filter(p => p.status === 'active').length,
+    total: detectiveBureau.memory.patterns.length 
+  });
+});
+
+// PROPHET - Predictive Analyst endpoints
+app.get('/detective/prophet', (req, res) => {
+  res.json(detectiveBureau.getProphetData());
+});
+
+app.get('/detective/prophet/predictions', (req, res) => {
+  const { status = 'all', limit = 50 } = req.query;
+  let predictions = detectiveBureau.memory.predictionHistory;
+  
+  if (status === 'pending') {
+    predictions = detectiveBureau.predictionStats.pending;
+  } else if (status === 'hit') {
+    predictions = predictions.filter(p => p.outcome === 'hit');
+  } else if (status === 'miss') {
+    predictions = predictions.filter(p => p.outcome === 'miss');
+  }
+  
+  res.json({
+    predictions: predictions.slice(0, parseInt(limit)),
+    pending: detectiveBureau.predictionStats.pending.length,
+    total: detectiveBureau.predictionStats.total,
+    hits: detectiveBureau.predictionStats.correct,
+    accuracy: detectiveBureau.getAccuracy()
+  });
+});
+
+app.get('/detective/prophet/accuracy', (req, res) => {
+  const accuracyHistory = detectiveBureau.predictionStats.accuracyHistory;
+  const accuracyOverTime = detectiveBureau.calculateAccuracyOverTime();
+  
+  // Calculate confidence-based accuracy
+  const byConfidence = {};
+  accuracyHistory.forEach(h => {
+    const bucket = Math.floor(h.confidence * 10) / 10; // Round to nearest 0.1
+    if (!byConfidence[bucket]) byConfidence[bucket] = { hits: 0, total: 0 };
+    byConfidence[bucket].total++;
+    if (h.outcome === 'hit') byConfidence[bucket].hits++;
+  });
+  
+  // Calculate by incident type
+  const byType = {};
+  accuracyHistory.forEach(h => {
+    const type = h.type?.toLowerCase() || 'unknown';
+    if (!byType[type]) byType[type] = { hits: 0, total: 0 };
+    byType[type].total++;
+    if (h.outcome === 'hit') byType[type].hits++;
+  });
+  
+  res.json({
+    overall: {
+      total: detectiveBureau.predictionStats.total,
+      hits: detectiveBureau.predictionStats.correct,
+      accuracy: detectiveBureau.getAccuracy()
+    },
+    overTime: accuracyOverTime,
+    byConfidence: Object.entries(byConfidence).map(([conf, data]) => ({
+      confidence: parseFloat(conf),
+      accuracy: data.total > 0 ? (data.hits / data.total * 100).toFixed(1) : '0',
+      hits: data.hits,
+      total: data.total
+    })),
+    byType: Object.entries(byType).map(([type, data]) => ({
+      type,
+      accuracy: data.total > 0 ? (data.hits / data.total * 100).toFixed(1) : '0',
+      hits: data.hits,
+      total: data.total
+    })),
+    recentHistory: accuracyHistory.slice(0, 30)
+  });
+});
+
+// Manual prediction feedback (for testing/calibration)
+app.post('/detective/prophet/feedback', (req, res) => {
+  const { predictionId, outcome, matchedIncidentId } = req.body;
+  if (!predictionId || !['hit', 'miss'].includes(outcome)) {
+    return res.status(400).json({ error: 'predictionId and outcome (hit/miss) required' });
+  }
+  
+  // Find pending prediction
+  const idx = detectiveBureau.predictionStats.pending.findIndex(p => p.id === predictionId);
+  if (idx === -1) return res.status(404).json({ error: 'Pending prediction not found' });
+  
+  const prediction = detectiveBureau.predictionStats.pending.splice(idx, 1)[0];
+  prediction.status = outcome;
+  prediction.manualFeedback = true;
+  
+  if (outcome === 'hit') {
+    detectiveBureau.predictionStats.correct++;
+    detectiveBureau.agents.PROPHET.stats.hits++;
+    prediction.matchedIncidentId = matchedIncidentId;
+  } else {
+    detectiveBureau.agents.PROPHET.stats.misses++;
+  }
+  
+  // Update history
+  const historyEntry = detectiveBureau.memory.predictionHistory.find(h => h.id === predictionId);
+  if (historyEntry) {
+    historyEntry.outcome = outcome;
+    historyEntry.manualFeedback = true;
+    historyEntry.resolvedAt = new Date().toISOString();
+  }
+  
+  detectiveBureau.recordAccuracy(outcome, prediction);
+  
+  res.json({ success: true, prediction, newAccuracy: detectiveBureau.getAccuracy() });
+});
+
 app.get('/detective/predictions', (req, res) => res.json(detectiveBureau.getPredictionStats()));
-app.get('/detective/patterns', (req, res) => res.json({ active: detectiveBureau.memory.patterns.filter(p => p.status === 'active'), total: detectiveBureau.memory.patterns.length }));
+
+// HISTORIAN - Historical Context endpoints
+app.get('/detective/historian', (req, res) => {
+  res.json(detectiveBureau.getHistorianData());
+});
+
+app.get('/detective/historian/hotspots', (req, res) => {
+  const { limit = 50, minCount = 2 } = req.query;
+  const hotspots = Array.from(detectiveBureau.memory.hotspots.entries())
+    .filter(([_, count]) => count >= parseInt(minCount))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, parseInt(limit))
+    .map(([key, count]) => {
+      const [borough, location] = key.split('-');
+      return { borough, location, count };
+    });
+  res.json({ hotspots, total: detectiveBureau.memory.hotspots.size });
+});
+
+app.get('/detective/historian/address/:address', (req, res) => {
+  const { address } = req.params;
+  const addressKey = address.toLowerCase();
+  const count = detectiveBureau.memory.addressHistory.get(addressKey) || 0;
+  
+  // Get all incidents at this address
+  const incidentsAtAddress = detectiveBureau.memory.incidents.filter(
+    inc => inc.location?.toLowerCase() === addressKey
+  );
+  
+  // Get insights about this address
+  const insights = detectiveBureau.memory.agentInsights.filter(
+    ai => ai.insights?.some(i => 
+      i.agent === 'HISTORIAN' && 
+      detectiveBureau.memory.incidents.find(inc => inc.id === ai.incidentId)?.location?.toLowerCase() === addressKey
+    )
+  );
+  
+  res.json({
+    address,
+    totalCalls: count,
+    incidents: incidentsAtAddress,
+    insights: insights.slice(0, 10)
+  });
+});
+
 app.get('/detective/hotspots', (req, res) => {
   const hotspots = Array.from(detectiveBureau.memory.hotspots.entries()).map(([key, count]) => {
     const [borough, location] = key.split('-');
@@ -1182,15 +2074,100 @@ app.get('/detective/hotspots', (req, res) => {
   }).sort((a, b) => b.count - a.count).slice(0, 50);
   res.json(hotspots);
 });
+
+// Collaboration endpoints
+app.get('/detective/collaboration', (req, res) => {
+  res.json(detectiveBureau.getCollaborationData());
+});
+
+app.get('/detective/collaboration/graph', (req, res) => {
+  // Return data formatted for visualization (nodes + edges)
+  const agents = Object.values(detectiveBureau.agents).map(a => ({
+    id: a.id,
+    name: a.name,
+    icon: a.icon,
+    role: a.role,
+    activations: a.stats.activations
+  }));
+  
+  const collaborations = detectiveBureau.memory.collaborations;
+  const edgeCounts = {};
+  
+  collaborations.forEach(c => {
+    const key = `${c.sourceAgent}-${c.targetAgent}`;
+    edgeCounts[key] = (edgeCounts[key] || 0) + 1;
+  });
+  
+  const edges = Object.entries(edgeCounts).map(([key, count]) => {
+    const [source, target] = key.split('-');
+    return { source, target, weight: count };
+  });
+  
+  res.json({ nodes: agents, edges });
+});
+
+// Briefing and general queries
 app.get('/detective/briefing', async (req, res) => {
   const briefing = await detectiveBureau.generateBriefing();
   res.json(briefing);
 });
+
 app.post('/detective/ask', async (req, res) => {
   const { question } = req.body;
   if (!question) return res.status(400).json({ error: 'Question required' });
   const response = await detectiveBureau.askAgents(question);
   res.json(response);
+});
+
+// Consult a specific agent
+app.post('/detective/consult/:agentId', async (req, res) => {
+  const { agentId } = req.params;
+  const { question, context = {} } = req.body;
+  if (!question) return res.status(400).json({ error: 'Question required' });
+  
+  const response = await detectiveBureau.consultAgent(agentId.toUpperCase(), question, context);
+  if (!response) return res.status(404).json({ error: 'Agent not found or error occurred' });
+  
+  res.json({ 
+    agent: agentId.toUpperCase(), 
+    response, 
+    timestamp: new Date().toISOString() 
+  });
+});
+
+// Force PROPHET to make predictions now (for testing)
+app.post('/detective/prophet/predict', async (req, res) => {
+  await detectiveBureau.runProphet();
+  res.json({
+    success: true,
+    pending: detectiveBureau.predictionStats.pending,
+    message: 'PROPHET analysis triggered'
+  });
+});
+
+// Memory/data export for future training
+app.get('/detective/export', (req, res) => {
+  const { type = 'all' } = req.query;
+  
+  const data = {
+    exportedAt: new Date().toISOString(),
+    incidents: type === 'all' || type === 'incidents' ? detectiveBureau.memory.incidents : undefined,
+    patterns: type === 'all' || type === 'patterns' ? detectiveBureau.memory.patterns : undefined,
+    predictions: type === 'all' || type === 'predictions' ? detectiveBureau.memory.predictionHistory : undefined,
+    agentInsights: type === 'all' || type === 'insights' ? detectiveBureau.memory.agentInsights : undefined,
+    collaborations: type === 'all' || type === 'collaborations' ? detectiveBureau.memory.collaborations : undefined,
+    stats: {
+      totalIncidents: detectiveBureau.memory.incidents.length,
+      totalPatterns: detectiveBureau.memory.patterns.length,
+      totalPredictions: detectiveBureau.predictionStats.total,
+      predictionAccuracy: detectiveBureau.getAccuracy(),
+      agentStats: Object.fromEntries(
+        Object.entries(detectiveBureau.agents).map(([k, v]) => [k, v.stats])
+      )
+    }
+  };
+  
+  res.json(data);
 });
 
 // Betting endpoints
