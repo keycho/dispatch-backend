@@ -1779,8 +1779,21 @@ async function initAllCityCameras() {
 }
 initAllCityCameras();
 
+// Throttling for transcript broadcasts
+const lastTranscriptBroadcast = { nyc: 0, mpls: 0 };
+const TRANSCRIPT_THROTTLE_MS = 500; // Min 500ms between transcript broadcasts
+
 // City-specific broadcast
 function broadcastToCity(cityId, data) {
+  // Throttle transcript broadcasts to prevent flashing
+  if (data.type === 'transcript') {
+    const now = Date.now();
+    if (now - lastTranscriptBroadcast[cityId] < TRANSCRIPT_THROTTLE_MS) {
+      return; // Skip this broadcast, too soon after last one
+    }
+    lastTranscriptBroadcast[cityId] = now;
+  }
+  
   const message = JSON.stringify({ ...data, city: cityId });
   const cityClients = cityState[cityId]?.clients || new Set();
   cityClients.forEach(client => { 
@@ -2489,10 +2502,26 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
   const lower = clean.toLowerCase();
   
   // Filter out Whisper prompt leakage (when it hallucinates the prompt back)
-  const promptLeakage = ['addresses like', 'intersections like', 'landmarks like', 'nypd police radio dispatch'];
+  const promptLeakage = [
+    'addresses like', 'intersections like', 'landmarks like', 
+    'nypd police radio dispatch',
+    '10-4, 10-13, 10-85',  // Exact prompt phrase
+    'forthwith, precinct, sector, central',  // Exact prompt phrase
+    'k, forthwith, precinct',
+    '42nd and lex', 'times square, penn station'  // Example phrases from prompt
+  ];
   if (promptLeakage.some(p => lower.includes(p))) {
     scannerStats.filteredPromptLeak = (scannerStats.filteredPromptLeak || 0) + 1;
     console.log(`[${feedName}] Filtered prompt leak: "${clean.substring(0, 50)}"`);
+    return;
+  }
+  
+  // Also filter if it contains multiple prompt keywords (likely hallucination)
+  const promptKeywords = ['10-4', '10-13', '10-85', 'forthwith', 'precinct', 'sector', 'central', 'responding'];
+  const keywordCount = promptKeywords.filter(kw => lower.includes(kw)).length;
+  if (keywordCount >= 5) {
+    scannerStats.filteredPromptLeak = (scannerStats.filteredPromptLeak || 0) + 1;
+    console.log(`[${feedName}] Filtered prompt leak (${keywordCount} keywords): "${clean.substring(0, 50)}"`);
     return;
   }
   
