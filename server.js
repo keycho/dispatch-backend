@@ -11,6 +11,89 @@ import cors from 'cors';
 
 dotenv.config();
 
+// ============================================
+// MULTI-CITY CONFIGURATION
+// ============================================
+
+const CITIES = {
+  nyc: {
+    id: 'nyc',
+    name: 'New York City',
+    shortName: 'NYC',
+    state: 'NY',
+    mapCenter: { lat: 40.7128, lng: -74.0060 },
+    mapZoom: 11,
+    openmhz: { system: 'nypd', name: 'NYPD' },
+    broadcastifyFeeds: [
+      { id: '30382', name: 'NYPD Manhattan North' },
+      { id: '30383', name: 'NYPD Manhattan South' },
+      { id: '30378', name: 'NYPD Brooklyn North' },
+      { id: '30379', name: 'NYPD Brooklyn South' },
+      { id: '30376', name: 'NYPD Bronx' },
+      { id: '30380', name: 'NYPD Queens North' },
+      { id: '30381', name: 'NYPD Queens South' },
+      { id: '29096', name: 'NYPD Staten Island' },
+      { id: '40184', name: 'NYPD Citywide 1' },
+      { id: '32119', name: 'NYPD Dispatch Citywide' },
+    ],
+    cameraApi: 'https://webcams.nyctmc.org/api/cameras',
+    districts: ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'],
+    landmarks: [
+      'Times Square', 'Penn Station', 'Grand Central', 'Port Authority', 'Lincoln Tunnel',
+      'Holland Tunnel', 'Brooklyn Bridge', 'Manhattan Bridge', 'Williamsburg Bridge',
+      'Central Park', 'Prospect Park', 'Harlem', 'SoHo', 'Tribeca', 'Chinatown',
+    ],
+    color: '#FF6B35', // Orange
+  },
+  mpls: {
+    id: 'mpls',
+    name: 'Minneapolis',
+    shortName: 'MPLS', 
+    state: 'MN',
+    mapCenter: { lat: 44.9778, lng: -93.2650 },
+    mapZoom: 12,
+    openmhz: { system: 'mnhennco', name: 'Hennepin County' },
+    broadcastifyFeeds: [
+      { id: '13544', name: 'Minneapolis Police' },
+      { id: '26049', name: 'Hennepin County Sheriff' },
+      { id: '30435', name: 'Hennepin County Fire/EMS' },
+      { id: '741', name: 'Minneapolis Fire' },
+    ],
+    cameraApi: 'https://511mn.org/api/getcameras', // MnDOT API
+    districts: ['Downtown', 'North', 'Northeast', 'Southeast', 'South', 'Southwest', 'Calhoun-Isles', 'Camden', 'Near North', 'Phillips', 'Powderhorn', 'Nokomis', 'Longfellow'],
+    landmarks: [
+      'Target Center', 'US Bank Stadium', 'Mall of America', 'Minneapolis Convention Center',
+      'Hennepin Avenue', 'Lake Street', 'Nicollet Mall', 'Stone Arch Bridge',
+      'University of Minnesota', 'Minneapolis-Saint Paul Airport', 'Lake Calhoun', 'Lake Harriet',
+    ],
+    color: '#4ECDC4', // Teal
+  }
+};
+
+// Per-city state storage
+const cityState = {};
+Object.keys(CITIES).forEach(cityId => {
+  cityState[cityId] = {
+    cameras: [],
+    incidents: [],
+    recentTranscripts: [],
+    incidentId: 0,
+    activeStreams: new Map(),
+    streamState: new Map(),
+    scannerStats: {
+      activeFeeds: [],
+      lastChunkTime: null,
+      lastTranscript: null,
+      totalChunks: 0,
+      successfulTranscripts: 0,
+      feedStats: {}
+    },
+    openMHzStats: { callsFetched: 0, callsProcessed: 0, lastPoll: null, errors: 0, disabled: false, method: null },
+    lastOpenMHzTime: Date.now(),
+    clients: new Set() // WebSocket clients subscribed to this city
+  };
+});
+
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
@@ -1526,9 +1609,10 @@ function getAllFacilitiesStatus() {
 }
 
 // ============================================
-// CAMERAS & SCANNER
+// CAMERAS & SCANNER - MULTI-CITY
 // ============================================
 
+// Legacy variables for backwards compatibility (default to NYC)
 let cameras = [];
 const incidents = [];
 let incidentId = 0;
@@ -1537,24 +1621,96 @@ const MAX_TRANSCRIPTS = 20;
 const audioClips = new Map();
 const MAX_AUDIO_CLIPS = 50;
 
-async function fetchNYCCameras() {
+// Fetch cameras for a specific city
+async function fetchCamerasForCity(cityId) {
+  const city = CITIES[cityId];
+  if (!city) return;
+  
   try {
-    const response = await fetch('https://webcams.nyctmc.org/api/cameras');
-    const data = await response.json();
-    cameras = data.filter(cam => cam.isOnline === true || cam.isOnline === "true").map(cam => ({
-      id: cam.id, location: cam.name, lat: cam.latitude, lng: cam.longitude, area: cam.area || "NYC",
-      imageUrl: `https://webcams.nyctmc.org/api/cameras/${cam.id}/image`, isOnline: true
-    }));
-    console.log(`Loaded ${cameras.length} NYC traffic cameras`);
+    if (cityId === 'nyc') {
+      const response = await fetch('https://webcams.nyctmc.org/api/cameras');
+      const data = await response.json();
+      cityState[cityId].cameras = data.filter(cam => cam.isOnline === true || cam.isOnline === "true").map(cam => ({
+        id: cam.id, location: cam.name, lat: cam.latitude, lng: cam.longitude, area: cam.area || "NYC",
+        imageUrl: `https://webcams.nyctmc.org/api/cameras/${cam.id}/image`, isOnline: true, city: 'nyc'
+      }));
+      // Also set legacy variable
+      cameras = cityState[cityId].cameras;
+      console.log(`[${city.shortName}] Loaded ${cityState[cityId].cameras.length} traffic cameras`);
+    } 
+    else if (cityId === 'mpls') {
+      // MnDOT 511 API for Minnesota cameras
+      try {
+        const response = await fetch('https://511mn.org/api/getcameras?format=json');
+        const data = await response.json();
+        
+        // Filter to Minneapolis metro area (roughly within 20 miles of downtown)
+        const mplsLat = 44.9778, mplsLng = -93.2650, radiusMiles = 25;
+        
+        cityState[cityId].cameras = (data.features || data || [])
+          .filter(cam => {
+            const lat = cam.geometry?.coordinates?.[1] || cam.latitude || cam.lat;
+            const lng = cam.geometry?.coordinates?.[0] || cam.longitude || cam.lng;
+            if (!lat || !lng) return false;
+            // Simple distance check
+            const distance = Math.sqrt(Math.pow(lat - mplsLat, 2) + Math.pow(lng - mplsLng, 2)) * 69; // rough miles
+            return distance < radiusMiles;
+          })
+          .map(cam => ({
+            id: cam.properties?.id || cam.id || Math.random().toString(36).substr(2, 9),
+            location: cam.properties?.description || cam.properties?.name || cam.name || 'MnDOT Camera',
+            lat: cam.geometry?.coordinates?.[1] || cam.latitude,
+            lng: cam.geometry?.coordinates?.[0] || cam.longitude,
+            area: 'Minneapolis',
+            imageUrl: cam.properties?.imageUrl || cam.properties?.image_url || cam.imageUrl,
+            isOnline: true,
+            city: 'mpls'
+          }));
+        
+        console.log(`[${city.shortName}] Loaded ${cityState[cityId].cameras.length} traffic cameras`);
+      } catch (e) {
+        console.log(`[${city.shortName}] MnDOT API error, using fallback cameras`);
+        // Fallback Minneapolis cameras at major intersections
+        cityState[cityId].cameras = [
+          { id: 'mpls-1', location: 'Hennepin Ave & Lake St', lat: 44.9486, lng: -93.2984, area: 'Uptown', city: 'mpls' },
+          { id: 'mpls-2', location: 'Nicollet Mall & 7th St', lat: 44.9778, lng: -93.2712, area: 'Downtown', city: 'mpls' },
+          { id: 'mpls-3', location: 'Washington Ave & 35W', lat: 44.9738, lng: -93.2590, area: 'Downtown', city: 'mpls' },
+          { id: 'mpls-4', location: 'Lake St & Chicago Ave', lat: 44.9486, lng: -93.2614, area: 'South', city: 'mpls' },
+          { id: 'mpls-5', location: 'Broadway & Washington', lat: 44.9958, lng: -93.2794, area: 'North', city: 'mpls' },
+          { id: 'mpls-6', location: 'Franklin Ave & Lyndale', lat: 44.9625, lng: -93.2878, area: 'Whittier', city: 'mpls' },
+          { id: 'mpls-7', location: 'University Ave & Central', lat: 44.9700, lng: -93.2473, area: 'Northeast', city: 'mpls' },
+          { id: 'mpls-8', location: '38th St & Chicago Ave', lat: 44.9341, lng: -93.2614, area: 'South', city: 'mpls' },
+        ];
+        console.log(`[${city.shortName}] Using ${cityState[cityId].cameras.length} fallback cameras`);
+      }
+    }
   } catch (error) {
-    console.error("Failed to fetch NYC cameras:", error);
-    cameras = [
-      { id: "07b8616e-373e-4ec9-89cc-11cad7d59fcb", location: "Worth St @ Centre St", lat: 40.715157, lng: -74.00213, area: "Manhattan" },
-      { id: "8d2b3ae9-da68-4d37-8ae2-d3bc014f827b", location: "Bedford Ave & S 5 St", lat: 40.710983, lng: -73.963168, area: "Brooklyn" },
-    ];
+    console.error(`[${city.shortName}] Failed to fetch cameras:`, error.message);
   }
 }
-fetchNYCCameras();
+
+// Load cameras for all cities
+async function initAllCityCameras() {
+  for (const cityId of Object.keys(CITIES)) {
+    await fetchCamerasForCity(cityId);
+  }
+}
+initAllCityCameras();
+
+// City-specific broadcast
+function broadcastToCity(cityId, data) {
+  const message = JSON.stringify({ ...data, city: cityId });
+  const cityClients = cityState[cityId]?.clients || new Set();
+  cityClients.forEach(client => { 
+    if (client.readyState === 1) client.send(message); 
+  });
+}
+
+// Global broadcast (all cities)
+function broadcast(data) {
+  const message = JSON.stringify(data);
+  clients.forEach(client => { if (client.readyState === 1) client.send(message); });
+}
 
 // Broadcastify Scanner - MULTI-STREAM for maximum coverage
 const BROADCASTIFY_USERNAME = 'whitefang123';
@@ -3288,8 +3444,154 @@ app.get('/facilities/:id', (req, res) => {
   res.json(intel);
 });
 
+// ============================================
+// MULTI-CITY API ENDPOINTS
+// ============================================
+
+// Get list of available cities
+app.get('/cities', (req, res) => {
+  res.json({
+    cities: Object.values(CITIES).map(city => ({
+      id: city.id,
+      name: city.name,
+      shortName: city.shortName,
+      state: city.state,
+      mapCenter: city.mapCenter,
+      mapZoom: city.mapZoom,
+      color: city.color,
+      cameraCount: cityState[city.id]?.cameras?.length || 0,
+      incidentCount: cityState[city.id]?.incidents?.length || 0,
+      isActive: (cityState[city.id]?.scannerStats?.totalChunks || 0) > 0 || 
+                (cityState[city.id]?.openMHzStats?.callsFetched || 0) > 0
+    }))
+  });
+});
+
+// Get city config
+app.get('/city/:cityId', (req, res) => {
+  const city = CITIES[req.params.cityId];
+  if (!city) return res.status(404).json({ error: 'City not found' });
+  
+  const state = cityState[req.params.cityId];
+  res.json({
+    ...city,
+    stats: {
+      cameras: state.cameras.length,
+      incidents: state.incidents.length,
+      scannerStats: state.scannerStats,
+      openMHzStats: state.openMHzStats
+    }
+  });
+});
+
+// Get cameras for a city
+app.get('/city/:cityId/cameras', (req, res) => {
+  const city = CITIES[req.params.cityId];
+  if (!city) return res.status(404).json({ error: 'City not found' });
+  
+  res.json(cityState[req.params.cityId].cameras);
+});
+
+// Get incidents for a city
+app.get('/city/:cityId/incidents', (req, res) => {
+  const city = CITIES[req.params.cityId];
+  if (!city) return res.status(404).json({ error: 'City not found' });
+  
+  res.json(cityState[req.params.cityId].incidents);
+});
+
+// Get transcripts for a city
+app.get('/city/:cityId/transcripts', (req, res) => {
+  const city = CITIES[req.params.cityId];
+  if (!city) return res.status(404).json({ error: 'City not found' });
+  
+  res.json(cityState[req.params.cityId].recentTranscripts);
+});
+
+// Get scanner status for a city
+app.get('/city/:cityId/scanner/status', (req, res) => {
+  const city = CITIES[req.params.cityId];
+  if (!city) return res.status(404).json({ error: 'City not found' });
+  
+  const state = cityState[req.params.cityId];
+  res.json({
+    city: city.shortName,
+    scannerStats: state.scannerStats,
+    openMHzStats: state.openMHzStats,
+    activeStreams: state.activeStreams.size,
+    isHealthy: state.scannerStats.totalChunks > 0 || state.openMHzStats.callsFetched > 0
+  });
+});
+
+// Camera image proxy for any city
+app.get('/city/:cityId/camera-image/:camId', async (req, res) => {
+  const { cityId, camId } = req.params;
+  const city = CITIES[cityId];
+  if (!city) return res.status(404).json({ error: 'City not found' });
+  
+  try {
+    if (cityId === 'nyc') {
+      const response = await fetch(`https://webcams.nyctmc.org/api/cameras/${camId}/image`);
+      const buffer = await response.arrayBuffer();
+      res.set('Content-Type', 'image/jpeg');
+      res.send(Buffer.from(buffer));
+    } else if (cityId === 'mpls') {
+      // MnDOT camera image - find the camera and get its image URL
+      const cam = cityState[cityId].cameras.find(c => c.id === camId);
+      if (cam && cam.imageUrl) {
+        const response = await fetch(cam.imageUrl);
+        const buffer = await response.arrayBuffer();
+        res.set('Content-Type', 'image/jpeg');
+        res.send(Buffer.from(buffer));
+      } else {
+        res.status(404).json({ error: 'Camera not found' });
+      }
+    }
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch camera image' });
+  }
+});
+
+// Full init data for a city (for WebSocket alternative)
+app.get('/city/:cityId/init', (req, res) => {
+  const city = CITIES[req.params.cityId];
+  if (!city) return res.status(404).json({ error: 'City not found' });
+  
+  const state = cityState[req.params.cityId];
+  res.json({
+    city: {
+      id: city.id,
+      name: city.name,
+      shortName: city.shortName,
+      mapCenter: city.mapCenter,
+      mapZoom: city.mapZoom,
+      districts: city.districts,
+      color: city.color
+    },
+    cameras: state.cameras,
+    incidents: state.incidents.slice(0, 20),
+    transcripts: state.recentTranscripts.slice(0, 10),
+    scannerStats: state.scannerStats,
+    agents: detectiveBureau.getAgentStatuses(),
+    predictions: detectiveBureau.getPredictionStats()
+  });
+});
+
+// ============================================
+// LEGACY ENDPOINTS (default to NYC for backwards compatibility)
+// ============================================
+
 // Core endpoints
-app.get('/', (req, res) => res.json({ name: "DISPATCH NYC", status: "operational", connections: clients.size, incidents: incidents.length, agents: detectiveBureau.getAgentStatuses(), predictionAccuracy: detectiveBureau.getAccuracy() }));
+app.get('/', (req, res) => res.json({ 
+  name: "DISPATCH", 
+  version: "2.0",
+  status: "operational", 
+  cities: Object.keys(CITIES),
+  connections: clients.size, 
+  totalIncidents: Object.values(cityState).reduce((sum, s) => sum + s.incidents.length, 0),
+  agents: detectiveBureau.getAgentStatuses(), 
+  predictionAccuracy: detectiveBureau.getAccuracy() 
+}));
 app.get('/cameras', (req, res) => res.json(cameras));
 app.get('/incidents', (req, res) => res.json(incidents));
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
@@ -3384,45 +3686,97 @@ app.post('/scanner/remove-feed', (req, res) => {
   res.json({ success: true, message: `Disconnected from feed ${feedId}` });
 });
 
-// WebSocket
-wss.on('connection', (ws) => {
+// WebSocket with city subscription support
+wss.on('connection', (ws, req) => {
   clients.add(ws);
+  
+  // Parse city from query string: ws://host/ws?city=mpls
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const requestedCity = url.searchParams.get('city') || 'nyc';
+  ws.subscribedCity = requestedCity;
+  
+  // Add to city-specific client list
+  if (cityState[requestedCity]) {
+    cityState[requestedCity].clients.add(ws);
+  }
+  
+  const city = CITIES[requestedCity] || CITIES.nyc;
+  const state = cityState[requestedCity] || cityState.nyc;
+  
+  // Send city-specific init data
   ws.send(JSON.stringify({
     type: "init",
-    incidents: incidents.slice(0, 20),
-    cameras,
-    transcripts: recentTranscripts.slice(0, 10),
-    activeFeeds: Array.from(activeStreams.keys()).map(id => NYPD_FEEDS.find(f => f.id === id)?.name || id),
-    streamCount: activeStreams.size,
+    city: {
+      id: city.id,
+      name: city.name,
+      shortName: city.shortName,
+      mapCenter: city.mapCenter,
+      mapZoom: city.mapZoom,
+      districts: city.districts,
+      color: city.color
+    },
+    cities: Object.values(CITIES).map(c => ({ id: c.id, name: c.name, shortName: c.shortName, color: c.color })),
+    incidents: state.incidents.slice(0, 20),
+    cameras: state.cameras,
+    transcripts: state.recentTranscripts.slice(0, 10),
+    activeFeeds: Array.from(state.activeStreams?.keys() || []),
+    streamCount: state.activeStreams?.size || 0,
     agents: detectiveBureau.getAgentStatuses(),
     predictions: detectiveBureau.getPredictionStats(),
-    facilities: NYC_FACILITIES.map(f => ({
-      id: f.id,
-      name: f.name,
-      shortName: f.shortName,
-      borough: f.borough,
-      lat: f.lat,
-      lng: f.lng,
-      currentPopulation: f.currentPopulation
-    })),
-    facilityStatus: getAllFacilitiesStatus()
+    facilities: requestedCity === 'nyc' ? NYC_FACILITIES.map(f => ({
+      id: f.id, name: f.name, shortName: f.shortName, borough: f.borough,
+      lat: f.lat, lng: f.lng, currentPopulation: f.currentPopulation
+    })) : [],
+    facilityStatus: requestedCity === 'nyc' ? getAllFacilitiesStatus() : null
   }));
-  ws.on('close', () => clients.delete(ws));
+  
+  ws.on('close', () => {
+    clients.delete(ws);
+    Object.values(cityState).forEach(state => state.clients.delete(ws));
+  });
+  
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message);
+      
+      // Allow switching cities
+      if (data.type === 'subscribe_city') {
+        const newCity = data.city;
+        if (CITIES[newCity]) {
+          if (ws.subscribedCity && cityState[ws.subscribedCity]) {
+            cityState[ws.subscribedCity].clients.delete(ws);
+          }
+          ws.subscribedCity = newCity;
+          cityState[newCity].clients.add(ws);
+          
+          const city = CITIES[newCity];
+          const state = cityState[newCity];
+          
+          ws.send(JSON.stringify({
+            type: "city_changed",
+            city: { id: city.id, name: city.name, shortName: city.shortName, mapCenter: city.mapCenter, mapZoom: city.mapZoom, districts: city.districts, color: city.color },
+            incidents: state.incidents.slice(0, 20),
+            cameras: state.cameras,
+            transcripts: state.recentTranscripts.slice(0, 10)
+          }));
+        }
+      }
+      
       if (data.type === 'manual_transcript') {
-        broadcast({ type: "transcript", text: data.text, timestamp: new Date().toISOString() });
+        const cityId = ws.subscribedCity || 'nyc';
+        broadcastToCity(cityId, { type: "transcript", text: data.text, timestamp: new Date().toISOString() });
         const parsed = await parseTranscript(data.text);
         if (parsed.hasIncident) {
-          incidentId++;
-          const camera = findNearestCamera(parsed.location, null, null, parsed.borough);
-          const incident = { id: incidentId, ...parsed, camera, lat: camera?.lat, lng: camera?.lng, timestamp: new Date().toISOString() };
-          incidents.unshift(incident);
-          detectiveBureau.processIncident(incident, broadcast);
+          const state = cityState[cityId];
+          state.incidentId++;
+          const cam = findNearestCamera(parsed.location, null, null, parsed.borough);
+          const incident = { id: state.incidentId, ...parsed, camera: cam, lat: cam?.lat, lng: cam?.lng, city: cityId, timestamp: new Date().toISOString() };
+          state.incidents.unshift(incident);
+          if (state.incidents.length > 50) state.incidents.pop();
+          detectiveBureau.processIncident(incident, (d) => broadcastToCity(cityId, d));
           checkBetsForIncident(incident);
-          broadcast({ type: "incident", incident });
-          if (camera) broadcast({ type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}` });
+          broadcastToCity(cityId, { type: "incident", incident });
+          if (cam) broadcastToCity(cityId, { type: "camera_switch", camera: cam, reason: `${parsed.incidentType} at ${parsed.location}` });
         }
       }
     } catch (e) { console.error('WS error:', e); }
@@ -3431,11 +3785,11 @@ wss.on('connection', (ws) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘  ðŸš¨ DISPATCH NYC - Police Scanner Intelligence         â•‘
-â•‘  Port: ${PORT}                                            â•‘
-â•‘  Agents: CHASE | PATTERN | PROPHET | HISTORIAN         â•‘
-â•‘  Chunk Duration: ${CHUNK_DURATION/1000}s (improved for full transmissions)  â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+=====================================================
+  DISPATCH - Multi-City Police Scanner Intelligence
+  Port: ${PORT}
+  Cities: ${Object.keys(CITIES).map(c => CITIES[c].shortName).join(', ')}
+  Agents: CHASE | PATTERN | PROPHET | HISTORIAN
+=====================================================
   `);
 });

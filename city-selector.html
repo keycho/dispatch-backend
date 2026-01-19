@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DISPATCH - Select City</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      background-color: #0a0a0a;
+      color: #fff;
+      font-family: 'JetBrains Mono', 'SF Mono', monospace;
+      overflow-x: hidden;
+    }
+
+    /* Grid background */
+    .grid-bg {
+      position: fixed;
+      inset: 0;
+      background-image: 
+        linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+      background-size: 60px 60px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* Scanline effect */
+    .scanline {
+      position: fixed;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.06), transparent);
+      animation: scanline 12s linear infinite;
+      pointer-events: none;
+      z-index: 100;
+    }
+
+    @keyframes scanline {
+      0% { top: -2px; }
+      100% { top: 100vh; }
+    }
+
+    /* Header */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 28px 48px;
+      position: relative;
+      z-index: 10;
+    }
+
+    .logo {
+      font-size: 13px;
+      letter-spacing: 6px;
+      font-weight: 300;
+      color: rgba(255,255,255,0.5);
+    }
+
+    .live-indicator {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: #ef4444;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .live-text {
+      font-size: 11px;
+      letter-spacing: 3px;
+      color: rgba(255,255,255,0.4);
+    }
+
+    /* Main content */
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 20px 48px 80px;
+      position: relative;
+      z-index: 10;
+    }
+
+    .title-section {
+      text-align: center;
+      margin-bottom: 60px;
+      opacity: 0;
+      transform: translateY(20px);
+      animation: fadeUp 0.8s ease forwards;
+    }
+
+    @keyframes fadeUp {
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    h1 {
+      font-size: clamp(28px, 4vw, 42px);
+      font-weight: 200;
+      letter-spacing: 10px;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+      font-family: 'Helvetica Neue', Arial, sans-serif;
+      color: rgba(255,255,255,0.9);
+    }
+
+    .subtitle {
+      font-size: 12px;
+      color: rgba(255,255,255,0.35);
+      letter-spacing: 4px;
+      text-transform: uppercase;
+    }
+
+    /* City grid */
+    .city-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+      gap: 32px;
+      margin-bottom: 60px;
+    }
+
+    .city-card {
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.1);
+      overflow: hidden;
+      cursor: pointer;
+      transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+      opacity: 0;
+      transform: translateY(40px);
+      animation: fadeUp 0.8s ease forwards;
+    }
+
+    .city-card:nth-child(1) { animation-delay: 0.2s; }
+    .city-card:nth-child(2) { animation-delay: 0.35s; }
+
+    .city-card:hover {
+      border-color: var(--city-color);
+      box-shadow: 0 0 60px var(--city-color-alpha), inset 0 0 60px var(--city-color-alpha-light);
+    }
+
+    .city-card.nyc {
+      --city-color: #FF6B35;
+      --city-color-alpha: rgba(255, 107, 53, 0.15);
+      --city-color-alpha-light: rgba(255, 107, 53, 0.05);
+    }
+
+    .city-card.mpls {
+      --city-color: #4ECDC4;
+      --city-color-alpha: rgba(78, 205, 196, 0.15);
+      --city-color-alpha-light: rgba(78, 205, 196, 0.05);
+    }
+
+    /* Map preview */
+    .map-preview {
+      position: relative;
+      height: 180px;
+      overflow: hidden;
+      background: #111;
+    }
+
+    .map-preview img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      filter: brightness(0.6);
+      transition: filter 0.4s ease;
+    }
+
+    .city-card:hover .map-preview img {
+      filter: brightness(1.1);
+    }
+
+    .map-gradient {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, transparent 30%, rgba(10,10,10,0.95) 100%);
+      pointer-events: none;
+    }
+
+    .center-dot {
+      position: absolute;
+      top: 45%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background-color: var(--city-color);
+      box-shadow: 0 0 20px var(--city-color), 0 0 40px var(--city-color);
+    }
+
+    .pulse-rings {
+      position: absolute;
+      top: 45%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    .city-card:hover .pulse-rings {
+      opacity: 1;
+    }
+
+    .pulse-ring {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      border: 1px solid var(--city-color);
+      animation: pulse-ring 2s ease-out infinite;
+    }
+
+    .pulse-ring:nth-child(2) {
+      animation-delay: 0.5s;
+    }
+
+    @keyframes pulse-ring {
+      0% { transform: translate(-50%, -50%) scale(1); opacity: 0.6; }
+      100% { transform: translate(-50%, -50%) scale(4); opacity: 0; }
+    }
+
+    /* City info */
+    .city-info {
+      padding: 24px 28px 28px;
+    }
+
+    .city-name-row {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      margin-bottom: 10px;
+    }
+
+    .city-name {
+      font-size: 26px;
+      font-weight: 300;
+      letter-spacing: 5px;
+      font-family: 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    .city-subtitle {
+      font-size: 10px;
+      letter-spacing: 3px;
+      font-weight: 600;
+      color: var(--city-color);
+    }
+
+    .city-description {
+      font-size: 13px;
+      color: rgba(255,255,255,0.45);
+      line-height: 1.5;
+      margin-bottom: 20px;
+      font-family: 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    .stats-row {
+      display: flex;
+      gap: 28px;
+      margin-bottom: 24px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .stat {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .stat-value {
+      font-size: 13px;
+      font-weight: 500;
+      color: rgba(255,255,255,0.85);
+      letter-spacing: 0.5px;
+    }
+
+    .stat-value.live {
+      color: var(--city-color);
+    }
+
+    .stat-label {
+      font-size: 9px;
+      color: rgba(255,255,255,0.35);
+      text-transform: uppercase;
+      letter-spacing: 2px;
+    }
+
+    .enter-btn {
+      width: 100%;
+      padding: 14px 20px;
+      background: transparent;
+      border: 1px solid rgba(255,255,255,0.2);
+      color: rgba(255,255,255,0.6);
+      font-size: 11px;
+      letter-spacing: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      transition: all 0.3s ease;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .city-card:hover .enter-btn {
+      border-color: var(--city-color);
+      color: var(--city-color);
+      background: var(--city-color-alpha-light);
+    }
+
+    .enter-btn .arrow {
+      transition: transform 0.3s ease;
+      font-size: 14px;
+    }
+
+    .city-card:hover .enter-btn .arrow {
+      transform: translateX(4px);
+    }
+
+    /* Footer */
+    .footer-hint {
+      text-align: center;
+      font-size: 11px;
+      color: rgba(255,255,255,0.2);
+      letter-spacing: 3px;
+      font-family: 'Helvetica Neue', Arial, sans-serif;
+      opacity: 0;
+      animation: fadeUp 0.8s ease forwards;
+      animation-delay: 0.5s;
+    }
+
+    /* Responsive */
+    @media (max-width: 860px) {
+      .city-grid {
+        grid-template-columns: 1fr;
+      }
+      
+      header, main {
+        padding-left: 24px;
+        padding-right: 24px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="grid-bg"></div>
+  <div class="scanline"></div>
+
+  <header>
+    <span class="logo">D I S P A T C H</span>
+    <div class="live-indicator">
+      <span class="live-dot"></span>
+      <span class="live-text">LIVE</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="title-section">
+      <h1>Select Your City</h1>
+      <p class="subtitle">Choose a metropolitan area to begin monitoring</p>
+    </div>
+
+    <div class="city-grid">
+      <!-- New York -->
+      <div class="city-card nyc" onclick="enterCity('nyc')">
+        <div class="map-preview">
+          <img 
+            src="https://api.mapbox.com/styles/v1/mapbox/dark-v11/static/-74.006,40.7128,10,0/500x280@2x?access_token=pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBndHRqcmZ3N3gifQ.rJcFIG214AriISLbB6B5aw" 
+            alt="New York City map"
+          />
+          <div class="map-gradient"></div>
+          <div class="center-dot"></div>
+          <div class="pulse-rings">
+            <div class="pulse-ring"></div>
+            <div class="pulse-ring"></div>
+          </div>
+        </div>
+        <div class="city-info">
+          <div class="city-name-row">
+            <h2 class="city-name">NEW YORK</h2>
+            <span class="city-subtitle">CITY</span>
+          </div>
+          <p class="city-description">Five boroughs. 8 million stories. Every call tracked.</p>
+          <div class="stats-row">
+            <div class="stat">
+              <span class="stat-value">8.3M</span>
+              <span class="stat-label">Population</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value">77 Precincts</span>
+              <span class="stat-label">Coverage</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value live">● 10 Live Feeds</span>
+              <span class="stat-label">Scanner</span>
+            </div>
+          </div>
+          <button class="enter-btn">
+            <span>ENTER SYSTEM</span>
+            <span class="arrow">→</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Minneapolis -->
+      <div class="city-card mpls" onclick="enterCity('mpls')">
+        <div class="map-preview">
+          <img 
+            src="https://api.mapbox.com/styles/v1/mapbox/dark-v11/static/-93.265,44.9778,10,0/500x280@2x?access_token=pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBndHRqcmZ3N3gifQ.rJcFIG214AriISLbB6B5aw" 
+            alt="Minneapolis map"
+          />
+          <div class="map-gradient"></div>
+          <div class="center-dot"></div>
+          <div class="pulse-rings">
+            <div class="pulse-ring"></div>
+            <div class="pulse-ring"></div>
+          </div>
+        </div>
+        <div class="city-info">
+          <div class="city-name-row">
+            <h2 class="city-name">MINNEAPOLIS</h2>
+            <span class="city-subtitle">MINNESOTA</span>
+          </div>
+          <p class="city-description">Twin Cities. Hennepin County. Real-time intelligence.</p>
+          <div class="stats-row">
+            <div class="stat">
+              <span class="stat-value">430K</span>
+              <span class="stat-label">Population</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value">5 Precincts</span>
+              <span class="stat-label">Coverage</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value live">● 4 Live Feeds</span>
+              <span class="stat-label">Scanner</span>
+            </div>
+          </div>
+          <button class="enter-btn">
+            <span>ENTER SYSTEM</span>
+            <span class="arrow">→</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <p class="footer-hint">More cities coming soon · Chicago · Los Angeles · Miami</p>
+  </main>
+
+  <script>
+    function enterCity(cityId) {
+      // Navigate to the city map
+      // Update this URL to match your routing setup
+      window.location.href = `/map?city=${cityId}`;
+      // Or for React Router style: window.location.href = `/${cityId}`;
+    }
+  </script>
+</body>
+</html>
