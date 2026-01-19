@@ -558,33 +558,77 @@ const detectiveBureau = new DetectiveBureau(anthropic);
 // ============================================
 
 const TREASURY_WALLET = process.env.TREASURY_WALLET || 'YOUR_SOLANA_WALLET_HERE';
-const HOUSE_EDGE = 0.05;
+const HOUSE_EDGE = 0.08; // 8% house edge
 
 const oddsEngine = {
-  boroughRates: { 'Manhattan': 12.5, 'Brooklyn': 9.8, 'Bronx': 7.2, 'Queens': 6.1, 'Staten Island': 1.4 },
-  incidentTypeRarity: { 'any': 1.0, 'traffic': 0.25, 'medical': 0.20, 'domestic': 0.15, 'assault': 0.12, 'suspicious': 0.10, 'theft': 0.08, 'robbery': 0.05, 'pursuit': 0.03, 'shots fired': 0.02 },
-  timeMultipliers: { 0: 0.7, 1: 0.5, 2: 0.4, 3: 0.3, 4: 0.4, 5: 0.5, 6: 0.7, 7: 0.9, 8: 1.0, 9: 1.0, 10: 1.0, 11: 1.1, 12: 1.2, 13: 1.1, 14: 1.0, 15: 1.1, 16: 1.2, 17: 1.3, 18: 1.4, 19: 1.5, 20: 1.6, 21: 1.5, 22: 1.3, 23: 1.0 },
+  // Base rates: expected DETECTED incidents per hour per borough (realistic for scanner detection)
+  boroughRates: { 
+    'Manhattan': 2.5,      // ~2-3 detected per hour
+    'Brooklyn': 2.0,       
+    'Bronx': 1.8,          
+    'Queens': 1.2,         
+    'Staten Island': 0.3   // Very quiet
+  },
+  
+  // Incident type rarity multipliers (applied to base rate)
+  incidentTypeRarity: { 
+    'any': 1.0,            // Any incident
+    'traffic': 0.20,       // 20% of incidents
+    'medical': 0.15,       
+    'domestic': 0.12,      
+    'assault': 0.08,       
+    'suspicious': 0.10,    
+    'theft': 0.06,         
+    'robbery': 0.03,       // Rare
+    'pursuit': 0.02,       // Very rare
+    'shots fired': 0.01    // Extremely rare
+  },
+  
+  // Time of day multipliers
+  timeMultipliers: { 
+    0: 0.6, 1: 0.4, 2: 0.3, 3: 0.2, 4: 0.3, 5: 0.4, 
+    6: 0.6, 7: 0.8, 8: 0.9, 9: 1.0, 10: 1.0, 11: 1.1, 
+    12: 1.2, 13: 1.1, 14: 1.0, 15: 1.1, 16: 1.2, 17: 1.3, 
+    18: 1.4, 19: 1.5, 20: 1.6, 21: 1.5, 22: 1.3, 23: 0.9 
+  },
   
   calculateProbability(borough, incidentType = 'any', windowMinutes = 30) {
     const hour = new Date().getHours();
-    const baseRate = this.boroughRates[borough] || 5.0;
+    const baseRate = this.boroughRates[borough] || 1.0;
     const timeAdjusted = baseRate * this.timeMultipliers[hour];
-    const typeMultiplier = this.incidentTypeRarity[incidentType.toLowerCase()] || 0.1;
+    const typeMultiplier = this.incidentTypeRarity[incidentType.toLowerCase()] || 0.05;
     const adjusted = timeAdjusted * typeMultiplier;
-    const expected = (adjusted / 60) * windowMinutes;
-    return Math.min(0.95, 1 - Math.exp(-expected));
+    
+    // Poisson probability of at least 1 event: P(X >= 1) = 1 - e^(-λ)
+    const lambda = (adjusted / 60) * windowMinutes;
+    const probability = 1 - Math.exp(-lambda);
+    
+    // Cap probability: min 2%, max 85% (ensures house edge always works)
+    return Math.max(0.02, Math.min(0.85, probability));
   },
   
   calculateMultiplier(probability) {
-    const fair = 1 / probability;
-    const withEdge = fair * (1 - HOUSE_EDGE);
-    return Math.max(1.1, Math.min(50.0, Math.round(withEdge * 100) / 100));
+    const fairOdds = 1 / probability;
+    const withEdge = fairOdds * (1 - HOUSE_EDGE);
+    // Min 1.1x, max 45x
+    return Math.max(1.1, Math.min(45.0, Math.round(withEdge * 10) / 10));
   },
   
   getOdds(borough, incidentType = 'any', windowMinutes = 30) {
     const prob = this.calculateProbability(borough, incidentType, windowMinutes);
     const mult = this.calculateMultiplier(prob);
-    return { borough, incidentType, windowMinutes, probability: Math.round(prob * 1000) / 10, multiplier: mult };
+    const expectedValue = (prob * mult) - 1; // Negative = house wins
+    
+    return { 
+      borough, 
+      incidentType, 
+      windowMinutes, 
+      probability: Math.round(prob * 100),      // Whole number percentage (e.g., 85)
+      probabilityRaw: prob,                      // Raw decimal for calculations
+      multiplier: mult,
+      expectedValue: Math.round(expectedValue * 1000) / 1000,
+      houseEdge: `${(HOUSE_EDGE * 100).toFixed(0)}%`
+    };
   }
 };
 
@@ -592,6 +636,201 @@ const treasury = { totalReceived: 0, totalPaidOut: 0, get netProfit() { return t
 const activeBets = new Map();
 const userProfiles = new Map();
 const betHistory = [];
+
+// ============================================
+// NYC CORRECTIONAL FACILITIES (Static Data)
+// ============================================
+
+const NYC_FACILITIES = [
+  {
+    id: 'rikers_island',
+    name: 'Rikers Island Complex',
+    shortName: 'Rikers',
+    type: 'jail',
+    borough: 'Queens',
+    lat: 40.7932,
+    lng: -73.8860,
+    capacity: 10000,
+    currentPopulation: 4800,
+    avgDailyReleases: 95,
+    releaseHours: '6:00 AM - 8:00 AM',
+    subFacilities: [
+      'Anna M. Kross Center (AMKC)',
+      'Eric M. Taylor Center (EMTC)',
+      'George R. Vierno Center (GRVC)',
+      'Otis Bantum Correctional Center (OBCC)',
+      'Robert N. Davoren Center (RNDC)',
+      'Rose M. Singer Center (RMSC) - Women'
+    ],
+    hasQ100: true,
+    notes: 'Main NYC jail complex. Q100 bus is only public transit access.'
+  },
+  {
+    id: 'manhattan_detention',
+    name: 'Manhattan Detention Complex',
+    shortName: 'The Tombs',
+    type: 'jail',
+    borough: 'Manhattan',
+    lat: 40.7142,
+    lng: -74.0010,
+    capacity: 898,
+    currentPopulation: 680,
+    avgDailyReleases: 25,
+    releaseHours: '6:00 AM - 10:00 AM',
+    subFacilities: [],
+    hasQ100: false,
+    notes: 'Located at 125 White Street. Near multiple subway lines.'
+  },
+  {
+    id: 'brooklyn_detention',
+    name: 'Brooklyn Detention Complex',
+    shortName: 'Brooklyn MDC',
+    type: 'jail',
+    borough: 'Brooklyn',
+    lat: 40.6912,
+    lng: -73.9866,
+    capacity: 759,
+    currentPopulation: 590,
+    avgDailyReleases: 18,
+    releaseHours: '6:00 AM - 10:00 AM',
+    subFacilities: [],
+    hasQ100: false,
+    notes: 'Located at 275 Atlantic Avenue.'
+  },
+  {
+    id: 'vernon_bain',
+    name: 'Vernon C. Bain Center',
+    shortName: 'The Boat',
+    type: 'jail',
+    borough: 'Bronx',
+    lat: 40.8054,
+    lng: -73.8796,
+    capacity: 800,
+    currentPopulation: 650,
+    avgDailyReleases: 12,
+    releaseHours: '6:00 AM - 8:00 AM',
+    subFacilities: [],
+    hasQ100: false,
+    notes: 'Floating detention center (barge) in the East River.'
+  },
+  {
+    id: 'queens_detention',
+    name: 'Queens Detention Facility',
+    shortName: 'Queens',
+    type: 'jail',
+    borough: 'Queens',
+    lat: 40.7282,
+    lng: -73.8303,
+    capacity: 500,
+    currentPopulation: 320,
+    avgDailyReleases: 10,
+    releaseHours: '6:00 AM - 10:00 AM',
+    subFacilities: [],
+    hasQ100: false,
+    notes: 'Located in Kew Gardens.'
+  }
+];
+
+// Q100 Bus Schedule Calculator (Rikers Island only)
+function getQ100Schedule(count = 5) {
+  const now = new Date();
+  const hour = now.getHours();
+  const minute = now.getMinutes();
+  const isWeekend = now.getDay() === 0 || now.getDay() === 6;
+  
+  // Peak hours during release time (5 AM - 10 AM)
+  const isPeak = hour >= 5 && hour < 10;
+  const frequency = isPeak ? 12 : (hour >= 6 && hour < 22 ? 20 : 30);
+  
+  const buses = [];
+  let nextMinute = Math.ceil(minute / frequency) * frequency;
+  let nextHour = hour;
+  
+  for (let i = 0; i < count; i++) {
+    if (nextMinute >= 60) {
+      nextMinute -= 60;
+      nextHour = (nextHour + 1) % 24;
+    }
+    
+    const busTime = new Date(now);
+    busTime.setHours(nextHour, nextMinute, 0, 0);
+    if (busTime <= now) {
+      busTime.setMinutes(busTime.getMinutes() + frequency);
+    }
+    
+    const minutesUntil = Math.round((busTime - now) / 60000);
+    
+    buses.push({
+      time: busTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }),
+      minutesUntil: Math.max(1, minutesUntil),
+      isPeak
+    });
+    
+    nextMinute += frequency;
+  }
+  
+  return buses;
+}
+
+// Check if during release hours
+function isDuringReleaseHours() {
+  const hour = new Date().getHours();
+  return hour >= 5 && hour <= 10;
+}
+
+// Get facility intelligence for a specific facility
+function getFacilityIntelligence(facilityId) {
+  const facility = NYC_FACILITIES.find(f => f.id === facilityId);
+  if (!facility) return null;
+  
+  const dayOfWeek = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date().getDay()];
+  const dayMultipliers = { Sun: 0.75, Mon: 0.95, Tue: 1.0, Wed: 1.05, Thu: 1.1, Fri: 1.2, Sat: 0.85 };
+  
+  // Estimate today's releases based on day of week
+  const estimatedReleases = Math.round(facility.avgDailyReleases * dayMultipliers[dayOfWeek]);
+  
+  const result = {
+    ...facility,
+    estimatedReleasesToday: estimatedReleases,
+    dayOfWeek,
+    releaseWindowActive: isDuringReleaseHours(),
+    timestamp: new Date().toISOString()
+  };
+  
+  // Add Q100 data for Rikers only
+  if (facility.hasQ100) {
+    const nextBuses = getQ100Schedule(5);
+    result.q100 = {
+      nextBuses,
+      nextBusIn: `${nextBuses[0].minutesUntil} min`,
+      isPeakTime: nextBuses[0].isPeak,
+      route: 'Rikers Island → Queens Plaza',
+      note: 'Only public transit to/from Rikers'
+    };
+  }
+  
+  return result;
+}
+
+// Get all facilities summary
+function getAllFacilitiesStatus() {
+  const dayOfWeek = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date().getDay()];
+  const dayMultipliers = { Sun: 0.75, Mon: 0.95, Tue: 1.0, Wed: 1.05, Thu: 1.1, Fri: 1.2, Sat: 0.85 };
+  
+  const totalPopulation = NYC_FACILITIES.reduce((sum, f) => sum + f.currentPopulation, 0);
+  const totalReleases = NYC_FACILITIES.reduce((sum, f) => 
+    sum + Math.round(f.avgDailyReleases * dayMultipliers[dayOfWeek]), 0);
+  
+  return {
+    totalPopulation,
+    estimatedReleasesToday: totalReleases,
+    dayOfWeek,
+    releaseWindowActive: isDuringReleaseHours(),
+    releaseWindowHours: '5:00 AM - 10:00 AM',
+    facilityCount: NYC_FACILITIES.length,
+    timestamp: new Date().toISOString()
+  };
+}
 
 // ============================================
 // CAMERAS & SCANNER
@@ -963,10 +1202,31 @@ app.get('/bet/odds', (req, res) => {
 app.get('/bet/all-odds', (req, res) => {
   const { window = 30 } = req.query;
   const boroughs = ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
-  const types = ['any', 'assault', 'robbery', 'traffic', 'shots fired'];
+  const types = ['any', 'assault', 'robbery', 'theft', 'pursuit', 'shots fired'];
   const odds = {};
   boroughs.forEach(b => { odds[b] = {}; types.forEach(t => { odds[b][t] = oddsEngine.getOdds(b, t, parseInt(window)); }); });
-  res.json({ timestamp: new Date().toISOString(), windowMinutes: parseInt(window), houseEdge: `${HOUSE_EDGE * 100}%`, odds, treasury: { totalReceivedSOL: treasury.totalReceived / 1e9, totalPaidOutSOL: treasury.totalPaidOut / 1e9, netProfitSOL: treasury.netProfit / 1e9 } });
+  
+  // Calculate summary stats
+  const allOdds = boroughs.flatMap(b => types.map(t => odds[b][t]));
+  const avgMultiplier = allOdds.reduce((s, o) => s + o.multiplier, 0) / allOdds.length;
+  
+  res.json({ 
+    timestamp: new Date().toISOString(), 
+    windowMinutes: parseInt(window), 
+    houseEdge: `${HOUSE_EDGE * 100}%`,
+    currentHour: new Date().getHours(),
+    summary: {
+      avgMultiplier: Math.round(avgMultiplier * 10) / 10,
+      lowestOdds: allOdds.reduce((min, o) => o.multiplier < min.multiplier ? o : min),
+      highestOdds: allOdds.reduce((max, o) => o.multiplier > max.multiplier ? o : max)
+    },
+    odds, 
+    treasury: { 
+      totalReceivedSOL: treasury.totalReceived / 1e9, 
+      totalPaidOutSOL: treasury.totalPaidOut / 1e9, 
+      netProfitSOL: treasury.netProfit / 1e9 
+    } 
+  });
 });
 app.get('/bet/treasury', (req, res) => res.json({ wallet: TREASURY_WALLET, totalReceivedSOL: treasury.totalReceived / 1e9, totalPaidOutSOL: treasury.totalPaidOut / 1e9, netProfitSOL: treasury.netProfit / 1e9, activeBets: activeBets.size, houseEdge: `${HOUSE_EDGE * 100}%` }));
 app.get('/bet/pool', (req, res) => {
@@ -1015,6 +1275,52 @@ app.post('/auth/verify', (req, res) => {
   res.json({ success: true, profile, activeBets: Array.from(activeBets.values()).filter(b => b.walletAddress === walletAddress) });
 });
 
+// Facility endpoints
+app.get('/facilities', (req, res) => {
+  res.json({
+    facilities: NYC_FACILITIES,
+    status: getAllFacilitiesStatus(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/facilities/list', (req, res) => {
+  res.json(NYC_FACILITIES.map(f => ({
+    id: f.id,
+    name: f.name,
+    shortName: f.shortName,
+    borough: f.borough,
+    lat: f.lat,
+    lng: f.lng,
+    currentPopulation: f.currentPopulation
+  })));
+});
+
+app.get('/facilities/status', (req, res) => {
+  res.json(getAllFacilitiesStatus());
+});
+
+app.get('/facilities/q100', (req, res) => {
+  const buses = getQ100Schedule(10);
+  res.json({
+    route: 'Q100 - Rikers Island to Queens Plaza',
+    description: 'Only public transit to/from Rikers Island',
+    nextBuses: buses,
+    nextBusIn: `${buses[0].minutesUntil} min`,
+    isPeakTime: buses[0].isPeak,
+    peakHours: '5:00 AM - 10:00 AM',
+    frequency: buses[0].isPeak ? 'Every 10-12 min' : 'Every 20-30 min'
+  });
+});
+
+app.get('/facilities/:id', (req, res) => {
+  const intel = getFacilityIntelligence(req.params.id);
+  if (!intel) {
+    return res.status(404).json({ error: 'Facility not found' });
+  }
+  res.json(intel);
+});
+
 // Core endpoints
 app.get('/', (req, res) => res.json({ name: "DISPATCH NYC", status: "operational", connections: clients.size, incidents: incidents.length, agents: detectiveBureau.getAgentStatuses(), predictionAccuracy: detectiveBureau.getAccuracy() }));
 app.get('/cameras', (req, res) => res.json(cameras));
@@ -1035,7 +1341,17 @@ wss.on('connection', (ws) => {
     transcripts: recentTranscripts.slice(0, 10),
     currentFeed: NYPD_FEEDS[currentFeedIndex]?.name,
     agents: detectiveBureau.getAgentStatuses(),
-    predictions: detectiveBureau.getPredictionStats()
+    predictions: detectiveBureau.getPredictionStats(),
+    facilities: NYC_FACILITIES.map(f => ({
+      id: f.id,
+      name: f.name,
+      shortName: f.shortName,
+      borough: f.borough,
+      lat: f.lat,
+      lng: f.lng,
+      currentPopulation: f.currentPopulation
+    })),
+    facilityStatus: getAllFacilitiesStatus()
   }));
   ws.on('close', () => clients.delete(ws));
   ws.on('message', async (message) => {
