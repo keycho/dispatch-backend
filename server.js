@@ -1356,20 +1356,112 @@ app.get('/facilities/nearby-incidents', (req, res) => {
 // Note: For production, get free API key from https://bustime.mta.info/wiki/Developers/Index
 const MTA_API_KEY = process.env.MTA_API_KEY || null;
 
+// Q100 Route Polyline - actual route from Rikers to Queens Plaza via Hazen St Bridge
+const Q100_ROUTE = {
+  name: 'Q100',
+  description: 'Rikers Island to Queens Plaza - Only public transit to/from Rikers',
+  origin: { name: 'Rikers Island Bus Depot', lat: 40.7932, lng: -73.8860 },
+  destination: { name: 'Queens Plaza', lat: 40.7505, lng: -73.9375 },
+  // Key stops along the route
+  stops: [
+    { name: 'Rikers Island', lat: 40.7932, lng: -73.8860, isTerminal: true },
+    { name: 'Hazen St/19 Ave', lat: 40.7780, lng: -73.8880 },
+    { name: '19 Ave/Hazen St', lat: 40.7750, lng: -73.8920 },
+    { name: 'Astoria Blvd/94 St', lat: 40.7680, lng: -73.8950 },
+    { name: '31 Ave/83 St', lat: 40.7620, lng: -73.9050 },
+    { name: 'Northern Blvd/69 St', lat: 40.7560, lng: -73.9150 },
+    { name: 'Broadway/Steinway St', lat: 40.7540, lng: -73.9250 },
+    { name: 'Queens Plaza', lat: 40.7505, lng: -73.9375, isTerminal: true }
+  ],
+  // Simplified route polyline for map display
+  polyline: [
+    [40.7932, -73.8860], // Rikers Island
+    [40.7910, -73.8850], // Bridge approach
+    [40.7870, -73.8865], // Hazen St Bridge
+    [40.7820, -73.8875], // Bridge exit
+    [40.7780, -73.8880], // Hazen St
+    [40.7750, -73.8920], // Turn onto 19 Ave
+    [40.7700, -73.8940], // 19 Ave
+    [40.7680, -73.8950], // Astoria Blvd
+    [40.7650, -73.9000], // Continuing
+    [40.7620, -73.9050], // 31 Ave
+    [40.7590, -73.9100], // Approaching Northern
+    [40.7560, -73.9150], // Northern Blvd
+    [40.7540, -73.9200], // Broadway
+    [40.7530, -73.9250], // Near Steinway
+    [40.7515, -73.9320], // Approaching Queens Plaza
+    [40.7505, -73.9375]  // Queens Plaza Terminal
+  ],
+  // Rikers Island Bridge coordinates for highlighting
+  bridge: {
+    start: [40.7910, -73.8850],
+    end: [40.7820, -73.8875],
+    name: 'Francis R. Buono Memorial Bridge'
+  },
+  // Estimated travel time
+  travelTimeMinutes: {
+    toRikers: 25,
+    fromRikers: 25
+  }
+};
+
+// Calculate distance between two points
+function haversineDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371; // km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+// Estimate ETA to Rikers based on bus position
+function estimateETAToRikers(busLat, busLng, direction) {
+  // Direction: 0 = heading to Queens Plaza (away from Rikers), 1 = heading to Rikers
+  const rikersLat = Q100_ROUTE.origin.lat;
+  const rikersLng = Q100_ROUTE.origin.lng;
+  const queensLat = Q100_ROUTE.destination.lat;
+  const queensLng = Q100_ROUTE.destination.lng;
+  
+  const distToRikers = haversineDistance(busLat, busLng, rikersLat, rikersLng);
+  const distToQueens = haversineDistance(busLat, busLng, queensLat, queensLng);
+  
+  // Total route distance ~7km
+  const totalRouteKm = 7;
+  const avgSpeedKmh = 18; // Average bus speed with stops
+  
+  if (direction === '1' || direction === 1) {
+    // Heading TO Rikers - direct ETA
+    const etaMinutes = Math.round((distToRikers / avgSpeedKmh) * 60);
+    return { minutes: Math.max(1, etaMinutes), direct: true };
+  } else {
+    // Heading AWAY from Rikers - needs to complete route and return
+    const etaMinutes = Math.round(((distToQueens + totalRouteKm) / avgSpeedKmh) * 60);
+    return { minutes: Math.max(1, etaMinutes), direct: false };
+  }
+}
+
 app.get('/facilities/q100/live', async (req, res) => {
+  const schedule = getQ100Schedule(5);
+  const baseResponse = {
+    route: Q100_ROUTE,
+    schedule,
+    nextBusIn: `${schedule[0].minutesUntil} min`,
+    isPeakTime: schedule[0].isPeak,
+    frequency: schedule[0].isPeak ? 'Every 10-12 min' : 'Every 20-30 min',
+    timestamp: new Date().toISOString()
+  };
+
   // Return schedule-based data if no MTA API key
   if (!MTA_API_KEY) {
-    const schedule = getQ100Schedule(5);
     return res.json({
+      ...baseResponse,
       live: false,
-      message: 'Live tracking unavailable - showing scheduled times',
-      schedule,
-      nextBusIn: `${schedule[0].minutesUntil} min`,
-      route: {
-        name: 'Q100',
-        origin: { name: 'Rikers Island', lat: 40.7932, lng: -73.8860 },
-        destination: { name: 'Queens Plaza', lat: 40.7505, lng: -73.9375 }
-      }
+      message: 'Live tracking unavailable - add MTA_API_KEY for real-time bus positions',
+      buses: [],
+      busCount: 0
     });
   }
   
@@ -1389,40 +1481,62 @@ app.get('/facilities/q100/live', async (req, res) => {
       const journey = v.MonitoredVehicleJourney;
       const location = journey?.VehicleLocation;
       const call = journey?.MonitoredCall;
+      const direction = journey?.DirectionRef;
+      
+      const lat = parseFloat(location?.Latitude);
+      const lng = parseFloat(location?.Longitude);
+      
+      // Calculate ETA to Rikers
+      const eta = (lat && lng) ? estimateETAToRikers(lat, lng, direction) : null;
       
       return {
         vehicleId: journey?.VehicleRef,
-        lat: parseFloat(location?.Latitude),
-        lng: parseFloat(location?.Longitude),
-        direction: journey?.DirectionRef, // 0 = to Queens, 1 = to Rikers
+        lat,
+        lng,
+        direction, // 0 = to Queens Plaza, 1 = to Rikers
+        directionLabel: direction === '1' || direction === 1 ? 'To Rikers' : 'To Queens Plaza',
+        bearing: parseFloat(journey?.Bearing) || null,
         nextStop: call?.StopPointName,
         expectedArrival: call?.ExpectedArrivalTime,
-        distanceFromStop: call?.DistanceFromStop
+        distanceFromStop: call?.DistanceFromStop,
+        progressRate: journey?.ProgressRate,
+        etaToRikers: eta
       };
     }).filter(b => b.lat && b.lng);
     
+    // Sort by ETA to Rikers (buses heading there first)
+    buses.sort((a, b) => {
+      if (a.direction !== b.direction) {
+        return (a.direction === '1' || a.direction === 1) ? -1 : 1;
+      }
+      return (a.etaToRikers?.minutes || 999) - (b.etaToRikers?.minutes || 999);
+    });
+    
     res.json({
+      ...baseResponse,
       live: true,
       buses,
       busCount: buses.length,
-      route: {
-        name: 'Q100',
-        origin: { name: 'Rikers Island', lat: 40.7932, lng: -73.8860 },
-        destination: { name: 'Queens Plaza', lat: 40.7505, lng: -73.9375 }
-      },
-      timestamp: new Date().toISOString()
+      busesToRikers: buses.filter(b => b.direction === '1' || b.direction === 1).length,
+      busesToQueens: buses.filter(b => b.direction === '0' || b.direction === 0).length,
+      nextBusToRikers: buses.find(b => b.direction === '1' || b.direction === 1) || null
     });
     
   } catch (error) {
     console.error('[Q100] Live tracking error:', error.message);
-    const schedule = getQ100Schedule(5);
     res.json({
+      ...baseResponse,
       live: false,
       error: error.message,
-      schedule,
-      nextBusIn: `${schedule[0].minutesUntil} min`
+      buses: [],
+      busCount: 0
     });
   }
+});
+
+// Dedicated route info endpoint
+app.get('/facilities/q100/route', (req, res) => {
+  res.json(Q100_ROUTE);
 });
 
 // Facilities summary for dashboard
