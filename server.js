@@ -1633,47 +1633,106 @@ async function fetchCamerasForCity(cityId) {
       console.log(`[${city.shortName}] Loaded ${cityState[cityId].cameras.length} traffic cameras`);
     } 
     else if (cityId === 'mpls') {
-      // MnDOT 511 API for Minnesota cameras
+      // MnDOT 511 API for Minnesota cameras - try multiple endpoints
       try {
-        const response = await fetch('https://511mn.org/api/getcameras?format=json');
-        const data = await response.json();
+        // Try the MnDOT CCTV GeoJSON endpoint
+        let cameras = [];
         
-        // Filter to Minneapolis metro area (roughly within 20 miles of downtown)
-        const mplsLat = 44.9778, mplsLng = -93.2650, radiusMiles = 25;
+        // Primary: MnDOT Open Data Portal
+        const endpoints = [
+          'https://511mn.org/api/getcameras?format=json',
+          'https://services.arcgis.com/BG6nSlhZSAWtExvp/arcgis/rest/services/MnDOT_CCTV_Camera_Locations/FeatureServer/0/query?where=1%3D1&outFields=*&f=geojson',
+        ];
         
-        cityState[cityId].cameras = (data.features || data || [])
-          .filter(cam => {
-            const lat = cam.geometry?.coordinates?.[1] || cam.latitude || cam.lat;
-            const lng = cam.geometry?.coordinates?.[0] || cam.longitude || cam.lng;
-            if (!lat || !lng) return false;
-            // Simple distance check
-            const distance = Math.sqrt(Math.pow(lat - mplsLat, 2) + Math.pow(lng - mplsLng, 2)) * 69; // rough miles
-            return distance < radiusMiles;
-          })
-          .map(cam => ({
-            id: cam.properties?.id || cam.id || Math.random().toString(36).substr(2, 9),
-            location: cam.properties?.description || cam.properties?.name || cam.name || 'MnDOT Camera',
-            lat: cam.geometry?.coordinates?.[1] || cam.latitude,
-            lng: cam.geometry?.coordinates?.[0] || cam.longitude,
-            area: 'Minneapolis',
-            imageUrl: cam.properties?.imageUrl || cam.properties?.image_url || cam.imageUrl,
-            isOnline: true,
-            city: 'mpls'
-          }));
+        for (const endpoint of endpoints) {
+          try {
+            const response = await fetch(endpoint, { 
+              timeout: 10000,
+              headers: { 'User-Agent': 'Mozilla/5.0' }
+            });
+            if (response.ok) {
+              const data = await response.json();
+              const features = data.features || data.cameraData || data || [];
+              
+              if (features.length > 0) {
+                // Filter to Minneapolis metro area
+                const mplsLat = 44.9778, mplsLng = -93.2650, radiusMiles = 30;
+                
+                cameras = features
+                  .filter(cam => {
+                    const lat = cam.geometry?.coordinates?.[1] || cam.attributes?.LAT || cam.latitude || cam.lat;
+                    const lng = cam.geometry?.coordinates?.[0] || cam.attributes?.LONG || cam.longitude || cam.lng;
+                    if (!lat || !lng) return false;
+                    const distance = Math.sqrt(Math.pow(lat - mplsLat, 2) + Math.pow(lng - mplsLng, 2)) * 69;
+                    return distance < radiusMiles;
+                  })
+                  .map(cam => {
+                    const id = cam.attributes?.DEVICEID || cam.properties?.id || cam.id || `mpls-${Math.random().toString(36).substr(2, 6)}`;
+                    const lat = cam.geometry?.coordinates?.[1] || cam.attributes?.LAT || cam.latitude;
+                    const lng = cam.geometry?.coordinates?.[0] || cam.attributes?.LONG || cam.longitude;
+                    const name = cam.attributes?.DESCRIPTION || cam.properties?.description || cam.properties?.name || cam.name || 'MnDOT Camera';
+                    const imageUrl = cam.attributes?.IMAGEURL || cam.properties?.imageUrl || `https://video.dot.state.mn.us/public/${id}.jpg`;
+                    
+                    return {
+                      id,
+                      location: name,
+                      lat,
+                      lng,
+                      area: 'Minneapolis',
+                      imageUrl,
+                      isOnline: true,
+                      city: 'mpls'
+                    };
+                  });
+                
+                if (cameras.length > 0) {
+                  console.log(`[${city.shortName}] Loaded ${cameras.length} cameras from ${endpoint.split('/')[2]}`);
+                  break;
+                }
+              }
+            }
+          } catch (e) {
+            // Try next endpoint
+          }
+        }
+        
+        if (cameras.length > 0) {
+          cityState[cityId].cameras = cameras;
+        } else {
+          throw new Error('No cameras from any endpoint');
+        }
         
         console.log(`[${city.shortName}] Loaded ${cityState[cityId].cameras.length} traffic cameras`);
       } catch (e) {
-        console.log(`[${city.shortName}] MnDOT API error, using fallback cameras`);
-        // Fallback Minneapolis cameras at major intersections
+        console.log(`[${city.shortName}] MnDOT API error, using expanded fallback cameras`);
+        // Expanded fallback Minneapolis cameras at major intersections and highways
         cityState[cityId].cameras = [
-          { id: 'mpls-1', location: 'Hennepin Ave & Lake St', lat: 44.9486, lng: -93.2984, area: 'Uptown', city: 'mpls' },
-          { id: 'mpls-2', location: 'Nicollet Mall & 7th St', lat: 44.9778, lng: -93.2712, area: 'Downtown', city: 'mpls' },
-          { id: 'mpls-3', location: 'Washington Ave & 35W', lat: 44.9738, lng: -93.2590, area: 'Downtown', city: 'mpls' },
-          { id: 'mpls-4', location: 'Lake St & Chicago Ave', lat: 44.9486, lng: -93.2614, area: 'South', city: 'mpls' },
-          { id: 'mpls-5', location: 'Broadway & Washington', lat: 44.9958, lng: -93.2794, area: 'North', city: 'mpls' },
-          { id: 'mpls-6', location: 'Franklin Ave & Lyndale', lat: 44.9625, lng: -93.2878, area: 'Whittier', city: 'mpls' },
-          { id: 'mpls-7', location: 'University Ave & Central', lat: 44.9700, lng: -93.2473, area: 'Northeast', city: 'mpls' },
+          // Downtown
+          { id: 'mpls-1', location: 'I-94 & Hennepin Ave', lat: 44.9738, lng: -93.2780, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6560.jpg' },
+          { id: 'mpls-2', location: 'I-35W & Washington Ave', lat: 44.9738, lng: -93.2590, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6545.jpg' },
+          { id: 'mpls-3', location: 'Nicollet Mall & 7th St', lat: 44.9778, lng: -93.2712, area: 'Downtown', city: 'mpls' },
+          { id: 'mpls-4', location: 'I-394 & Dunwoody Blvd', lat: 44.9697, lng: -93.2898, area: 'Downtown', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6505.jpg' },
+          // Uptown / South
+          { id: 'mpls-5', location: 'Hennepin Ave & Lake St', lat: 44.9486, lng: -93.2984, area: 'Uptown', city: 'mpls' },
+          { id: 'mpls-6', location: 'Lake St & Chicago Ave', lat: 44.9486, lng: -93.2614, area: 'South', city: 'mpls' },
+          { id: 'mpls-7', location: 'I-35W & Lake St', lat: 44.9486, lng: -93.2505, area: 'South', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6530.jpg' },
           { id: 'mpls-8', location: '38th St & Chicago Ave', lat: 44.9341, lng: -93.2614, area: 'South', city: 'mpls' },
+          { id: 'mpls-9', location: 'I-35W & 46th St', lat: 44.9220, lng: -93.2505, area: 'South', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6520.jpg' },
+          // North
+          { id: 'mpls-10', location: 'I-94 & Dowling Ave N', lat: 45.0150, lng: -93.2850, area: 'North', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6580.jpg' },
+          { id: 'mpls-11', location: 'Broadway & Washington Ave N', lat: 44.9958, lng: -93.2794, area: 'North', city: 'mpls' },
+          { id: 'mpls-12', location: 'I-94 & Humboldt Ave', lat: 45.0020, lng: -93.2980, area: 'North', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6575.jpg' },
+          // Northeast
+          { id: 'mpls-13', location: 'University Ave & Central Ave', lat: 44.9700, lng: -93.2473, area: 'Northeast', city: 'mpls' },
+          { id: 'mpls-14', location: 'I-35W & Stinson Blvd', lat: 45.0100, lng: -93.2350, area: 'Northeast', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6600.jpg' },
+          // Southwest / Whittier
+          { id: 'mpls-15', location: 'Franklin Ave & Lyndale Ave', lat: 44.9625, lng: -93.2878, area: 'Whittier', city: 'mpls' },
+          { id: 'mpls-16', location: 'I-35W & Franklin Ave', lat: 44.9625, lng: -93.2505, area: 'Whittier', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6540.jpg' },
+          // Highways - I-494/I-694 metro ring
+          { id: 'mpls-17', location: 'I-494 & France Ave', lat: 44.8650, lng: -93.3340, area: 'Bloomington', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6400.jpg' },
+          { id: 'mpls-18', location: 'I-94 & Snelling Ave (St Paul)', lat: 44.9550, lng: -93.1670, area: 'St Paul', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6650.jpg' },
+          { id: 'mpls-19', location: 'I-35E & Maryland Ave (St Paul)', lat: 44.9780, lng: -93.0920, area: 'St Paul', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6700.jpg' },
+          { id: 'mpls-20', location: 'I-694 & Rice St', lat: 45.0650, lng: -93.1050, area: 'Roseville', city: 'mpls', imageUrl: 'https://video.dot.state.mn.us/public/D6750.jpg' },
         ];
         console.log(`[${city.shortName}] Using ${cityState[cityId].cameras.length} fallback cameras`);
       }
@@ -1710,13 +1769,23 @@ function broadcast(data) {
 const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
+// NYC Feeds
 const NYPD_FEEDS = [
-  // These are verified working Broadcastify feed IDs
-  { id: '40184', name: 'NYPD Citywide 1' },
-  { id: '40185', name: 'NYPD Citywide 2' },
-  { id: '40186', name: 'NYPD Citywide 3' },
-  { id: '32119', name: 'NYPD Dispatch Citywide' },
+  { id: '40184', name: 'NYPD Citywide 1', city: 'nyc' },
+  { id: '40185', name: 'NYPD Citywide 2', city: 'nyc' },
+  { id: '40186', name: 'NYPD Citywide 3', city: 'nyc' },
+  { id: '32119', name: 'NYPD Dispatch Citywide', city: 'nyc' },
 ];
+
+// Minneapolis Feeds
+const MPLS_FEEDS = [
+  { id: '13544', name: 'Minneapolis Police', city: 'mpls' },
+  { id: '26049', name: 'Hennepin County Sheriff', city: 'mpls' },
+  { id: '741', name: 'Minneapolis Fire Dispatch', city: 'mpls' },
+];
+
+// Combined feeds for multi-city streaming
+const ALL_FEEDS = [...NYPD_FEEDS, ...MPLS_FEEDS];
 
 // Run 4 streams simultaneously for 4x the coverage
 const MAX_CONCURRENT_STREAMS = 4;
@@ -1724,60 +1793,65 @@ let activeStreams = new Map();
 let streamStats = {};
 
 // ============================================
-// OPENMHZ - CORRECT API FORMAT + SOCKET.IO
+// OPENMHZ - MULTI-CITY SUPPORT
 // ============================================
-const OPENMHZ_SYSTEM = 'nypd'; // Correct system name from openmhz.com/system/nypd
+const OPENMHZ_SYSTEMS = {
+  nyc: { system: 'nypd', name: 'NYPD' },
+  mpls: { system: 'mnhennco', name: 'Hennepin County' }
+};
 const OPENMHZ_POLL_INTERVAL = 20000;
-// Time format is weird: Unix seconds + 3 decimal places as integer
-// e.g., 1609533015.681 becomes 1609533015681
-let lastOpenMHzTime = Date.now() - (5 * 60 * 1000); // Start 5 min ago to catch recent calls 
-let openMHzStats = { callsFetched: 0, callsProcessed: 0, lastPoll: null, errors: 0, disabled: false, method: null };
 
-// Socket.IO for real-time (preferred method)
+// Per-city OpenMHz state
+const openMHzState = {
+  nyc: { lastTime: Date.now() - (5 * 60 * 1000), stats: { callsFetched: 0, callsProcessed: 0, lastPoll: null, errors: 0, disabled: false, method: null } },
+  mpls: { lastTime: Date.now() - (5 * 60 * 1000), stats: { callsFetched: 0, callsProcessed: 0, lastPoll: null, errors: 0, disabled: false, method: null } }
+};
+
+// Legacy reference for backwards compatibility
+let lastOpenMHzTime = Date.now() - (5 * 60 * 1000);
+let openMHzStats = openMHzState.nyc.stats;
+
+// Socket.IO for real-time (preferred method) - tries both cities
 async function startOpenMHzSocketIO() {
   try {
-    // Dynamic import socket.io-client
     const { io } = await import('socket.io-client');
     
-    console.log('[OPENMHZ] Connecting via Socket.IO...');
-    
-    const socket = io('https://api.openmhz.com', {
-      transports: ['websocket', 'polling'],
-      reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 5000
-    });
-    
-    socket.on('connect', () => {
-      console.log('[OPENMHZ] ✓ Socket.IO connected!');
-      openMHzStats.method = 'socketio';
-      // Subscribe to NYC system
-      socket.emit('subscribe', { system: OPENMHZ_SYSTEM });
-    });
-    
-    socket.on('new message', async (call) => {
-      // The NYPD system only has NYPD calls, no need to filter
-      openMHzStats.callsFetched++;
-      const tg = call.talkgroupNum || call.talkgroup || 'unknown';
-      console.log(`[OPENMHZ] Real-time call: TG ${tg}`);
+    for (const [cityId, config] of Object.entries(OPENMHZ_SYSTEMS)) {
+      console.log(`[OPENMHZ-${cityId.toUpperCase()}] Connecting via Socket.IO...`);
       
-      if (call.url) {
-        processOpenMHzCall(call);
-      }
-    });
-    
-    socket.on('disconnect', (reason) => {
-      console.log('[OPENMHZ] Socket.IO disconnected:', reason);
-    });
-    
-    socket.on('connect_error', (error) => {
-      console.log('[OPENMHZ] Socket.IO error, falling back to polling:', error.message);
-      openMHzStats.errors++;
-      socket.disconnect();
-      // Fallback to polling
-      startOpenMHzPolling();
-    });
-    
+      const socket = io('https://api.openmhz.com', {
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+        reconnectionAttempts: 3,
+        reconnectionDelay: 5000
+      });
+      
+      socket.on('connect', () => {
+        console.log(`[OPENMHZ-${cityId.toUpperCase()}] ✓ Socket.IO connected!`);
+        openMHzState[cityId].stats.method = 'socketio';
+        socket.emit('subscribe', { system: config.system });
+      });
+      
+      socket.on('new message', async (call) => {
+        openMHzState[cityId].stats.callsFetched++;
+        const tg = call.talkgroupNum || call.talkgroup || 'unknown';
+        console.log(`[OPENMHZ-${cityId.toUpperCase()}] Real-time call: TG ${tg}`);
+        
+        if (call.url) {
+          processOpenMHzCall(call, cityId);
+        }
+      });
+      
+      socket.on('disconnect', (reason) => {
+        console.log(`[OPENMHZ-${cityId.toUpperCase()}] Socket.IO disconnected:`, reason);
+      });
+      
+      socket.on('connect_error', (error) => {
+        console.log(`[OPENMHZ-${cityId.toUpperCase()}] Socket.IO error:`, error.message);
+        openMHzState[cityId].stats.errors++;
+        socket.disconnect();
+      });
+    }
   } catch (error) {
     console.log('[OPENMHZ] Socket.IO not available, using polling');
     startOpenMHzPolling();
@@ -1785,27 +1859,32 @@ async function startOpenMHzSocketIO() {
 }
 
 async function startOpenMHzPolling() {
-  console.log('[OPENMHZ] Starting polling mode...');
+  console.log('[OPENMHZ] Starting polling mode for all cities...');
+  
+  // Poll each city's system
+  for (const [cityId, config] of Object.entries(OPENMHZ_SYSTEMS)) {
+    startCityPolling(cityId, config);
+  }
+}
+
+async function startCityPolling(cityId, config) {
   let consecutiveErrors = 0;
+  const state = openMHzState[cityId];
   
   async function pollCalls() {
-    if (openMHzStats.disabled) return;
+    if (state.stats.disabled) return;
     
     try {
-      // OpenMHz time format: Unix ms but as string with no decimal
-      const timeParam = lastOpenMHzTime;
+      const timeParam = state.lastTime;
+      const url = `https://api.openmhz.com/${config.system}/calls/newer?time=${timeParam}`;
       
-      // Try the /calls/newer endpoint with correct format
-      const url = `https://api.openmhz.com/${OPENMHZ_SYSTEM}/calls/newer?time=${timeParam}`;
-      
-      // Log first poll URL for debugging
-      if (!openMHzStats.method) {
-        console.log(`[OPENMHZ] Polling: ${url}`);
+      if (!state.stats.method) {
+        console.log(`[OPENMHZ-${cityId.toUpperCase()}] Polling: ${url}`);
       }
       
       const response = await fetch(url, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
           'Accept': 'application/json',
           'Origin': 'https://openmhz.com',
           'Referer': 'https://openmhz.com/'
@@ -1814,55 +1893,51 @@ async function startOpenMHzPolling() {
       
       if (!response.ok) {
         consecutiveErrors++;
-        openMHzStats.errors++;
+        state.stats.errors++;
         
-        // Log first few errors for debugging
         if (consecutiveErrors <= 3) {
-          console.log(`[OPENMHZ] API error ${response.status}: ${response.statusText}`);
+          console.log(`[OPENMHZ-${cityId.toUpperCase()}] API error ${response.status}: ${response.statusText}`);
         }
         
-        if (consecutiveErrors >= 5 && !openMHzStats.disabled) {
-          console.log(`[OPENMHZ] API unavailable (${response.status}) - disabled`);
-          openMHzStats.disabled = true;
+        if (consecutiveErrors >= 5 && !state.stats.disabled) {
+          console.log(`[OPENMHZ-${cityId.toUpperCase()}] API unavailable - disabled`);
+          state.stats.disabled = true;
         }
         return;
       }
       
-      if (!openMHzStats.method) {
-        console.log('[OPENMHZ] ✓ Connected via polling');
-        openMHzStats.method = 'polling';
+      if (!state.stats.method) {
+        console.log(`[OPENMHZ-${cityId.toUpperCase()}] ✓ Connected via polling`);
+        state.stats.method = 'polling';
       }
       
       consecutiveErrors = 0;
       const data = await response.json();
       
-      openMHzStats.lastPoll = new Date().toISOString();
+      state.stats.lastPoll = new Date().toISOString();
       
-      // Process all calls from the NYPD system
       const calls = Array.isArray(data.calls || data) ? (data.calls || data) : [];
       
-      // Log poll result
-      if (openMHzStats.callsFetched === 0 && calls.length === 0) {
-        console.log(`[OPENMHZ] Polling... (waiting for new calls)`);
+      if (state.stats.callsFetched === 0 && calls.length === 0) {
+        console.log(`[OPENMHZ-${cityId.toUpperCase()}] Polling... (waiting for new calls)`);
       }
       
       if (calls.length > 0) {
-        console.log(`[OPENMHZ] Processing ${calls.length} NYPD calls`);
-        openMHzStats.callsFetched += calls.length;
+        console.log(`[OPENMHZ-${cityId.toUpperCase()}] Processing ${calls.length} calls`);
+        state.stats.callsFetched += calls.length;
         
         for (const call of calls.slice(0, 10)) {
-          // Update time tracker
           const callTime = new Date(call.time).getTime();
-          if (callTime > lastOpenMHzTime) lastOpenMHzTime = callTime;
+          if (callTime > state.lastTime) state.lastTime = callTime;
           
-          if (call.url) processOpenMHzCall(call);
+          if (call.url) processOpenMHzCall(call, cityId);
         }
       }
     } catch (error) {
       consecutiveErrors++;
-      openMHzStats.errors++;
+      state.stats.errors++;
       if (consecutiveErrors < 3) {
-        console.error('[OPENMHZ] Poll error:', error.message);
+        console.error(`[OPENMHZ-${cityId.toUpperCase()}] Poll error:`, error.message);
       }
     }
   }
@@ -1871,7 +1946,7 @@ async function startOpenMHzPolling() {
   setInterval(pollCalls, OPENMHZ_POLL_INTERVAL);
 }
 
-async function processOpenMHzCall(call) {
+async function processOpenMHzCall(call, cityId = 'nyc') {
   try {
     const audioResponse = await fetch(call.url);
     if (!audioResponse.ok) return;
@@ -1885,45 +1960,62 @@ async function processOpenMHzCall(call) {
     
     if (lower.length < 15 || lower.includes('fema.gov') || lower.includes('broadcastify')) return;
     
-    openMHzStats.callsProcessed++;
+    openMHzState[cityId].stats.callsProcessed++;
     
     const talkgroupName = call.talkgroupDescription || call.talkgroupTag || `TG ${call.talkgroupNum}`;
-    console.log(`[OPENMHZ] (${talkgroupName}): "${clean.substring(0, 80)}..."`);
+    console.log(`[OPENMHZ-${cityId.toUpperCase()}] (${talkgroupName}): "${clean.substring(0, 80)}..."`);
     
     const transcriptEntry = { 
       text: clean, 
       source: `OpenMHz: ${talkgroupName}`,
       talkgroup: call.talkgroupNum,
+      city: cityId,
       timestamp: call.time || new Date().toISOString()
     };
-    recentTranscripts.unshift(transcriptEntry);
-    if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
     
-    broadcast({ type: "transcript", ...transcriptEntry });
+    // Store in city-specific state
+    const state = cityState[cityId];
+    state.recentTranscripts.unshift(transcriptEntry);
+    if (state.recentTranscripts.length > MAX_TRANSCRIPTS) state.recentTranscripts.pop();
     
-    const parsed = await parseTranscript(clean);
+    // Also store in global for backwards compatibility (NYC only)
+    if (cityId === 'nyc') {
+      recentTranscripts.unshift(transcriptEntry);
+      if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
+    }
+    
+    broadcastToCity(cityId, { type: "transcript", ...transcriptEntry });
+    
+    const parsed = await parseTranscriptForCity(clean, cityId);
     
     if (parsed.hasIncident) {
-      incidentId++;
-      const camera = findNearestCamera(parsed.location, null, null, parsed.borough);
+      state.incidentId++;
+      const camera = findNearestCameraForCity(parsed.location, parsed.borough, cityId);
       
       const incident = {
-        id: incidentId, ...parsed, transcript: clean,
+        id: state.incidentId, ...parsed, transcript: clean,
         source: `OpenMHz: ${talkgroupName}`, camera,
         lat: camera?.lat, lng: camera?.lng,
+        city: cityId,
         timestamp: call.time || new Date().toISOString()
       };
       
-      incidents.unshift(incident);
-      if (incidents.length > 50) incidents.pop();
+      state.incidents.unshift(incident);
+      if (state.incidents.length > 50) state.incidents.pop();
       
-      detectiveBureau.processIncident(incident, broadcast);
-      checkBetsForIncident(incident);
+      // Also store in global for backwards compatibility (NYC only)
+      if (cityId === 'nyc') {
+        incidents.unshift(incident);
+        if (incidents.length > 50) incidents.pop();
+      }
       
-      broadcast({ type: "incident", incident });
-      if (camera) broadcast({ type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}` });
+      detectiveBureau.processIncident(incident, (data) => broadcastToCity(cityId, data));
+      if (cityId === 'nyc') checkBetsForIncident(incident);
       
-      console.log('[OPENMHZ INCIDENT]', incident.incidentType, '@', incident.location, `(${incident.borough})`);
+      broadcastToCity(cityId, { type: "incident", incident });
+      if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}` });
+      
+      console.log(`[OPENMHZ-${cityId.toUpperCase()} INCIDENT]`, incident.incidentType, '@', incident.location, `(${incident.borough})`);
     }
   } catch (error) { /* silent */ }
 }
@@ -2059,24 +2151,29 @@ function handleMultiStream(stream, feed) {
 function startNextAvailableFeed() {
   if (activeStreams.size >= MAX_CONCURRENT_STREAMS) return;
   
-  const availableFeeds = NYPD_FEEDS.filter(f => !activeStreams.has(f.id));
+  // Prefer NYC feeds first, then Minneapolis
+  const availableFeeds = ALL_FEEDS.filter(f => !activeStreams.has(f.id));
   if (availableFeeds.length === 0) return;
   
   connectToFeed(availableFeeds[0]);
 }
 
-// Start multiple streams
+// Start multiple streams for both cities
 function startMultiStreamBroadcastify() {
   if (!BROADCASTIFY_PASSWORD) { 
     console.log('[MULTI-STREAM] BROADCASTIFY_PASSWORD not set'); 
     return; 
   }
   
-  console.log(`[MULTI-STREAM] Starting ${MAX_CONCURRENT_STREAMS} simultaneous feeds...`);
+  console.log(`[MULTI-STREAM] Starting ${MAX_CONCURRENT_STREAMS} simultaneous feeds (NYC + MPLS)...`);
   console.log(`[MULTI-STREAM] Auth: ${BROADCASTIFY_USERNAME} / ${'*'.repeat(BROADCASTIFY_PASSWORD.length)}`);
   
-  // Connect to first N feeds
-  const initialFeeds = NYPD_FEEDS.slice(0, MAX_CONCURRENT_STREAMS);
+  // Balance between NYC and Minneapolis - 3 NYC, 1 MPLS
+  const initialFeeds = [
+    ...NYPD_FEEDS.slice(0, 3),  // 3 NYC feeds
+    ...MPLS_FEEDS.slice(0, 1),  // 1 Minneapolis feed
+  ].slice(0, MAX_CONCURRENT_STREAMS);
+  
   initialFeeds.forEach((feed, i) => {
     setTimeout(() => connectToFeed(feed), i * 2000); // Stagger connections
   });
@@ -2224,6 +2321,112 @@ function findNearestCamera(location, lat, lng, borough) {
   return searchCameras[Math.floor(Math.random() * searchCameras.length)];
 }
 
+// City-specific camera lookup
+function findNearestCameraForCity(location, borough, cityId) {
+  const cityCameras = cityState[cityId]?.cameras || [];
+  if (cityCameras.length === 0) return null;
+  
+  let searchCameras = cityCameras;
+  
+  // Filter by area/district
+  if (borough && borough !== 'Unknown') {
+    const areaCameras = cityCameras.filter(cam => 
+      cam.area?.toLowerCase().includes(borough.toLowerCase())
+    );
+    if (areaCameras.length > 0) searchCameras = areaCameras;
+  }
+  
+  // Try to match by location string
+  if (location && location !== 'Unknown') {
+    const locationLower = location.toLowerCase();
+    const matchingCameras = searchCameras.filter(cam => {
+      const camLocation = cam.location?.toLowerCase() || '';
+      const locationWords = locationLower.split(/[\s&@]+/).filter(w => w.length > 2);
+      return locationWords.some(word => camLocation.includes(word));
+    });
+    
+    if (matchingCameras.length > 0) {
+      return matchingCameras[Math.floor(Math.random() * matchingCameras.length)];
+    }
+  }
+  
+  return searchCameras[Math.floor(Math.random() * searchCameras.length)];
+}
+
+// City-specific transcript parsing
+async function parseTranscriptForCity(transcript, cityId) {
+  if (cityId === 'mpls') {
+    return parseTranscriptMPLS(transcript);
+  }
+  return parseTranscript(transcript);
+}
+
+// Minneapolis-specific transcript parsing
+async function parseTranscriptMPLS(transcript) {
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 800,
+      system: `You are an expert Minneapolis/Hennepin County police radio parser. Your PRIMARY job is to extract LOCATION information.
+
+MINNEAPOLIS LOCATION EXTRACTION RULES:
+1. Look for street addresses: "123 Lake Street" → location: "123 Lake St"
+2. Look for intersections: "Hennepin and Lake", "Franklin and Lyndale" → location: "Hennepin Ave & Lake St"
+3. Look for landmarks: "Target Center", "US Bank Stadium", "Mall of America", "Nicollet Mall"
+4. Look for highways: "I-35W", "I-94", "I-494", "Highway 55"
+5. Look for neighborhoods: Uptown, Downtown, North Minneapolis, Northeast, Phillips, Powderhorn
+
+MINNEAPOLIS PRECINCTS:
+- 1st Precinct: Downtown, North Loop
+- 2nd Precinct: Northeast Minneapolis  
+- 3rd Precinct: South Minneapolis (Lake St, Powderhorn, Longfellow)
+- 4th Precinct: North Minneapolis
+- 5th Precinct: Southwest Minneapolis (Uptown, Calhoun, Lyndale)
+
+COMMON MINNEAPOLIS STREETS:
+- Hennepin Avenue, Lyndale Avenue, Nicollet Avenue, Lake Street, Franklin Avenue
+- Broadway, Washington Avenue, University Avenue, Central Avenue
+- 35th St, 38th St, 46th St, 50th St, Chicago Avenue, Portland Avenue
+
+If NO location can be determined, set location to null.
+
+INCIDENT TYPE MAPPING:
+- Code 3: Emergency response
+- Shots fired, shooting → Shots Fired
+- Domestic, DV → Domestic
+- Robbery, theft → Robbery/Theft
+- Assault, fight → Assault
+- EDP, mental health → Mental Health Crisis
+
+Respond ONLY with valid JSON:
+{
+  "hasIncident": boolean,
+  "incidentType": "string describing incident",
+  "location": "specific location or null if none found",
+  "borough": "Downtown/North/Northeast/South/Southwest/Uptown/Unknown",
+  "units": ["unit IDs mentioned"],
+  "priority": "CRITICAL/HIGH/MEDIUM/LOW",
+  "summary": "brief summary",
+  "precinctMentioned": "number or null"
+}`,
+      messages: [{ role: "user", content: `Parse this Minneapolis police radio transmission and extract any location information:\n\n"${transcript}"` }]
+    });
+    
+    const text = response.content[0].text;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (parsed.location === null) parsed.location = 'Unknown';
+      return parsed;
+    }
+    return { hasIncident: false };
+  } catch (error) {
+    console.error('[PARSE-MPLS] Error:', error.message);
+    return { hasIncident: false };
+  }
+}
+
 async function processAudioFromStream(buffer, feedName, feedId = null) {
   if (buffer.length < 5000) {
     scannerStats.filteredSmallBuffer = (scannerStats.filteredSmallBuffer || 0) + 1;
@@ -2314,32 +2517,43 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
   scannerStats.lastTranscript = clean.substring(0, 200);
   scannerStats.successfulTranscripts++;
   
+  // Determine which city this feed belongs to
+  const feed = ALL_FEEDS.find(f => f.id === feedId);
+  const cityId = feed?.city || 'nyc';
+  const state = cityState[cityId];
+  
   // Track per-feed stats
   if (feedId && scannerStats.feedStats[feedId]) {
     scannerStats.feedStats[feedId].transcripts = (scannerStats.feedStats[feedId].transcripts || 0) + 1;
   }
   
-  const transcriptEntry = { text: clean, source: feedName, timestamp: new Date().toISOString() };
-  recentTranscripts.unshift(transcriptEntry);
-  if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
+  const transcriptEntry = { text: clean, source: feedName, city: cityId, timestamp: new Date().toISOString() };
   
-  // Sync with cityState for multi-city WebSocket
-  cityState['nyc'].recentTranscripts = recentTranscripts;
+  // Store in city-specific state
+  state.recentTranscripts.unshift(transcriptEntry);
+  if (state.recentTranscripts.length > MAX_TRANSCRIPTS) state.recentTranscripts.pop();
   
-  broadcast({ type: "transcript", ...transcriptEntry });
+  // Also store in global for backwards compatibility (NYC only)
+  if (cityId === 'nyc') {
+    recentTranscripts.unshift(transcriptEntry);
+    if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
+  }
   
-  const parsed = await parseTranscript(clean);
+  broadcastToCity(cityId, { type: "transcript", ...transcriptEntry });
+  
+  // Use city-specific parsing
+  const parsed = await parseTranscriptForCity(clean, cityId);
   
   if (parsed.hasIncident) {
-    incidentId++;
-    const camera = findNearestCamera(parsed.location, null, null, parsed.borough);
+    state.incidentId++;
+    const camera = findNearestCameraForCity(parsed.location, parsed.borough, cityId);
     
-    const audioId = `audio_${incidentId}_${Date.now()}`;
+    const audioId = `audio_${cityId}_${state.incidentId}_${Date.now()}`;
     audioClips.set(audioId, buffer);
     if (audioClips.size > MAX_AUDIO_CLIPS) audioClips.delete(audioClips.keys().next().value);
     
     const incident = {
-      id: incidentId,
+      id: state.incidentId,
       ...parsed,
       transcript: clean,
       audioUrl: `/audio/${audioId}`,
@@ -2347,15 +2561,18 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
       lat: camera?.lat,
       lng: camera?.lng,
       source: feedName,
+      city: cityId,
       timestamp: new Date().toISOString()
     };
     
-    incidents.unshift(incident);
-    if (incidents.length > 50) incidents.pop();
+    state.incidents.unshift(incident);
+    if (state.incidents.length > 50) state.incidents.pop();
     
-    // Also store in cityState for multi-city WebSocket
-    cityState['nyc'].incidents = incidents;
-    cityState['nyc'].recentTranscripts = recentTranscripts;
+    // Also store in global for backwards compatibility (NYC only)
+    if (cityId === 'nyc') {
+      incidents.unshift(incident);
+      if (incidents.length > 50) incidents.pop();
+    }
     
     // Track per-feed incidents
     if (feedId && scannerStats.feedStats[feedId]) {
@@ -2363,21 +2580,22 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     }
     
     // Process through Detective Bureau
-    detectiveBureau.processIncident(incident, broadcast);
+    detectiveBureau.processIncident(incident, (data) => broadcastToCity(cityId, data));
     
-    // Check bets
-    checkBetsForIncident(incident);
+    // Check bets (NYC only for now)
+    if (cityId === 'nyc') checkBetsForIncident(incident);
     
-    broadcast({ type: "incident", incident });
-    if (camera) broadcast({ type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}`, priority: parsed.priority });
+    broadcastToCity(cityId, { type: "incident", incident });
+    if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}`, priority: parsed.priority });
     
-    console.log(`[${feedName}] 🚨 INCIDENT: ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
+    console.log(`[${feedName}] 🚨 INCIDENT (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
   } else {
     // Broadcast as monitoring even if no incident detected
-    broadcast({
+    broadcastToCity(cityId, {
       type: "analysis",
       text: `[MONITORING] ${clean.substring(0, 100)}...`,
       location: 'Unknown',
+      city: cityId,
       timestamp: new Date().toISOString()
     });
   }
