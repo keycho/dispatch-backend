@@ -893,7 +893,11 @@ let facilityIntelligence = {
   population: {
     lastFetch: null,
     current: 0,
+    previous: 0,
+    change: 0,
     trend: 'stable', // increasing, decreasing, stable
+    dataDate: null,
+    ada: 0,
     history: [] // last 30 days
   },
   discharges: {
@@ -928,6 +932,7 @@ let facilityIntelligence = {
     lastFetch: null,
     byPrecinct: {},
     total7d: 0,
+    recentArrests: [],
     trend: 'stable'
   }
 };
@@ -1210,40 +1215,40 @@ function getFacilityStatus() {
     
     // Population
     population: {
-      current: facilityIntelligence.population.current,
-      change: facilityIntelligence.population.change,
-      trend: facilityIntelligence.population.trend,
-      dataDate: facilityIntelligence.population.dataDate
+      current: facilityIntelligence.population?.current || 0,
+      change: facilityIntelligence.population?.change || 0,
+      trend: facilityIntelligence.population?.trend || 'stable',
+      dataDate: facilityIntelligence.population?.dataDate || null
     },
     
     // Discharges
     discharges: {
-      estimatedToday: facilityIntelligence.discharges.today,
-      dayAverage: facilityIntelligence.discharges.byDayOfWeek[dayOfWeek],
-      weekdayPattern: facilityIntelligence.discharges.byDayOfWeek,
+      estimatedToday: facilityIntelligence.discharges?.today || 0,
+      dayAverage: facilityIntelligence.discharges?.byDayOfWeek?.[dayOfWeek] || 100,
+      weekdayPattern: facilityIntelligence.discharges?.byDayOfWeek || {},
       note: dayOfWeek === 'Fri' ? 'Fridays typically have highest releases' : null
     },
     
     // Q100 Bus
     q100: {
       nextBuses,
-      nextBusIn: nextBuses[0]?.minutesUntil + ' min',
-      isPeakTime: nextBuses[0]?.isPeak,
+      nextBusIn: nextBuses[0]?.minutesUntil ? nextBuses[0].minutesUntil + ' min' : 'Unknown',
+      isPeakTime: nextBuses[0]?.isPeak || false,
       note: 'Q100 is the only public transit to/from Rikers Island'
     },
     
     // 311 Activity
     complaints311: {
-      total24h: facilityIntelligence.complaints311.total24h,
-      nearRikers: facilityIntelligence.complaints311.nearRikers.length,
-      nearTombs: facilityIntelligence.complaints311.nearTombs.length,
-      nearBrooklyn: facilityIntelligence.complaints311.nearBrooklyn.length,
+      total24h: facilityIntelligence.complaints311?.total24h || 0,
+      nearRikers: facilityIntelligence.complaints311?.nearRikers?.length || 0,
+      nearTombs: facilityIntelligence.complaints311?.nearTombs?.length || 0,
+      nearBrooklyn: facilityIntelligence.complaints311?.nearBrooklyn?.length || 0,
       topTypes: getTop311Types()
     },
     
     // Recent arrests (pipeline to facilities)
     arrests: {
-      recent7d: facilityIntelligence.arrests.total7d,
+      recent7d: facilityIntelligence.arrests?.total7d || 0,
       topPrecincts: getTopPrecincts(),
       note: 'Arrests flow into facility intake within 24-48 hours'
     }
@@ -1251,29 +1256,39 @@ function getFacilityStatus() {
 }
 
 function getTop311Types() {
-  const allComplaints = [
-    ...facilityIntelligence.complaints311.nearRikers,
-    ...facilityIntelligence.complaints311.nearTombs,
-    ...facilityIntelligence.complaints311.nearBrooklyn
-  ];
-  
-  const types = {};
-  allComplaints.forEach(c => {
-    types[c.type] = (types[c.type] || 0) + 1;
-  });
-  
-  return Object.entries(types)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([type, count]) => ({ type, count }));
+  try {
+    const allComplaints = [
+      ...(facilityIntelligence.complaints311?.nearRikers || []),
+      ...(facilityIntelligence.complaints311?.nearTombs || []),
+      ...(facilityIntelligence.complaints311?.nearBrooklyn || [])
+    ];
+    
+    const types = {};
+    allComplaints.forEach(c => {
+      if (c && c.type) {
+        types[c.type] = (types[c.type] || 0) + 1;
+      }
+    });
+    
+    return Object.entries(types)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([type, count]) => ({ type, count }));
+  } catch (e) {
+    return [];
+  }
 }
 
 function getTopPrecincts() {
-  const precincts = facilityIntelligence.arrests.byPrecinct || {};
-  return Object.entries(precincts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([precinct, count]) => ({ precinct, count }));
+  try {
+    const precincts = facilityIntelligence.arrests?.byPrecinct || {};
+    return Object.entries(precincts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([precinct, count]) => ({ precinct, count }));
+  } catch (e) {
+    return [];
+  }
 }
 
 // Population data storage (keep for backwards compatibility)
@@ -1353,14 +1368,27 @@ function getFacilityContext(incident) {
 async function startFacilityFetching() {
   console.log('[FACILITIES] Starting comprehensive facility data fetching...');
   
-  // Initial fetches
-  await fetchFacilityPopulation();
-  syncFacilityPopulation();
+  // Initial fetches - wrapped in try-catch to prevent crashes
+  try {
+    await fetchFacilityPopulation();
+    syncFacilityPopulation();
+  } catch (e) {
+    console.error('[FACILITIES] Population fetch failed:', e.message);
+  }
   
-  await fetch311NearFacilities();
-  await fetchArrestData();
+  try {
+    await fetch311NearFacilities();
+  } catch (e) {
+    console.error('[FACILITIES] 311 fetch failed:', e.message);
+  }
   
-  // Update Q100 bus schedule
+  try {
+    await fetchArrestData();
+  } catch (e) {
+    console.error('[FACILITIES] Arrest fetch failed:', e.message);
+  }
+  
+  // Update Q100 bus schedule (local calculation, won't fail)
   facilityIntelligence.q100.schedule = getNextQ100Buses(10);
   facilityIntelligence.q100.nextBus = facilityIntelligence.q100.schedule[0];
   facilityIntelligence.q100.lastFetch = new Date().toISOString();
@@ -1368,19 +1396,7 @@ async function startFacilityFetching() {
   console.log('[FACILITIES] Initial data fetch complete');
   
   // Broadcast comprehensive update
-  broadcast({
-    type: 'facility_update',
-    facilities: NYC_CORRECTIONAL_FACILITIES,
-    population: facilityPopulation,
-    intelligence: getFacilityStatus(),
-    timestamp: new Date().toISOString()
-  });
-  
-  // Fetch population every 30 minutes
-  setInterval(async () => {
-    await fetchFacilityPopulation();
-    syncFacilityPopulation();
-    
+  try {
     broadcast({
       type: 'facility_update',
       facilities: NYC_CORRECTIONAL_FACILITIES,
@@ -1388,16 +1404,44 @@ async function startFacilityFetching() {
       intelligence: getFacilityStatus(),
       timestamp: new Date().toISOString()
     });
+  } catch (e) {
+    console.error('[FACILITIES] Broadcast failed:', e.message);
+  }
+  
+  // Fetch population every 30 minutes
+  setInterval(async () => {
+    try {
+      await fetchFacilityPopulation();
+      syncFacilityPopulation();
+      
+      broadcast({
+        type: 'facility_update',
+        facilities: NYC_CORRECTIONAL_FACILITIES,
+        population: facilityPopulation,
+        intelligence: getFacilityStatus(),
+        timestamp: new Date().toISOString()
+      });
+    } catch (e) {
+      console.error('[FACILITIES] Periodic update failed:', e.message);
+    }
   }, 30 * 60 * 1000);
   
   // Fetch 311 every 15 minutes
   setInterval(async () => {
-    await fetch311NearFacilities();
+    try {
+      await fetch311NearFacilities();
+    } catch (e) {
+      console.error('[FACILITIES] 311 periodic fetch failed:', e.message);
+    }
   }, 15 * 60 * 1000);
   
   // Fetch arrests every hour
   setInterval(async () => {
-    await fetchArrestData();
+    try {
+      await fetchArrestData();
+    } catch (e) {
+      console.error('[FACILITIES] Arrest periodic fetch failed:', e.message);
+    }
   }, 60 * 60 * 1000);
   
   // Update bus schedule every 5 minutes
@@ -1408,8 +1452,12 @@ async function startFacilityFetching() {
   }, 5 * 60 * 1000);
 }
 
-// Start fetching after server starts
-setTimeout(startFacilityFetching, 10000);
+// Start fetching after server starts (with error handling)
+setTimeout(() => {
+  startFacilityFetching().catch(e => {
+    console.error('[FACILITIES] Fatal error in facility fetching:', e.message);
+  });
+}, 15000); // Increased to 15 seconds to ensure server is fully ready
 
 // ============================================
 // BETTING SYSTEM
