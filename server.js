@@ -1539,6 +1539,267 @@ app.get('/facilities/q100/route', (req, res) => {
   res.json(Q100_ROUTE);
 });
 
+// ============================================
+// NYC OPEN DATA - DAILY INMATES IN CUSTODY
+// ============================================
+// Source: https://data.cityofnewyork.us/Public-Safety/Daily-Inmates-In-Custody/7479-ugqb
+// No API key required - public dataset
+
+const NYC_OPENDATA_INMATES_URL = 'https://data.cityofnewyork.us/resource/7479-ugqb.json';
+
+// Cache for inmate data (refresh every 6 hours - data updates daily)
+let inmateDataCache = null;
+let inmateDataCacheTime = 0;
+const INMATE_CACHE_DURATION = 6 * 60 * 60 * 1000; // 6 hours
+
+async function fetchInmateData() {
+  const now = Date.now();
+  
+  // Return cached data if fresh
+  if (inmateDataCache && (now - inmateDataCacheTime) < INMATE_CACHE_DURATION) {
+    return inmateDataCache;
+  }
+  
+  try {
+    // Fetch with limit - dataset can be large
+    const response = await fetch(`${NYC_OPENDATA_INMATES_URL}?$limit=50000`, {
+      headers: { 'Accept': 'application/json' }
+    });
+    
+    if (!response.ok) throw new Error('NYC Open Data API error');
+    
+    const data = await response.json();
+    inmateDataCache = data;
+    inmateDataCacheTime = now;
+    
+    console.log(`[INMATES] Fetched ${data.length} inmate records from NYC Open Data`);
+    return data;
+    
+  } catch (error) {
+    console.error('[INMATES] Fetch error:', error.message);
+    return inmateDataCache || []; // Return stale cache if available
+  }
+}
+
+// Aggregate inmate stats
+function aggregateInmateStats(inmates) {
+  const stats = {
+    total: inmates.length,
+    byGender: {},
+    byRace: {},
+    byAge: { '18-25': 0, '26-35': 0, '36-45': 0, '46-55': 0, '56+': 0 },
+    byCustodyLevel: {},
+    byMentalHealth: {},
+    byTopCharge: {},
+    bySecurityRiskGroup: { yes: 0, no: 0 },
+    byLegalStatus: {}
+  };
+  
+  inmates.forEach(inmate => {
+    // Gender
+    const gender = inmate.gender || 'Unknown';
+    stats.byGender[gender] = (stats.byGender[gender] || 0) + 1;
+    
+    // Race
+    const race = inmate.race || 'Unknown';
+    stats.byRace[race] = (stats.byRace[race] || 0) + 1;
+    
+    // Age brackets
+    const age = parseInt(inmate.age) || 0;
+    if (age >= 18 && age <= 25) stats.byAge['18-25']++;
+    else if (age >= 26 && age <= 35) stats.byAge['26-35']++;
+    else if (age >= 36 && age <= 45) stats.byAge['36-45']++;
+    else if (age >= 46 && age <= 55) stats.byAge['46-55']++;
+    else if (age >= 56) stats.byAge['56+']++;
+    
+    // Custody Level
+    const custody = inmate.custody_level || 'Unknown';
+    stats.byCustodyLevel[custody] = (stats.byCustodyLevel[custody] || 0) + 1;
+    
+    // Mental Health
+    const mental = inmate.bradh || inmate.mental_designation || 'None';
+    stats.byMentalHealth[mental] = (stats.byMentalHealth[mental] || 0) + 1;
+    
+    // Top Charge (limit to top 20)
+    const charge = inmate.top_charge || 'Unknown';
+    stats.byTopCharge[charge] = (stats.byTopCharge[charge] || 0) + 1;
+    
+    // Security Risk Group
+    const srg = (inmate.srg_flg === 'Y' || inmate.srg_flg === 'Yes') ? 'yes' : 'no';
+    stats.bySecurityRiskGroup[srg]++;
+    
+    // Legal Status
+    const legal = inmate.legal_status || 'Unknown';
+    stats.byLegalStatus[legal] = (stats.byLegalStatus[legal] || 0) + 1;
+  });
+  
+  // Sort and limit top charges to top 15
+  stats.byTopCharge = Object.fromEntries(
+    Object.entries(stats.byTopCharge)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+  );
+  
+  return stats;
+}
+
+// Main inmate population endpoint
+app.get('/facilities/inmates', async (req, res) => {
+  try {
+    const inmates = await fetchInmateData();
+    const stats = aggregateInmateStats(inmates);
+    
+    res.json({
+      source: 'NYC Open Data - Daily Inmates In Custody',
+      datasetId: '7479-ugqb',
+      lastUpdated: new Date(inmateDataCacheTime).toISOString(),
+      stats,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Detailed breakdown endpoint
+app.get('/facilities/inmates/breakdown', async (req, res) => {
+  try {
+    const inmates = await fetchInmateData();
+    const { field = 'race' } = req.query;
+    
+    const validFields = ['gender', 'race', 'custody_level', 'top_charge', 'legal_status', 'bradh', 'age'];
+    if (!validFields.includes(field)) {
+      return res.status(400).json({ error: `Invalid field. Valid: ${validFields.join(', ')}` });
+    }
+    
+    const breakdown = {};
+    inmates.forEach(inmate => {
+      let value = inmate[field] || 'Unknown';
+      if (field === 'age') {
+        const age = parseInt(value) || 0;
+        if (age >= 18 && age <= 25) value = '18-25';
+        else if (age >= 26 && age <= 35) value = '26-35';
+        else if (age >= 36 && age <= 45) value = '36-45';
+        else if (age >= 46 && age <= 55) value = '46-55';
+        else if (age >= 56) value = '56+';
+        else value = 'Unknown';
+      }
+      breakdown[value] = (breakdown[value] || 0) + 1;
+    });
+    
+    // Sort by count descending
+    const sorted = Object.entries(breakdown)
+      .sort((a, b) => b[1] - a[1])
+      .map(([label, count]) => ({
+        label,
+        count,
+        percent: ((count / inmates.length) * 100).toFixed(1)
+      }));
+    
+    res.json({
+      field,
+      total: inmates.length,
+      breakdown: sorted,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Top charges endpoint
+app.get('/facilities/inmates/charges', async (req, res) => {
+  try {
+    const inmates = await fetchInmateData();
+    const limit = parseInt(req.query.limit) || 20;
+    
+    const charges = {};
+    inmates.forEach(inmate => {
+      const charge = inmate.top_charge || 'Unknown';
+      charges[charge] = (charges[charge] || 0) + 1;
+    });
+    
+    const sorted = Object.entries(charges)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([charge, count]) => ({
+        charge,
+        count,
+        percent: ((count / inmates.length) * 100).toFixed(1)
+      }));
+    
+    res.json({
+      total: inmates.length,
+      topCharges: sorted,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Demographics summary for dashboard cards
+app.get('/facilities/inmates/demographics', async (req, res) => {
+  try {
+    const inmates = await fetchInmateData();
+    
+    // Quick demographic summary
+    const genderCounts = {};
+    const raceCounts = {};
+    let mentalHealthCount = 0;
+    let srgCount = 0;
+    let avgAge = 0;
+    
+    inmates.forEach(inmate => {
+      // Gender
+      const g = inmate.gender || 'Unknown';
+      genderCounts[g] = (genderCounts[g] || 0) + 1;
+      
+      // Race
+      const r = inmate.race || 'Unknown';
+      raceCounts[r] = (raceCounts[r] || 0) + 1;
+      
+      // Mental health (has designation)
+      if (inmate.bradh && inmate.bradh !== 'NO' && inmate.bradh !== 'N') {
+        mentalHealthCount++;
+      }
+      
+      // Security risk group
+      if (inmate.srg_flg === 'Y' || inmate.srg_flg === 'Yes') {
+        srgCount++;
+      }
+      
+      // Age
+      avgAge += parseInt(inmate.age) || 0;
+    });
+    
+    avgAge = Math.round(avgAge / inmates.length);
+    
+    res.json({
+      population: inmates.length,
+      gender: genderCounts,
+      race: raceCounts,
+      mentalHealthDesignation: {
+        count: mentalHealthCount,
+        percent: ((mentalHealthCount / inmates.length) * 100).toFixed(1)
+      },
+      securityRiskGroup: {
+        count: srgCount,
+        percent: ((srgCount / inmates.length) * 100).toFixed(1)
+      },
+      averageAge: avgAge,
+      dataSource: 'NYC Open Data',
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Facilities summary for dashboard
 app.get('/facilities/summary', (req, res) => {
   const hour = new Date().getHours();
