@@ -1560,13 +1560,169 @@ fetchNYCCameras();
 const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 const NYPD_FEEDS = [
+  // Borough-specific feeds (often more reliable)
+  { id: '30382', name: 'NYPD Manhattan North' },
+  { id: '30383', name: 'NYPD Manhattan South' },
+  { id: '30378', name: 'NYPD Brooklyn North' },
+  { id: '30379', name: 'NYPD Brooklyn South' },
+  { id: '30376', name: 'NYPD Bronx' },
+  { id: '30380', name: 'NYPD Queens North' },
+  { id: '30381', name: 'NYPD Queens South' },
+  { id: '29096', name: 'NYPD Staten Island' },
+  // Citywide fallbacks
   { id: '40184', name: 'NYPD Citywide 1' },
   { id: '40185', name: 'NYPD Citywide 2' },
-  { id: '40186', name: 'NYPD Citywide 3' },
-  { id: '40187', name: 'NYPD Citywide 4' },
   { id: '32119', name: 'NYPD Dispatch Citywide 1' },
-  { id: '9466', name: 'FDNY Citywide' }, // Fire adds more activity
 ];
+
+// ============================================
+// OPENMHZ - RELIABLE BACKUP SOURCE (no ads, ~30sec delay)
+// ============================================
+const OPENMHZ_SYSTEM = 'nyc-p25';
+const OPENMHZ_POLL_INTERVAL = 15000; // Poll every 15 seconds
+let lastOpenMHzCallTime = Date.now();
+let openMHzStats = { callsFetched: 0, callsProcessed: 0, lastPoll: null, errors: 0 };
+
+// NYPD talkgroup IDs on NYC P25 system (dispatch channels)
+const NYPD_TALKGROUPS = [
+  // Dispatch
+  3312, 3313, 3314, 3315, 3316, // Citywide dispatch
+  3101, 3102, 3103, 3104, 3105, // Manhattan
+  3201, 3202, 3203, 3204, 3205, // Bronx  
+  3301, 3302, 3303, 3304, 3305, // Brooklyn
+  3401, 3402, 3403, 3404, 3405, // Queens
+  3501, 3502, 3503, // Staten Island
+];
+
+async function startOpenMHzPolling() {
+  console.log('[OPENMHZ] Starting NYC P25 polling...');
+  
+  async function pollCalls() {
+    try {
+      const response = await fetch(`https://api.openmhz.com/${OPENMHZ_SYSTEM}/calls?time=${Math.floor(lastOpenMHzCallTime/1000)}`);
+      
+      if (!response.ok) {
+        console.error(`[OPENMHZ] API error: ${response.status}`);
+        openMHzStats.errors++;
+        return;
+      }
+      
+      const data = await response.json();
+      const calls = data.calls || [];
+      
+      openMHzStats.lastPoll = new Date().toISOString();
+      openMHzStats.callsFetched += calls.length;
+      
+      if (calls.length > 0) {
+        console.log(`[OPENMHZ] Fetched ${calls.length} new calls`);
+        
+        // Process calls (newest first, but we want chronological)
+        const sortedCalls = calls.reverse();
+        
+        for (const call of sortedCalls) {
+          // Filter to NYPD talkgroups only (skip FDNY, EMS for now)
+          const tgNum = parseInt(call.talkgroupNum);
+          const isNYPD = tgNum >= 3000 && tgNum < 4000;
+          
+          if (!isNYPD) continue;
+          
+          // Update timestamp tracker
+          const callTime = new Date(call.time).getTime();
+          if (callTime > lastOpenMHzCallTime) {
+            lastOpenMHzCallTime = callTime;
+          }
+          
+          // Download and transcribe the audio
+          if (call.url) {
+            processOpenMHzCall(call);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[OPENMHZ] Poll error:', error.message);
+      openMHzStats.errors++;
+    }
+  }
+  
+  // Initial poll
+  await pollCalls();
+  
+  // Continue polling
+  setInterval(pollCalls, OPENMHZ_POLL_INTERVAL);
+}
+
+async function processOpenMHzCall(call) {
+  try {
+    // Download audio
+    const audioResponse = await fetch(call.url);
+    if (!audioResponse.ok) return;
+    
+    const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+    
+    // Transcribe
+    const transcript = await transcribeAudio(audioBuffer);
+    if (!transcript || transcript.length < 10) return;
+    
+    const clean = transcript.trim();
+    const lower = clean.toLowerCase();
+    
+    // Skip noise
+    if (lower.length < 15) return;
+    if (lower.includes('fema.gov') || lower.includes('broadcastify')) return;
+    
+    openMHzStats.callsProcessed++;
+    
+    const talkgroupName = call.talkgroupDescription || `TG ${call.talkgroupNum}`;
+    console.log(`[OPENMHZ] Transcribed (${talkgroupName}): "${clean.substring(0, 80)}..."`);
+    
+    // Broadcast transcript
+    const transcriptEntry = { 
+      text: clean, 
+      source: `OpenMHz: ${talkgroupName}`,
+      talkgroup: call.talkgroupNum,
+      timestamp: call.time || new Date().toISOString()
+    };
+    recentTranscripts.unshift(transcriptEntry);
+    if (recentTranscripts.length > MAX_TRANSCRIPTS) recentTranscripts.pop();
+    
+    broadcast({ type: "transcript", ...transcriptEntry });
+    
+    // Parse for incidents
+    const parsed = await parseTranscript(clean);
+    
+    if (parsed.hasIncident) {
+      incidentId++;
+      const camera = findNearestCamera(parsed.location, null, null, parsed.borough);
+      
+      const incident = {
+        id: incidentId,
+        ...parsed,
+        transcript: clean,
+        source: `OpenMHz: ${talkgroupName}`,
+        camera,
+        lat: camera?.lat,
+        lng: camera?.lng,
+        timestamp: call.time || new Date().toISOString()
+      };
+      
+      incidents.unshift(incident);
+      if (incidents.length > 50) incidents.pop();
+      
+      detectiveBureau.processIncident(incident, broadcast);
+      checkBetsForIncident(incident);
+      
+      broadcast({ type: "incident", incident });
+      if (camera) broadcast({ type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}` });
+      
+      console.log('[OPENMHZ INCIDENT]', incident.incidentType, '@', incident.location, `(${incident.borough})`);
+    }
+  } catch (error) {
+    console.error('[OPENMHZ] Process error:', error.message);
+  }
+}
+
+// Start OpenMHz polling alongside Broadcastify
+setTimeout(startOpenMHzPolling, 3000);
 
 let currentFeedIndex = 0;
 let lastProcessTime = Date.now();
@@ -1583,9 +1739,11 @@ function broadcast(data) {
 
 async function startBroadcastifyStream() {
   if (!BROADCASTIFY_PASSWORD) { 
-    console.log('[SCANNER] BROADCASTIFY_PASSWORD not set'); 
+    console.log('[SCANNER] BROADCASTIFY_PASSWORD not set - Broadcastify disabled'); 
+    console.log('[SCANNER] Relying on OpenMHz only');
     return; 
   }
+  console.log(`[SCANNER] Broadcastify auth: ${BROADCASTIFY_USERNAME} / ${'*'.repeat(BROADCASTIFY_PASSWORD.length)}`);
   const feed = NYPD_FEEDS[currentFeedIndex];
   console.log(`[SCANNER] Connecting to: ${feed.name} (${feed.id})`);
 
@@ -1842,6 +2000,34 @@ async function processAudioFromStream(buffer, feedName) {
       lower.includes('become a subscriber')) {
     scannerStats.filteredAd = (scannerStats.filteredAd || 0) + 1;
     console.log(`[SCANNER] Filtered ad: "${clean}"`);
+    return;
+  }
+  
+  // Filter out garbage/placeholder audio (wrong stream content)
+  const garbagePatterns = [
+    'un.org', 'un videos', 'united nations',
+    'test broadcast', 'this is a test',
+    'lorem ipsum', 'placeholder',
+    'stream offline', 'feed offline',
+    'no audio', 'audio unavailable'
+  ];
+  
+  if (garbagePatterns.some(pattern => lower.includes(pattern))) {
+    scannerStats.filteredGarbage = (scannerStats.filteredGarbage || 0) + 1;
+    console.log(`[SCANNER] ⚠️  Garbage audio detected: "${clean.substring(0, 80)}"`);
+    console.log(`[SCANNER] Rotating to next feed...`);
+    currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+    return;
+  }
+  
+  // Detect repetitive content (same phrase repeated multiple times = bad stream)
+  const words = lower.split(/\s+/);
+  const uniqueWords = new Set(words);
+  if (words.length > 20 && uniqueWords.size < words.length * 0.3) {
+    scannerStats.filteredRepetitive = (scannerStats.filteredRepetitive || 0) + 1;
+    console.log(`[SCANNER] ⚠️  Repetitive content detected (${uniqueWords.size}/${words.length} unique words)`);
+    console.log(`[SCANNER] Rotating to next feed...`);
+    currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
     return;
   }
   
@@ -2979,7 +3165,8 @@ app.get('/debug', (req, res) => res.json({
     feedIndex: currentFeedIndex,
     feeds: NYPD_FEEDS.map(f => f.name),
     uptime: process.uptime()
-  }, 
+  },
+  openMHz: openMHzStats,
   connections: clients.size, 
   incidents: incidents.length, 
   cameras: cameras.length, 
@@ -3004,10 +3191,21 @@ app.get('/scanner/status', (req, res) => {
     currentFeed: NYPD_FEEDS[currentFeedIndex],
     silentSeconds,
     isHealthy: silentSeconds !== null && silentSeconds < 60,
+    filteredGarbage: scannerStats.filteredGarbage || 0,
+    filteredRepetitive: scannerStats.filteredRepetitive || 0,
     successRate: scannerStats.totalChunks > 0 
       ? ((scannerStats.successfulTranscripts / scannerStats.totalChunks) * 100).toFixed(1) + '%'
       : '0%'
   });
+});
+
+// Force rotate to next feed
+app.post('/scanner/rotate', (req, res) => {
+  const oldFeed = NYPD_FEEDS[currentFeedIndex];
+  currentFeedIndex = (currentFeedIndex + 1) % NYPD_FEEDS.length;
+  const newFeed = NYPD_FEEDS[currentFeedIndex];
+  console.log(`[SCANNER] Manual rotation: ${oldFeed.name} → ${newFeed.name}`);
+  res.json({ success: true, previousFeed: oldFeed.name, newFeed: newFeed.name, message: 'Feed rotated. Restart scanner to apply.' });
 });
 
 // WebSocket
