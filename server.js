@@ -153,29 +153,33 @@ function getPrecinctBorough(precinctNum) {
 // PERSISTENT MEMORY SYSTEM
 // ============================================
 
-const MEMORY_FILE = process.env.RAILWAY_VOLUME_MOUNT_PATH 
-  ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/detective_memory.json`
-  : './detective_memory.json';
+const MEMORY_BASE_PATH = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
 const MEMORY_SAVE_INTERVAL = 60000; // Save every minute
 
-console.log(`[MEMORY] Storage location: ${MEMORY_FILE}`);
+function getMemoryFile(cityId = 'nyc') {
+  return `${MEMORY_BASE_PATH}/detective_memory_${cityId}.json`;
+}
+
+console.log(`[MEMORY] Storage base: ${MEMORY_BASE_PATH}`);
 console.log(`[MEMORY] Railway volume: ${process.env.RAILWAY_VOLUME_MOUNT_PATH || 'NOT CONFIGURED'}`);
 
-function loadMemoryFromDisk() {
+function loadMemoryFromDisk(cityId = 'nyc') {
   try {
-    if (fs.existsSync(MEMORY_FILE)) {
-      const data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
-      console.log('[MEMORY] Loaded from disk:', data.incidents?.length || 0, 'incidents,', data.predictionStats?.total || 0, 'predictions');
+    const memFile = getMemoryFile(cityId);
+    if (fs.existsSync(memFile)) {
+      const data = JSON.parse(fs.readFileSync(memFile, 'utf8'));
+      console.log(`[MEMORY-${cityId.toUpperCase()}] Loaded from disk:`, data.incidents?.length || 0, 'incidents,', data.predictionStats?.total || 0, 'predictions');
       return data;
     }
   } catch (error) {
-    console.error('[MEMORY] Load error:', error.message);
+    console.error(`[MEMORY-${cityId.toUpperCase()}] Load error:`, error.message);
   }
   return null;
 }
 
-function saveMemoryToDisk(memory, predictionStats, agents) {
+function saveMemoryToDisk(memory, predictionStats, agents, cityId = 'nyc') {
   try {
+    const memFile = getMemoryFile(cityId);
     const serializable = {
       incidents: memory.incidents,
       predictions: memory.predictions,
@@ -198,9 +202,9 @@ function saveMemoryToDisk(memory, predictionStats, agents) {
       ),
       savedAt: new Date().toISOString()
     };
-    fs.writeFileSync(MEMORY_FILE, JSON.stringify(serializable, null, 2));
+    fs.writeFileSync(memFile, JSON.stringify(serializable, null, 2));
   } catch (error) {
-    console.error('[MEMORY] Save error:', error.message);
+    console.error(`[MEMORY-${cityId.toUpperCase()}] Save error:`, error.message);
   }
 }
 
@@ -210,11 +214,28 @@ function saveMemoryToDisk(memory, predictionStats, agents) {
 // ============================================
 
 class DetectiveBureau {
-  constructor(anthropicClient) {
+  constructor(anthropicClient, cityId = 'nyc') {
     this.anthropic = anthropicClient;
+    this.cityId = cityId;
     
-    const savedMemory = loadMemoryFromDisk();
+    const savedMemory = loadMemoryFromDisk(cityId);
     const savedAgentStats = savedMemory?.agentStats || {};
+    
+    // City-specific knowledge for system prompts
+    const cityKnowledge = {
+      nyc: {
+        streets: 'NYC street topology - one-ways, dead ends, bridge/tunnel access (GW Bridge, Lincoln Tunnel, Holland Tunnel, Brooklyn Bridge)',
+        landmarks: 'Times Square, Penn Station, Grand Central, Port Authority, Central Park',
+        precincts: 'NYPD precincts 1-123'
+      },
+      mpls: {
+        streets: 'Minneapolis street grid - Lake Street, Hennepin Ave, I-35W, I-94, Highway 55, one-ways in downtown',
+        landmarks: 'Target Center, US Bank Stadium, Mall of America, Nicollet Mall, Stone Arch Bridge, University of Minnesota',
+        precincts: 'Minneapolis Police precincts 1-5, Hennepin County Sheriff'
+      }
+    };
+    
+    const cityInfo = cityKnowledge[cityId] || cityKnowledge.nyc;
     
     this.agents = {
       CHASE: {
@@ -224,7 +245,7 @@ class DetectiveBureau {
         role: 'Pursuit Specialist',
         status: 'idle',
         triggers: ['pursuit', 'fled', 'fleeing', 'chase', 'vehicle pursuit', 'on foot', 'running', 'high speed', 'foot pursuit', '10-13'],
-        systemPrompt: `You are CHASE, a pursuit specialist AI. You predict escape routes, containment points, and track active pursuits across NYC. You know NYC street topology intimately - one-ways, dead ends, bridge/tunnel access. Keep responses to 2-3 sentences. Be tactical and specific.`,
+        systemPrompt: `You are CHASE, a pursuit specialist AI for ${cityId.toUpperCase()}. You predict escape routes, containment points, and track active pursuits. You know ${cityInfo.streets}. Keep responses to 2-3 sentences. Be tactical and specific.`,
         stats: savedAgentStats.CHASE?.stats || { activations: 0, insights: 0, successfulContainments: 0 },
         history: savedAgentStats.CHASE?.history || []
       },
@@ -286,13 +307,13 @@ class DetectiveBureau {
 
     // Start memory persistence
     setInterval(() => {
-      saveMemoryToDisk(this.memory, this.predictionStats, this.agents);
+      saveMemoryToDisk(this.memory, this.predictionStats, this.agents, this.cityId);
     }, MEMORY_SAVE_INTERVAL);
 
     this.startProphetCycle();
     this.startPatternCycle();
     
-    console.log('[DETECTIVE] Bureau initialized with', this.memory.incidents.length, 'historical incidents');
+    console.log(`[DETECTIVE-${this.cityId.toUpperCase()}] Bureau initialized with`, this.memory.incidents.length, 'historical incidents');
   }
 
   // ============================================
@@ -1322,7 +1343,14 @@ Recent collaborations: ${JSON.stringify(this.memory.collaborations.slice(0, 5))}
   }
 }
 
-const detectiveBureau = new DetectiveBureau(anthropic);
+// Create separate DetectiveBureau per city
+const detectiveBureaus = {
+  nyc: new DetectiveBureau(anthropic, 'nyc'),
+  mpls: new DetectiveBureau(anthropic, 'mpls')
+};
+
+// Legacy reference for backwards compatibility with existing endpoints
+const detectiveBureau = detectiveBureaus.nyc;
 
 // ============================================
 // BETTING SYSTEM
@@ -2022,7 +2050,7 @@ async function processOpenMHzCall(call, cityId = 'nyc') {
         if (incidents.length > 50) incidents.pop();
       }
       
-      detectiveBureau.processIncident(incident, (data) => broadcastToCity(cityId, data));
+      detectiveBureaus[cityId].processIncident(incident, (data) => broadcastToCity(cityId, data));
       if (cityId === 'nyc') checkBetsForIncident(incident);
       
       broadcastToCity(cityId, { type: "incident", incident });
@@ -2621,7 +2649,7 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     }
     
     // Process through Detective Bureau
-    detectiveBureau.processIncident(incident, (data) => broadcastToCity(cityId, data));
+    detectiveBureaus[cityId].processIncident(incident, (data) => broadcastToCity(cityId, data));
     
     // Check bets (NYC only for now)
     if (cityId === 'nyc') checkBetsForIncident(incident);
@@ -2684,7 +2712,70 @@ function checkBetsForIncident(incident) {
 // ============================================
 
 // ============================================
-// DETECTIVE BUREAU ENDPOINTS (Enhanced)
+// DETECTIVE BUREAU ENDPOINTS (City-specific)
+// ============================================
+
+// City-specific detective overview
+app.get('/city/:cityId/detective/overview', (req, res) => {
+  const { cityId } = req.params;
+  const bureau = detectiveBureaus[cityId];
+  if (!bureau) return res.status(404).json({ error: 'City not found' });
+  res.json(bureau.getAgentOverview());
+});
+
+// City-specific agent statuses
+app.get('/city/:cityId/detective/agents', (req, res) => {
+  const { cityId } = req.params;
+  const bureau = detectiveBureaus[cityId];
+  if (!bureau) return res.status(404).json({ error: 'City not found' });
+  res.json(bureau.getAgentStatuses());
+});
+
+// City-specific predictions
+app.get('/city/:cityId/detective/predictions', (req, res) => {
+  const { cityId } = req.params;
+  const bureau = detectiveBureaus[cityId];
+  if (!bureau) return res.status(404).json({ error: 'City not found' });
+  res.json(bureau.getPredictionStats());
+});
+
+// City-specific patterns
+app.get('/city/:cityId/detective/patterns', (req, res) => {
+  const { cityId } = req.params;
+  const bureau = detectiveBureaus[cityId];
+  if (!bureau) return res.status(404).json({ error: 'City not found' });
+  res.json({
+    active: bureau.memory.patterns.filter(p => p.status === 'active'),
+    total: bureau.memory.patterns.length
+  });
+});
+
+// City-specific hotspots
+app.get('/city/:cityId/detective/hotspots', (req, res) => {
+  const { cityId } = req.params;
+  const bureau = detectiveBureaus[cityId];
+  if (!bureau) return res.status(404).json({ error: 'City not found' });
+  const hotspots = Array.from(bureau.memory.hotspots.entries())
+    .map(([key, count]) => {
+      const [borough, location] = key.split('-');
+      return { borough, location, count };
+    })
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 50);
+  res.json(hotspots);
+});
+
+// City-specific briefing
+app.get('/city/:cityId/detective/briefing', async (req, res) => {
+  const { cityId } = req.params;
+  const bureau = detectiveBureaus[cityId];
+  if (!bureau) return res.status(404).json({ error: 'City not found' });
+  const briefing = await bureau.generateBriefing();
+  res.json(briefing);
+});
+
+// ============================================
+// LEGACY DETECTIVE BUREAU ENDPOINTS (NYC default for backwards compatibility)
 // ============================================
 
 // Overview - Combined stats for all agents
@@ -3828,10 +3919,12 @@ app.get('/city/:cityId/camera-image/:camId', async (req, res) => {
 
 // Full init data for a city (for WebSocket alternative)
 app.get('/city/:cityId/init', (req, res) => {
-  const city = CITIES[req.params.cityId];
+  const cityId = req.params.cityId;
+  const city = CITIES[cityId];
   if (!city) return res.status(404).json({ error: 'City not found' });
   
-  const state = cityState[req.params.cityId];
+  const state = cityState[cityId];
+  const bureau = detectiveBureaus[cityId];
   res.json({
     city: {
       id: city.id,
@@ -3846,8 +3939,8 @@ app.get('/city/:cityId/init', (req, res) => {
     incidents: state.incidents.slice(0, 20),
     transcripts: state.recentTranscripts.slice(0, 10),
     scannerStats: state.scannerStats,
-    agents: detectiveBureau.getAgentStatuses(),
-    predictions: detectiveBureau.getPredictionStats()
+    agents: bureau.getAgentStatuses(),
+    predictions: bureau.getPredictionStats()
   });
 });
 
@@ -3995,8 +4088,8 @@ wss.on('connection', (ws, req) => {
     transcripts: state.recentTranscripts.slice(0, 10),
     activeFeeds: Array.from(state.activeStreams?.keys() || []),
     streamCount: state.activeStreams?.size || 0,
-    agents: detectiveBureau.getAgentStatuses(),
-    predictions: detectiveBureau.getPredictionStats(),
+    agents: detectiveBureaus[requestedCity].getAgentStatuses(),
+    predictions: detectiveBureaus[requestedCity].getPredictionStats(),
     facilities: requestedCity === 'nyc' ? NYC_FACILITIES.map(f => ({
       id: f.id, name: f.name, shortName: f.shortName, borough: f.borough,
       lat: f.lat, lng: f.lng, currentPopulation: f.currentPopulation
@@ -4047,7 +4140,7 @@ wss.on('connection', (ws, req) => {
           const incident = { id: state.incidentId, ...parsed, camera: cam, lat: cam?.lat, lng: cam?.lng, city: cityId, timestamp: new Date().toISOString() };
           state.incidents.unshift(incident);
           if (state.incidents.length > 50) state.incidents.pop();
-          detectiveBureau.processIncident(incident, (d) => broadcastToCity(cityId, d));
+          detectiveBureaus[cityId].processIncident(incident, (d) => broadcastToCity(cityId, d));
           checkBetsForIncident(incident);
           broadcastToCity(cityId, { type: "incident", incident });
           if (cam) broadcastToCity(cityId, { type: "camera_switch", camera: cam, reason: `${parsed.incidentType} at ${parsed.location}` });
