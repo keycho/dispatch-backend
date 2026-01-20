@@ -1080,7 +1080,6 @@ Based on patterns, hotspots, time of day, and your learning from past prediction
     }
     
     this.agents.PATTERN.status = 'idle';
-    }, 5 * 60 * 1000);
   }
 
   // ============================================
