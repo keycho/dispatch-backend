@@ -3751,6 +3751,35 @@ app.get('/city/mpls/ice/dashboard', async (req, res) => {
 
 // Minneapolis location patterns for geocoding social media posts
 const MPLS_LOCATION_PATTERNS = [
+  // Twin Cities Suburbs (check these first - most specific)
+  { pattern: /burnsville/i, name: 'Burnsville', lat: 44.7677, lng: -93.2777 },
+  { pattern: /bloomington(?!\s*ave)/i, name: 'Bloomington', lat: 44.8408, lng: -93.2983 },
+  { pattern: /eden\s*prairie/i, name: 'Eden Prairie', lat: 44.8547, lng: -93.4708 },
+  { pattern: /edina/i, name: 'Edina', lat: 44.8897, lng: -93.3499 },
+  { pattern: /richfield/i, name: 'Richfield', lat: 44.8831, lng: -93.2669 },
+  { pattern: /brooklyn\s*(center|park)/i, name: 'Brooklyn Center/Park', lat: 45.0761, lng: -93.3327 },
+  { pattern: /maple\s*grove/i, name: 'Maple Grove', lat: 45.0724, lng: -93.4558 },
+  { pattern: /plymouth/i, name: 'Plymouth', lat: 45.0105, lng: -93.4555 },
+  { pattern: /golden\s*valley/i, name: 'Golden Valley', lat: 44.9919, lng: -93.3591 },
+  { pattern: /st\.?\s*louis\s*park/i, name: 'St. Louis Park', lat: 44.9597, lng: -93.3702 },
+  { pattern: /hopkins/i, name: 'Hopkins', lat: 44.9252, lng: -93.4183 },
+  { pattern: /minnetonka/i, name: 'Minnetonka', lat: 44.9211, lng: -93.4687 },
+  { pattern: /eagan/i, name: 'Eagan', lat: 44.8041, lng: -93.1669 },
+  { pattern: /apple\s*valley/i, name: 'Apple Valley', lat: 44.7319, lng: -93.2177 },
+  { pattern: /lakeville/i, name: 'Lakeville', lat: 44.6497, lng: -93.2427 },
+  { pattern: /roseville/i, name: 'Roseville', lat: 45.0061, lng: -93.1566 },
+  { pattern: /maplewood/i, name: 'Maplewood', lat: 44.9530, lng: -93.0252 },
+  { pattern: /woodbury/i, name: 'Woodbury', lat: 44.9239, lng: -92.9594 },
+  { pattern: /cottage\s*grove/i, name: 'Cottage Grove', lat: 44.8277, lng: -92.9438 },
+  { pattern: /shakopee/i, name: 'Shakopee', lat: 44.7980, lng: -93.5269 },
+  { pattern: /prior\s*lake/i, name: 'Prior Lake', lat: 44.7133, lng: -93.4227 },
+  { pattern: /savage/i, name: 'Savage', lat: 44.7792, lng: -93.3363 },
+  { pattern: /coon\s*rapids/i, name: 'Coon Rapids', lat: 45.1200, lng: -93.2878 },
+  { pattern: /fridley/i, name: 'Fridley', lat: 45.0852, lng: -93.2633 },
+  { pattern: /columbia\s*heights/i, name: 'Columbia Heights', lat: 45.0408, lng: -93.2472 },
+  { pattern: /anoka/i, name: 'Anoka', lat: 45.1977, lng: -93.3872 },
+  { pattern: /blaine/i, name: 'Blaine', lat: 45.1608, lng: -93.2349 },
+  
   // Major streets
   { pattern: /lake\s*(?:st(?:reet)?|ave)/i, name: 'Lake Street', lat: 44.9486, lng: -93.2590 },
   { pattern: /east\s*lake/i, name: 'East Lake Street', lat: 44.9486, lng: -93.2300 },
@@ -3801,7 +3830,7 @@ const MPLS_LOCATION_PATTERNS = [
   { pattern: /freeborn/i, name: 'Freeborn County Jail', lat: 43.6481, lng: -93.3677 },
   { pattern: /kandiyohi/i, name: 'Kandiyohi County Jail', lat: 45.1219, lng: -95.0403 },
   
-  // General Minneapolis mention
+  // General Minneapolis mention (lowest priority)
   { pattern: /minneapolis|mpls/i, name: 'Minneapolis', lat: 44.9778, lng: -93.2650 },
   { pattern: /minnesota|mn/i, name: 'Minnesota', lat: 44.9778, lng: -93.2650 }
 ];
@@ -4190,26 +4219,82 @@ async function fetchICENewsLive() {
   // Combine scraped and known events
   const combined = [...news, ...recentKnownEvents];
   
+  // Deduplicate by title similarity (same post from multiple subreddits)
+  const seen = new Set();
+  const deduplicated = combined.filter(item => {
+    // Create a normalized key from the title
+    const key = item.title.toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .substring(0, 50);
+    
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+  
+  console.log(`[ICE NEWS] Deduplicated: ${combined.length} -> ${deduplicated.length} items`);
+  
   // Sort by timestamp, newest first
-  combined.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  deduplicated.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
   
   // Geocode items that don't have coordinates
-  const geocoded = await geocodeNewsItems(combined);
+  const geocoded = await geocodeNewsItems(deduplicated);
   
   // Log geocoding stats
   const withCoords = geocoded.filter(n => n.lat && n.lng).length;
   console.log(`[ICE NEWS] Geocoded ${withCoords}/${geocoded.length} items with coordinates`);
   
+  // Find new items that weren't in cache before
+  const existingIds = new Set(iceNewsEvents.map(n => n.id));
+  const newItems = geocoded.filter(n => !existingIds.has(n.id));
+  
   // Update cache
   iceNewsEvents.length = 0;
   iceNewsEvents.push(...geocoded.slice(0, MAX_ICE_NEWS));
+  
+  // Broadcast new social media posts to Minneapolis clients
+  if (newItems.length > 0) {
+    const socialWithCoords = newItems.filter(n => n.lat && n.lng && n.type === 'social');
+    if (socialWithCoords.length > 0) {
+      console.log(`[ICE NEWS] Broadcasting ${socialWithCoords.length} new social posts with coordinates`);
+      broadcastToCity('mpls', {
+        type: 'ice_social_posts',
+        posts: socialWithCoords.map(n => ({
+          id: n.id,
+          type: n.type,
+          source: n.source,
+          title: n.title,
+          url: n.url,
+          lat: n.lat,
+          lng: n.lng,
+          location: n.location,
+          imageUrl: n.imageUrl,
+          thumbnailUrl: n.thumbnailUrl,
+          hasMedia: n.hasMedia,
+          timestamp: n.timestamp
+        })),
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // Also broadcast all new items
+    broadcastToCity('mpls', {
+      type: 'ice_news_update',
+      newCount: newItems.length,
+      total: geocoded.length,
+      withCoordinates: withCoords,
+      timestamp: new Date().toISOString()
+    });
+  }
   
   return geocoded;
 }
 
 // Fetch news on startup and periodically
-setTimeout(() => fetchICENewsLive(), 10000);
-setInterval(() => fetchICENewsLive(), 15 * 60 * 1000); // Every 15 minutes
+setTimeout(() => fetchICENewsLive(), 5000); // Start faster
+setInterval(() => fetchICENewsLive(), 5 * 60 * 1000); // Every 5 minutes (was 15)
 
 // ============================================
 // LEGACY DETECTIVE BUREAU ENDPOINTS (NYC default for backwards compatibility)
