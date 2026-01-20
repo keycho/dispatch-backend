@@ -3,6 +3,7 @@ import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import https from 'https';
 import fs from 'fs';
+import pg from 'pg';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI, { toFile } from 'openai';
 import fetch from 'node-fetch';
@@ -10,6 +11,22 @@ import dotenv from 'dotenv';
 import cors from 'cors';
 
 dotenv.config();
+
+// ============================================
+// DATABASE CONNECTION
+// ============================================
+
+const { Pool } = pg;
+const pool = process.env.DATABASE_URL ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+}) : null;
+
+if (pool) {
+  console.log('[DATABASE] PostgreSQL connection configured');
+} else {
+  console.log('[DATABASE] No DATABASE_URL - running without persistent storage');
+}
 
 // ============================================
 // MULTI-CITY CONFIGURATION
@@ -1868,6 +1885,343 @@ function verifyTranscription(transcriptId, username, isCorrect) {
 
 // ============================================
 // END GAMIFICATION SYSTEM
+// ============================================
+
+// ============================================
+// DATABASE SCHEMA & HELPERS
+// ============================================
+
+async function initDatabase() {
+  if (!pool) return;
+  
+  try {
+    await pool.query(`
+      -- Users
+      CREATE TABLE IF NOT EXISTS users_db (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        display_name VARCHAR(50),
+        pts INTEGER DEFAULT 500,
+        wins INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        total_predictions INTEGER DEFAULT 0,
+        login_streak INTEGER DEFAULT 1,
+        last_login_date DATE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      -- Incidents (permanent archive)
+      CREATE TABLE IF NOT EXISTS incidents_db (
+        id SERIAL PRIMARY KEY,
+        external_id VARCHAR(100),
+        city VARCHAR(10) NOT NULL,
+        incident_type VARCHAR(100),
+        location TEXT,
+        borough VARCHAR(100),
+        lat DECIMAL(10, 7),
+        lng DECIMAL(10, 7),
+        priority VARCHAR(20),
+        summary TEXT,
+        transcript TEXT,
+        units TEXT[],
+        source VARCHAR(100),
+        audio_url TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(city, external_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_incidents_city ON incidents_db(city);
+      CREATE INDEX IF NOT EXISTS idx_incidents_created ON incidents_db(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_incidents_borough ON incidents_db(borough);
+
+      -- Arrests (NYC Open Data)
+      CREATE TABLE IF NOT EXISTS arrests (
+        id SERIAL PRIMARY KEY,
+        external_id VARCHAR(100),
+        city VARCHAR(10) NOT NULL,
+        arrest_date DATE,
+        offense_description TEXT,
+        offense_category VARCHAR(100),
+        law_category VARCHAR(50),
+        borough VARCHAR(100),
+        precinct VARCHAR(20),
+        age_group VARCHAR(20),
+        sex VARCHAR(10),
+        lat DECIMAL(10, 7),
+        lng DECIMAL(10, 7),
+        source VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(city, external_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_arrests_city ON arrests(city);
+      CREATE INDEX IF NOT EXISTS idx_arrests_date ON arrests(arrest_date DESC);
+
+      -- Inmates
+      CREATE TABLE IF NOT EXISTS inmates (
+        id SERIAL PRIMARY KEY,
+        external_id VARCHAR(100),
+        city VARCHAR(10) NOT NULL,
+        facility VARCHAR(100),
+        admission_date DATE,
+        status VARCHAR(50),
+        top_charge TEXT,
+        age INTEGER,
+        sex VARCHAR(10),
+        source VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(city, external_id)
+      );
+
+      -- ICE Activities
+      CREATE TABLE IF NOT EXISTS ice_activities (
+        id SERIAL PRIMARY KEY,
+        city VARCHAR(10) NOT NULL,
+        activity_type VARCHAR(50),
+        location TEXT,
+        lat DECIMAL(10, 7),
+        lng DECIMAL(10, 7),
+        description TEXT,
+        agencies TEXT[],
+        source VARCHAR(50),
+        source_url TEXT,
+        reported_by VARCHAR(50),
+        verified BOOLEAN DEFAULT FALSE,
+        verification_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_ice_city ON ice_activities(city);
+      CREATE INDEX IF NOT EXISTS idx_ice_created ON ice_activities(created_at DESC);
+
+      -- Detention Facilities
+      CREATE TABLE IF NOT EXISTS detention_facilities (
+        id SERIAL PRIMARY KEY,
+        facility_id VARCHAR(100) UNIQUE,
+        name VARCHAR(200),
+        city VARCHAR(10),
+        state VARCHAR(10),
+        address TEXT,
+        lat DECIMAL(10, 7),
+        lng DECIMAL(10, 7),
+        facility_type VARCHAR(50),
+        capacity INTEGER,
+        last_updated TIMESTAMP DEFAULT NOW()
+      );
+
+      -- Address History (problem locations)
+      CREATE TABLE IF NOT EXISTS address_history (
+        id SERIAL PRIMARY KEY,
+        address TEXT NOT NULL,
+        city VARCHAR(10) NOT NULL,
+        incident_count INTEGER DEFAULT 1,
+        last_incident_at TIMESTAMP,
+        flagged BOOLEAN DEFAULT FALSE,
+        UNIQUE(address, city)
+      );
+
+      -- Community Reports
+      CREATE TABLE IF NOT EXISTS community_reports (
+        id SERIAL PRIMARY KEY,
+        city VARCHAR(10) NOT NULL,
+        report_type VARCHAR(50),
+        location TEXT,
+        lat DECIMAL(10, 7),
+        lng DECIMAL(10, 7),
+        description TEXT,
+        reported_by VARCHAR(50),
+        verified BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      -- Data Sync Log
+      CREATE TABLE IF NOT EXISTS data_sync_log (
+        id SERIAL PRIMARY KEY,
+        source VARCHAR(100),
+        city VARCHAR(10),
+        records_fetched INTEGER,
+        records_inserted INTEGER,
+        status VARCHAR(20),
+        error_message TEXT,
+        completed_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    
+    console.log('[DATABASE] Tables initialized');
+    
+    // Seed detention facilities
+    await seedDetentionFacilities();
+  } catch (error) {
+    console.error('[DATABASE] Init error:', error.message);
+  }
+}
+
+async function seedDetentionFacilities() {
+  if (!pool) return;
+  
+  const facilities = [
+    { facility_id: 'sherburne_mn', name: 'Sherburne County Jail', city: 'mpls', state: 'MN', address: '13880 Business Center Dr NW, Elk River, MN', lat: 45.3036, lng: -93.5672, facility_type: 'ice_contract', capacity: 700 },
+    { facility_id: 'freeborn_mn', name: 'Freeborn County Jail', city: 'mpls', state: 'MN', address: '411 S Broadway Ave, Albert Lea, MN', lat: 43.6480, lng: -93.3683, facility_type: 'ice_contract', capacity: 104 },
+    { facility_id: 'hudson_nj', name: 'Hudson County Correctional', city: 'nyc', state: 'NJ', address: '30 Hackensack Ave, Kearny, NJ', lat: 40.7618, lng: -74.1185, facility_type: 'ice_detention', capacity: 750 },
+    { facility_id: 'bergen_nj', name: 'Bergen County Jail', city: 'nyc', state: 'NJ', address: '160 S River St, Hackensack, NJ', lat: 40.8826, lng: -74.0435, facility_type: 'ice_contract', capacity: 1200 }
+  ];
+  
+  for (const f of facilities) {
+    try {
+      await pool.query(`
+        INSERT INTO detention_facilities (facility_id, name, city, state, address, lat, lng, facility_type, capacity)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (facility_id) DO NOTHING
+      `, [f.facility_id, f.name, f.city, f.state, f.address, f.lat, f.lng, f.facility_type, f.capacity]);
+    } catch (e) { /* ignore */ }
+  }
+}
+
+// Save incident to database
+async function saveIncidentToDb(incident) {
+  if (!pool) return null;
+  
+  try {
+    const result = await pool.query(`
+      INSERT INTO incidents_db (external_id, city, incident_type, location, borough, lat, lng, priority, summary, transcript, units, source, audio_url, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      ON CONFLICT (city, external_id) DO NOTHING
+      RETURNING id
+    `, [
+      `inc_${incident.id}`, incident.city || 'nyc', incident.incidentType, incident.location,
+      incident.borough, incident.lat, incident.lng, incident.priority, incident.summary,
+      incident.transcript, incident.units || [], incident.source, incident.audioUrl,
+      incident.timestamp || new Date()
+    ]);
+    
+    // Update address history
+    if (incident.location && incident.location !== 'Unknown') {
+      await updateAddressHistory(incident.location, incident.city || 'nyc');
+    }
+    
+    return result.rows[0]?.id;
+  } catch (error) {
+    console.error('[DB] Save incident error:', error.message);
+    return null;
+  }
+}
+
+// Update address history for problem location tracking
+async function updateAddressHistory(address, city) {
+  if (!pool) return;
+  
+  try {
+    await pool.query(`
+      INSERT INTO address_history (address, city, incident_count, last_incident_at)
+      VALUES ($1, $2, 1, NOW())
+      ON CONFLICT (address, city) DO UPDATE SET
+        incident_count = address_history.incident_count + 1,
+        last_incident_at = NOW(),
+        flagged = CASE WHEN address_history.incident_count >= 9 THEN TRUE ELSE address_history.flagged END
+    `, [address.toLowerCase().trim(), city]);
+  } catch (error) {
+    console.error('[DB] Address history error:', error.message);
+  }
+}
+
+// ============================================
+// PUBLIC DATA SYNC FUNCTIONS
+// ============================================
+
+// NYC Open Data - Arrests
+async function fetchNYCArrestData() {
+  if (!pool) return;
+  console.log('[DATA SYNC] Fetching NYC arrests...');
+  
+  try {
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const url = `https://data.cityofnewyork.us/resource/uip8-fykc.json?$where=arrest_date>='${thirtyDaysAgo}'&$limit=2000&$order=arrest_date DESC`;
+    
+    const response = await fetch(url, {
+      headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+    });
+    
+    if (!response.ok) return;
+    const data = await response.json();
+    let inserted = 0;
+    
+    for (const arrest of data) {
+      try {
+        const result = await pool.query(`
+          INSERT INTO arrests (external_id, city, arrest_date, offense_description, offense_category, law_category, borough, precinct, age_group, sex, lat, lng, source)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          ON CONFLICT (city, external_id) DO NOTHING
+          RETURNING id
+        `, [arrest.arrest_key, 'nyc', arrest.arrest_date, arrest.pd_desc, arrest.ofns_desc, arrest.law_cat_cd, arrest.arrest_boro, arrest.arrest_precinct, arrest.age_group, arrest.perp_sex, arrest.latitude, arrest.longitude, 'nyc_open_data']);
+        if (result.rows[0]) inserted++;
+      } catch (e) { /* skip */ }
+    }
+    
+    await pool.query('INSERT INTO data_sync_log (source, city, records_fetched, records_inserted, status) VALUES ($1, $2, $3, $4, $5)', ['nyc_arrests', 'nyc', data.length, inserted, 'success']);
+    console.log(`[DATA SYNC] NYC arrests: ${inserted}/${data.length} inserted`);
+  } catch (error) {
+    console.error('[DATA SYNC] NYC arrests error:', error.message);
+  }
+}
+
+// NYC DOC - Inmates
+async function fetchNYCInmateData() {
+  if (!pool) return;
+  console.log('[DATA SYNC] Fetching NYC inmates...');
+  
+  try {
+    const url = `https://data.cityofnewyork.us/resource/7479-ugqb.json?$limit=5000`;
+    const response = await fetch(url, {
+      headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+    });
+    
+    if (!response.ok) return;
+    const data = await response.json();
+    let inserted = 0;
+    
+    for (const inmate of data) {
+      try {
+        const result = await pool.query(`
+          INSERT INTO inmates (external_id, city, facility, admission_date, status, top_charge, age, sex, source)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          ON CONFLICT (city, external_id) DO NOTHING
+          RETURNING id
+        `, [inmate.inmateid, 'nyc', inmate.custody_level || 'Unknown', inmate.admitted_dt, 'in_custody', inmate.top_charge, inmate.age, inmate.gender, 'nyc_doc']);
+        if (result.rows[0]) inserted++;
+      } catch (e) { /* skip */ }
+    }
+    
+    await pool.query('INSERT INTO data_sync_log (source, city, records_fetched, records_inserted, status) VALUES ($1, $2, $3, $4, $5)', ['nyc_inmates', 'nyc', data.length, inserted, 'success']);
+    console.log(`[DATA SYNC] NYC inmates: ${inserted}/${data.length} inserted`);
+  } catch (error) {
+    console.error('[DATA SYNC] NYC inmates error:', error.message);
+  }
+}
+
+// Start data sync scheduler
+function startDataSyncScheduler() {
+  if (!pool) {
+    console.log('[DATA SYNC] Skipping - no database configured');
+    return;
+  }
+  
+  // NYC arrests - every 6 hours
+  setInterval(fetchNYCArrestData, 6 * 60 * 60 * 1000);
+  
+  // NYC inmates - every 4 hours  
+  setInterval(fetchNYCInmateData, 4 * 60 * 60 * 1000);
+  
+  // Initial sync after startup
+  setTimeout(fetchNYCArrestData, 15000);
+  setTimeout(fetchNYCInmateData, 45000);
+  
+  console.log('[DATA SYNC] Scheduler started');
+}
+
+// Initialize database on startup
+initDatabase().then(() => {
+  startDataSyncScheduler();
+});
+
+// ============================================
+// END DATABASE SYSTEM
 // ============================================
 
 const oddsEngine = {
@@ -4003,6 +4357,9 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     state.incidents.unshift(incident);
     if (state.incidents.length > 50) state.incidents.pop();
     
+    // Save to database (permanent archive)
+    saveIncidentToDb(incident);
+    
     // Also store in global for backwards compatibility (NYC only)
     if (cityId === 'nyc') {
       incidents.unshift(incident);
@@ -5766,6 +6123,395 @@ app.get('/leaderboard/transcribers', (req, res) => {
 
 // ============================================
 // END GAMIFICATION ENDPOINTS
+// ============================================
+
+// ============================================
+// DATABASE ARCHIVE ENDPOINTS
+// ============================================
+
+// Search incidents archive
+app.get('/archive/incidents', async (req, res) => {
+  if (!pool) return res.json({ incidents: [], total: 0, error: 'Database not configured' });
+  
+  const { city, borough, type, from, to, location, limit = 50, offset = 0 } = req.query;
+  
+  try {
+    let query = 'SELECT * FROM incidents_db WHERE 1=1';
+    const params = [];
+    let i = 1;
+    
+    if (city) { query += ` AND city = $${i++}`; params.push(city); }
+    if (borough) { query += ` AND borough ILIKE $${i++}`; params.push(`%${borough}%`); }
+    if (type) { query += ` AND incident_type ILIKE $${i++}`; params.push(`%${type}%`); }
+    if (location) { query += ` AND location ILIKE $${i++}`; params.push(`%${location}%`); }
+    if (from) { query += ` AND created_at >= $${i++}`; params.push(from); }
+    if (to) { query += ` AND created_at <= $${i++}`; params.push(to); }
+    
+    query += ` ORDER BY created_at DESC LIMIT $${i++} OFFSET $${i++}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    let countQuery = 'SELECT COUNT(*) FROM incidents_db WHERE 1=1';
+    const countParams = [];
+    let j = 1;
+    if (city) { countQuery += ` AND city = $${j++}`; countParams.push(city); }
+    if (borough) { countQuery += ` AND borough ILIKE $${j++}`; countParams.push(`%${borough}%`); }
+    
+    const countResult = await pool.query(countQuery, countParams);
+    
+    res.json({
+      incidents: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+      hasMore: parseInt(offset) + result.rows.length < parseInt(countResult.rows[0].count)
+    });
+  } catch (error) {
+    console.error('[API] Archive incidents error:', error.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Search arrests
+app.get('/archive/arrests', async (req, res) => {
+  if (!pool) return res.json({ arrests: [], total: 0, error: 'Database not configured' });
+  
+  const { city, borough, category, from, to, limit = 50, offset = 0 } = req.query;
+  
+  try {
+    let query = 'SELECT * FROM arrests WHERE 1=1';
+    const params = [];
+    let i = 1;
+    
+    if (city) { query += ` AND city = $${i++}`; params.push(city); }
+    if (borough) { query += ` AND borough ILIKE $${i++}`; params.push(`%${borough}%`); }
+    if (category) { query += ` AND (offense_category ILIKE $${i} OR offense_description ILIKE $${i++})`; params.push(`%${category}%`); }
+    if (from) { query += ` AND arrest_date >= $${i++}`; params.push(from); }
+    if (to) { query += ` AND arrest_date <= $${i++}`; params.push(to); }
+    
+    query += ` ORDER BY arrest_date DESC LIMIT $${i++} OFFSET $${i++}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    let countQuery = 'SELECT COUNT(*) FROM arrests WHERE 1=1';
+    const countParams = [];
+    let j = 1;
+    if (city) { countQuery += ` AND city = $${j++}`; countParams.push(city); }
+    
+    const countResult = await pool.query(countQuery, countParams);
+    
+    res.json({
+      arrests: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (error) {
+    console.error('[API] Archive arrests error:', error.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Search inmates
+app.get('/archive/inmates', async (req, res) => {
+  if (!pool) return res.json({ inmates: [], total: 0, error: 'Database not configured' });
+  
+  const { city, facility, status, limit = 50, offset = 0 } = req.query;
+  
+  try {
+    let query = 'SELECT * FROM inmates WHERE 1=1';
+    const params = [];
+    let i = 1;
+    
+    if (city) { query += ` AND city = $${i++}`; params.push(city); }
+    if (facility) { query += ` AND facility ILIKE $${i++}`; params.push(`%${facility}%`); }
+    if (status) { query += ` AND status = $${i++}`; params.push(status); }
+    
+    query += ` ORDER BY admission_date DESC LIMIT $${i++} OFFSET $${i++}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    const countResult = await pool.query('SELECT COUNT(*) FROM inmates');
+    
+    res.json({
+      inmates: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (error) {
+    console.error('[API] Archive inmates error:', error.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ICE activities archive
+app.get('/archive/ice', async (req, res) => {
+  if (!pool) return res.json({ activities: [], total: 0, error: 'Database not configured' });
+  
+  const { city, type, verified, from, to, limit = 50, offset = 0 } = req.query;
+  
+  try {
+    let query = 'SELECT * FROM ice_activities WHERE 1=1';
+    const params = [];
+    let i = 1;
+    
+    if (city) { query += ` AND city = $${i++}`; params.push(city); }
+    if (type) { query += ` AND activity_type = $${i++}`; params.push(type); }
+    if (verified === 'true') { query += ` AND verified = true`; }
+    if (verified === 'false') { query += ` AND verified = false`; }
+    if (from) { query += ` AND created_at >= $${i++}`; params.push(from); }
+    if (to) { query += ` AND created_at <= $${i++}`; params.push(to); }
+    
+    query += ` ORDER BY created_at DESC LIMIT $${i++} OFFSET $${i++}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    const countResult = await pool.query('SELECT COUNT(*) FROM ice_activities');
+    
+    res.json({
+      activities: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (error) {
+    console.error('[API] Archive ICE error:', error.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Detention facilities
+app.get('/archive/detention-facilities', async (req, res) => {
+  if (!pool) return res.json({ facilities: [] });
+  
+  const { city, type } = req.query;
+  
+  try {
+    let query = 'SELECT * FROM detention_facilities WHERE 1=1';
+    const params = [];
+    let i = 1;
+    
+    if (city) { query += ` AND city = $${i++}`; params.push(city); }
+    if (type) { query += ` AND facility_type = $${i++}`; params.push(type); }
+    
+    query += ' ORDER BY name';
+    
+    const result = await pool.query(query, params);
+    res.json({ facilities: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Location lookup (problem addresses)
+app.get('/archive/location', async (req, res) => {
+  if (!pool) return res.json({ error: 'Database not configured' });
+  
+  const { address, city = 'nyc' } = req.query;
+  if (!address) return res.status(400).json({ error: 'Address required' });
+  
+  try {
+    const historyResult = await pool.query(
+      'SELECT * FROM address_history WHERE address ILIKE $1 AND city = $2',
+      [`%${address}%`, city]
+    );
+    
+    const incidentsResult = await pool.query(
+      'SELECT * FROM incidents_db WHERE location ILIKE $1 AND city = $2 ORDER BY created_at DESC LIMIT 50',
+      [`%${address}%`, city]
+    );
+    
+    const iceResult = await pool.query(
+      'SELECT * FROM ice_activities WHERE location ILIKE $1 ORDER BY created_at DESC LIMIT 20',
+      [`%${address}%`]
+    );
+    
+    res.json({
+      address,
+      city,
+      history: historyResult.rows[0] || null,
+      incidents: incidentsResult.rows,
+      iceActivities: iceResult.rows,
+      isFlagged: historyResult.rows[0]?.flagged || false,
+      totalIncidents: historyResult.rows[0]?.incident_count || incidentsResult.rows.length
+    });
+  } catch (error) {
+    console.error('[API] Location lookup error:', error.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Problem locations (flagged addresses)
+app.get('/archive/problem-locations', async (req, res) => {
+  if (!pool) return res.json({ locations: [] });
+  
+  const { city, limit = 50 } = req.query;
+  
+  try {
+    let query = 'SELECT * FROM address_history WHERE incident_count >= 5';
+    const params = [];
+    let i = 1;
+    
+    if (city) { query += ` AND city = $${i++}`; params.push(city); }
+    query += ` ORDER BY incident_count DESC LIMIT $${i++}`;
+    params.push(parseInt(limit));
+    
+    const result = await pool.query(query, params);
+    res.json({ locations: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Statistics overview
+app.get('/archive/stats', async (req, res) => {
+  if (!pool) return res.json({ error: 'Database not configured' });
+  
+  const { city } = req.query;
+  
+  try {
+    const cityFilter = city ? `WHERE city = '${city}'` : '';
+    
+    const [incidents, arrests, inmates, ice] = await Promise.all([
+      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') as last_24h, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') as last_7d FROM incidents_db ${cityFilter}`),
+      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE arrest_date > CURRENT_DATE - INTERVAL '7 days') as last_7d FROM arrests ${cityFilter}`),
+      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE status = 'in_custody') as in_custody FROM inmates ${cityFilter}`),
+      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE verified = true) as verified FROM ice_activities ${city ? `WHERE city = '${city}'` : ''}`)
+    ]);
+    
+    const topTypes = await pool.query(`SELECT incident_type, COUNT(*) as count FROM incidents_db ${cityFilter} GROUP BY incident_type ORDER BY count DESC LIMIT 10`);
+    const byBorough = await pool.query(`SELECT borough, COUNT(*) as count FROM incidents_db ${cityFilter} GROUP BY borough ORDER BY count DESC LIMIT 10`);
+    
+    res.json({
+      city: city || 'all',
+      incidents: { total: parseInt(incidents.rows[0].total), last24h: parseInt(incidents.rows[0].last_24h), last7d: parseInt(incidents.rows[0].last_7d) },
+      arrests: { total: parseInt(arrests.rows[0].total), last7d: parseInt(arrests.rows[0].last_7d) },
+      inmates: { total: parseInt(inmates.rows[0].total), inCustody: parseInt(inmates.rows[0].in_custody) },
+      iceActivities: { total: parseInt(ice.rows[0].total), verified: parseInt(ice.rows[0].verified) },
+      topIncidentTypes: topTypes.rows,
+      byBorough: byBorough.rows,
+      lastUpdated: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[API] Stats error:', error.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Data sync status
+app.get('/archive/sync-status', async (req, res) => {
+  if (!pool) return res.json({ syncs: [] });
+  
+  try {
+    const result = await pool.query(`SELECT DISTINCT ON (source) * FROM data_sync_log ORDER BY source, completed_at DESC`);
+    res.json({ syncs: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Manual sync trigger (admin)
+app.post('/archive/sync', async (req, res) => {
+  const { source, adminKey } = req.body;
+  
+  if (adminKey !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    switch (source) {
+      case 'nyc_arrests': await fetchNYCArrestData(); break;
+      case 'nyc_inmates': await fetchNYCInmateData(); break;
+      case 'all':
+        await fetchNYCArrestData();
+        await fetchNYCInmateData();
+        break;
+      default:
+        return res.status(400).json({ error: 'Unknown source' });
+    }
+    res.json({ success: true, source, timestamp: new Date().toISOString() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Submit community report
+app.post('/archive/report', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  
+  const { city, reportType, location, lat, lng, description, reportedBy } = req.body;
+  
+  if (!city || !reportType || !description) {
+    return res.status(400).json({ error: 'Missing required fields: city, reportType, description' });
+  }
+  
+  try {
+    const result = await pool.query(`
+      INSERT INTO community_reports (city, report_type, location, lat, lng, description, reported_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING id
+    `, [city, reportType, location, lat, lng, description, reportedBy]);
+    
+    res.json({ success: true, reportId: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save report' });
+  }
+});
+
+// Submit ICE activity report
+app.post('/archive/ice', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  
+  const { city, activityType, location, lat, lng, description, agencies, source, sourceUrl, reportedBy } = req.body;
+  
+  if (!city || !activityType || !location) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  try {
+    const result = await pool.query(`
+      INSERT INTO ice_activities (city, activity_type, location, lat, lng, description, agencies, source, source_url, reported_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING id
+    `, [city, activityType, location, lat, lng, description, agencies || [], source || 'community_report', sourceUrl, reportedBy]);
+    
+    res.json({ success: true, activityId: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save ICE activity' });
+  }
+});
+
+// Verify ICE activity
+app.post('/archive/ice/:id/verify', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  
+  const { username } = req.body;
+  const { id } = req.params;
+  
+  try {
+    const result = await pool.query(`
+      UPDATE ice_activities 
+      SET verification_count = verification_count + 1,
+          verified = CASE WHEN verification_count >= 2 THEN TRUE ELSE verified END
+      WHERE id = $1
+      RETURNING *
+    `, [id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Activity not found' });
+    }
+    
+    res.json({ success: true, activity: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to verify' });
+  }
+});
+
+// ============================================
+// END DATABASE ARCHIVE ENDPOINTS
 // ============================================
 
 app.post('/predict/place', (req, res) => {
