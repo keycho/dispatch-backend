@@ -1541,37 +1541,42 @@ const detectiveBureau = detectiveBureaus.nyc;
 // Will be initialized after server starts
 
 // ============================================
-// BETTING SYSTEM
+// PREDICTION SYSTEM (PTS-BASED)
 // ============================================
 
-const TREASURY_WALLET = process.env.TREASURY_WALLET || 'YOUR_SOLANA_WALLET_HERE';
 const HOUSE_EDGE = 0.08; // 8% house edge
+const SIGNUP_BONUS = 500;
+const DAILY_LOGIN_BONUS = 50;
+const MIN_PREDICTION = 10;
+const MAX_PREDICTION = 10000;
+
+// User accounts store
+const users = new Map();
+const activePredictions = new Map();
+const predictionHistory = [];
 
 const oddsEngine = {
-  // Base rates: expected DETECTED incidents per hour per borough (realistic for scanner detection)
   boroughRates: { 
-    'Manhattan': 2.5,      // ~2-3 detected per hour
+    'Manhattan': 2.5,
     'Brooklyn': 2.0,       
     'Bronx': 1.8,          
     'Queens': 1.2,         
-    'Staten Island': 0.3   // Very quiet
+    'Staten Island': 0.3
   },
   
-  // Incident type rarity multipliers (applied to base rate)
   incidentTypeRarity: { 
-    'any': 1.0,            // Any incident
-    'traffic': 0.20,       // 20% of incidents
+    'any': 1.0,
+    'traffic': 0.20,
     'medical': 0.15,       
     'domestic': 0.12,      
     'assault': 0.08,       
     'suspicious': 0.10,    
     'theft': 0.06,         
-    'robbery': 0.03,       // Rare
-    'pursuit': 0.02,       // Very rare
-    'shots fired': 0.01    // Extremely rare
+    'robbery': 0.03,
+    'pursuit': 0.02,
+    'shots fired': 0.01
   },
   
-  // Time of day multipliers
   timeMultipliers: { 
     0: 0.6, 1: 0.4, 2: 0.3, 3: 0.2, 4: 0.3, 5: 0.4, 
     6: 0.6, 7: 0.8, 8: 0.9, 9: 1.0, 10: 1.0, 11: 1.1, 
@@ -1585,44 +1590,143 @@ const oddsEngine = {
     const timeAdjusted = baseRate * this.timeMultipliers[hour];
     const typeMultiplier = this.incidentTypeRarity[incidentType.toLowerCase()] || 0.05;
     const adjusted = timeAdjusted * typeMultiplier;
-    
-    // Poisson probability of at least 1 event: P(X >= 1) = 1 - e^(-λ)
     const lambda = (adjusted / 60) * windowMinutes;
     const probability = 1 - Math.exp(-lambda);
-    
-    // Cap probability: min 2%, max 85% (ensures house edge always works)
     return Math.max(0.02, Math.min(0.85, probability));
   },
   
   calculateMultiplier(probability) {
     const fairOdds = 1 / probability;
     const withEdge = fairOdds * (1 - HOUSE_EDGE);
-    // Min 1.1x, max 45x
     return Math.max(1.1, Math.min(45.0, Math.round(withEdge * 10) / 10));
   },
   
   getOdds(borough, incidentType = 'any', windowMinutes = 30) {
     const prob = this.calculateProbability(borough, incidentType, windowMinutes);
     const mult = this.calculateMultiplier(prob);
-    const expectedValue = (prob * mult) - 1; // Negative = house wins
-    
     return { 
       borough, 
       incidentType, 
       windowMinutes, 
-      probability: Math.round(prob * 100),      // Whole number percentage (e.g., 85)
-      probabilityRaw: prob,                      // Raw decimal for calculations
+      probability: Math.round(prob * 100),
+      probabilityRaw: prob,
       multiplier: mult,
-      expectedValue: Math.round(expectedValue * 1000) / 1000,
       houseEdge: `${(HOUSE_EDGE * 100).toFixed(0)}%`
     };
   }
 };
 
-const treasury = { totalReceived: 0, totalPaidOut: 0, get netProfit() { return this.totalReceived - this.totalPaidOut; } };
-const activeBets = new Map();
-const userProfiles = new Map();
-const betHistory = [];
+const pool = { 
+  totalPredictions: 0, 
+  totalPtsWagered: 0, 
+  totalPtsPaidOut: 0,
+  get netPool() { return this.totalPtsWagered - this.totalPtsPaidOut; }
+};
+
+// User management helpers
+function createUser(username) {
+  const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+  const user = {
+    id: userId,
+    username: username.toLowerCase().trim(),
+    displayName: username.trim(),
+    pts: SIGNUP_BONUS,
+    totalPredictions: 0,
+    wins: 0,
+    losses: 0,
+    totalWinnings: 0,
+    totalLosses: 0,
+    lastLoginDate: new Date().toISOString().split('T')[0],
+    createdAt: new Date().toISOString()
+  };
+  users.set(user.username, user);
+  return user;
+}
+
+function getUserByUsername(username) {
+  return users.get(username.toLowerCase().trim());
+}
+
+function checkDailyBonus(user) {
+  const today = new Date().toISOString().split('T')[0];
+  if (user.lastLoginDate !== today) {
+    user.pts += DAILY_LOGIN_BONUS;
+    user.lastLoginDate = today;
+    return { awarded: true, amount: DAILY_LOGIN_BONUS, newBalance: user.pts };
+  }
+  return { awarded: false, amount: 0, newBalance: user.pts };
+}
+
+// Check predictions when incident occurs
+function checkPredictionsForIncident(incident) {
+  const now = Date.now();
+  
+  activePredictions.forEach((pred, predId) => {
+    if (pred.status !== 'ACTIVE') return;
+    
+    if (now > new Date(pred.expiresAt).getTime()) {
+      pred.status = 'LOST';
+      pred.resolvedAt = new Date().toISOString();
+      pred.result = 'expired';
+      const user = users.get(pred.username);
+      if (user) { user.losses++; user.totalLosses += pred.amount; }
+      predictionHistory.unshift(pred);
+      activePredictions.delete(predId);
+      return;
+    }
+    
+    const boroughMatch = incident.borough?.toLowerCase() === pred.borough.toLowerCase();
+    const typeMatch = pred.incidentType === 'any' || 
+      incident.incidentType?.toLowerCase().includes(pred.incidentType.toLowerCase());
+    
+    if (boroughMatch && typeMatch) {
+      pred.status = 'WON';
+      pred.resolvedAt = new Date().toISOString();
+      pred.result = 'matched';
+      pred.matchedIncident = { id: incident.id, type: incident.incidentType, location: incident.location };
+      
+      const winnings = Math.floor(pred.amount * pred.multiplier);
+      pred.winnings = winnings;
+      
+      const user = users.get(pred.username);
+      if (user) { user.pts += winnings; user.wins++; user.totalWinnings += winnings; }
+      
+      pool.totalPtsPaidOut += winnings;
+      predictionHistory.unshift(pred);
+      activePredictions.delete(predId);
+      
+      broadcast({
+        type: 'prediction_won',
+        prediction: { id: pred.id, user: pred.displayName, borough: pred.borough, amount: pred.amount, winnings, multiplier: pred.multiplier },
+        incident: { id: incident.id, type: incident.incidentType, location: incident.location },
+        timestamp: new Date().toISOString()
+      });
+      
+      console.log(`[PREDICTION] WIN! ${pred.displayName} won ${winnings} PTS`);
+    }
+  });
+}
+
+// Periodic check for expired predictions
+setInterval(() => {
+  const now = Date.now();
+  activePredictions.forEach((pred, predId) => {
+    if (pred.status === 'ACTIVE' && now > new Date(pred.expiresAt).getTime()) {
+      pred.status = 'LOST';
+      pred.resolvedAt = new Date().toISOString();
+      pred.result = 'expired';
+      const user = users.get(pred.username);
+      if (user) { user.losses++; user.totalLosses += pred.amount; }
+      predictionHistory.unshift(pred);
+      activePredictions.delete(predId);
+    }
+  });
+}, 10000);
+
+// Legacy compatibility - keep old variable names pointing to new ones
+const activeBets = activePredictions;
+const userProfiles = users;
+const betHistory = predictionHistory;
 
 // ============================================
 // NYC CORRECTIONAL FACILITIES (Static Data)
@@ -3520,35 +3624,9 @@ setTimeout(startBroadcastifyStream, 5000);
 // BETTING FUNCTIONS
 // ============================================
 
+// Legacy function - now calls checkPredictionsForIncident
 function checkBetsForIncident(incident) {
-  const now = new Date();
-  activeBets.forEach((bet, betId) => {
-    if (bet.status !== 'ACTIVE') return;
-    if (now > new Date(bet.expiresAt)) {
-      bet.status = 'EXPIRED';
-      betHistory.unshift(bet);
-      activeBets.delete(betId);
-      return;
-    }
-    const boroughMatch = incident.borough?.toLowerCase() === bet.borough.toLowerCase();
-    const typeMatch = bet.incidentType === 'any' || incident.incidentType?.toLowerCase().includes(bet.incidentType.toLowerCase());
-    if (boroughMatch && typeMatch) {
-      bet.status = 'WON';
-      bet.winnings = bet.potentialWin;
-      treasury.totalPaidOut += bet.winnings;
-      const profile = userProfiles.get(bet.walletAddress);
-      if (profile) { profile.wins++; profile.totalWinnings += bet.winnings; }
-      betHistory.unshift(bet);
-      activeBets.delete(betId);
-      broadcast({
-        type: 'bet_won',
-        bet: { id: bet.id, user: `${bet.walletAddress.slice(0,4)}...${bet.walletAddress.slice(-4)}`, amount: bet.amountSOL, multiplier: bet.multiplier, winnings: bet.winnings / 1e9, borough: bet.borough },
-        incident: { id: incident.id, type: incident.incidentType, location: incident.location },
-        timestamp: new Date().toISOString()
-      });
-      console.log(`[BET] WINNER! ${bet.winnings / 1e9} SOL`);
-    }
-  });
+  checkPredictionsForIncident(incident);
 }
 
 // ============================================
@@ -4919,19 +4997,75 @@ app.post('/detective/cleanup', (req, res) => {
 });
 
 // Betting endpoints
-app.get('/bet/odds', (req, res) => {
+// Prediction Game endpoints (PTS-based)
+app.post('/auth/login', (req, res) => {
+  const { username } = req.body;
+  if (!username || username.length < 3 || username.length > 20) {
+    return res.status(400).json({ error: 'Username must be 3-20 characters' });
+  }
+  
+  const cleanUsername = username.toLowerCase().trim().replace(/[^a-z0-9_]/g, '');
+  if (cleanUsername.length < 3) {
+    return res.status(400).json({ error: 'Invalid username characters' });
+  }
+  
+  let user = getUserByUsername(cleanUsername);
+  let isNewUser = false;
+  
+  if (!user) {
+    user = createUser(cleanUsername);
+    isNewUser = true;
+  }
+  
+  const dailyBonus = checkDailyBonus(user);
+  
+  res.json({
+    success: true,
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.displayName,
+      pts: user.pts,
+      wins: user.wins,
+      losses: user.losses,
+      totalPredictions: user.totalPredictions,
+      winRate: user.totalPredictions > 0 ? ((user.wins / user.totalPredictions) * 100).toFixed(1) + '%' : '0%'
+    },
+    isNewUser,
+    signupBonus: isNewUser ? SIGNUP_BONUS : 0,
+    dailyBonus,
+    activePredictions: Array.from(activePredictions.values()).filter(p => p.username === user.username)
+  });
+});
+
+app.get('/auth/user/:username', (req, res) => {
+  const user = getUserByUsername(req.params.username);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  
+  res.json({
+    user: {
+      id: user.id, username: user.username, displayName: user.displayName, pts: user.pts,
+      wins: user.wins, losses: user.losses, totalPredictions: user.totalPredictions,
+      winRate: user.totalPredictions > 0 ? ((user.wins / user.totalPredictions) * 100).toFixed(1) + '%' : '0%'
+    },
+    activePredictions: Array.from(activePredictions.values()).filter(p => p.username === user.username),
+    recentHistory: predictionHistory.filter(p => p.username === user.username).slice(0, 20)
+  });
+});
+
+app.get('/predict/odds', (req, res) => {
   const { type = 'any', window = 30 } = req.query;
   const boroughs = ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
   res.json(boroughs.map(b => oddsEngine.getOdds(b, type, parseInt(window))));
 });
-app.get('/bet/all-odds', (req, res) => {
+
+app.get('/predict/all-odds', (req, res) => {
   const { window = 30 } = req.query;
   const boroughs = ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
   const types = ['any', 'assault', 'robbery', 'theft', 'pursuit', 'shots fired'];
   const odds = {};
   boroughs.forEach(b => { odds[b] = {}; types.forEach(t => { odds[b][t] = oddsEngine.getOdds(b, t, parseInt(window)); }); });
   
-  // Calculate summary stats
   const allOdds = boroughs.flatMap(b => types.map(t => odds[b][t]));
   const avgMultiplier = allOdds.reduce((s, o) => s + o.multiplier, 0) / allOdds.length;
   
@@ -4940,65 +5074,134 @@ app.get('/bet/all-odds', (req, res) => {
     windowMinutes: parseInt(window), 
     houseEdge: `${HOUSE_EDGE * 100}%`,
     currentHour: new Date().getHours(),
+    currency: 'PTS',
     summary: {
       avgMultiplier: Math.round(avgMultiplier * 10) / 10,
       lowestOdds: allOdds.reduce((min, o) => o.multiplier < min.multiplier ? o : min),
       highestOdds: allOdds.reduce((max, o) => o.multiplier > max.multiplier ? o : max)
     },
-    odds, 
-    treasury: { 
-      totalReceivedSOL: treasury.totalReceived / 1e9, 
-      totalPaidOutSOL: treasury.totalPaidOut / 1e9, 
-      netProfitSOL: treasury.netProfit / 1e9 
-    } 
+    odds,
+    pool: { totalPredictions: pool.totalPredictions, totalWagered: pool.totalPtsWagered, totalPaidOut: pool.totalPtsPaidOut }
   });
 });
-app.get('/bet/treasury', (req, res) => res.json({ wallet: TREASURY_WALLET, totalReceivedSOL: treasury.totalReceived / 1e9, totalPaidOutSOL: treasury.totalPaidOut / 1e9, netProfitSOL: treasury.netProfit / 1e9, activeBets: activeBets.size, houseEdge: `${HOUSE_EDGE * 100}%` }));
-app.get('/bet/pool', (req, res) => {
-  const active = Array.from(activeBets.values()).filter(b => b.status === 'ACTIVE');
+
+app.get('/predict/pool', (req, res) => {
+  const active = Array.from(activePredictions.values()).filter(p => p.status === 'ACTIVE');
   const poolByBorough = {};
-  active.forEach(bet => { if (!poolByBorough[bet.borough]) poolByBorough[bet.borough] = { total: 0, count: 0 }; poolByBorough[bet.borough].total += bet.amount; poolByBorough[bet.borough].count++; });
-  res.json({ totalPool: active.reduce((s, b) => s + b.amount, 0) / 1e9, totalBets: active.length, poolByBorough: Object.fromEntries(Object.entries(poolByBorough).map(([k, v]) => [k, { total: v.total / 1e9, count: v.count }])), recentWinners: betHistory.filter(b => b.status === 'WON').slice(0, 5) });
-});
-app.get('/bet/leaderboard', (req, res) => {
-  const leaders = Array.from(userProfiles.values()).sort((a, b) => b.totalWinnings - a.totalWinnings).slice(0, 20).map(p => ({ displayName: p.displayName, wins: p.wins, totalBets: p.totalBets, winnings: p.totalWinnings / 1e9, winRate: p.totalBets > 0 ? ((p.wins / p.totalBets) * 100).toFixed(1) + '%' : '0%' }));
-  res.json(leaders);
-});
-app.post('/bet/place', (req, res) => {
-  const { walletAddress, borough, incidentType, amount, timeWindow, txSignature } = req.body;
-  if (!walletAddress || !borough || !amount) return res.status(400).json({ error: 'Missing fields' });
-  const lamports = parseInt(amount);
-  if (lamports < 10000000 || lamports > 10000000000) return res.status(400).json({ error: 'Bet must be 0.01-10 SOL' });
-  const existing = Array.from(activeBets.values()).find(b => b.walletAddress === walletAddress && b.status === 'ACTIVE');
-  if (existing) return res.status(400).json({ error: 'Active bet exists', bet: existing });
-  
-  const type = incidentType || 'any';
-  const window = timeWindow || 30;
-  const odds = oddsEngine.getOdds(borough, type, window);
-  const potentialWin = Math.floor(lamports * odds.multiplier);
-  
-  const betId = `bet_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  const bet = { id: betId, walletAddress, borough, incidentType: type, amount: lamports, amountSOL: lamports / 1e9, timeWindow: window, txSignature, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + window * 60 * 1000).toISOString(), status: 'ACTIVE', multiplier: odds.multiplier, probability: odds.probability, potentialWin, potentialWinSOL: potentialWin / 1e9 };
-  
-  activeBets.set(betId, bet);
-  treasury.totalReceived += lamports;
-  
-  let profile = userProfiles.get(walletAddress);
-  if (!profile) { profile = { walletAddress, displayName: `${walletAddress.slice(0,4)}...${walletAddress.slice(-4)}`, totalBets: 0, wins: 0, totalWinnings: 0 }; userProfiles.set(walletAddress, profile); }
-  profile.totalBets++;
-  
-  broadcast({ type: 'new_bet', bet: { id: bet.id, borough: bet.borough, incidentType: bet.incidentType, amount: bet.amountSOL, multiplier: bet.multiplier, potentialWinSOL: bet.potentialWinSOL, user: profile.displayName }, timestamp: new Date().toISOString() });
-  
-  res.json({ success: true, bet, odds });
+  active.forEach(pred => { 
+    if (!poolByBorough[pred.borough]) poolByBorough[pred.borough] = { total: 0, count: 0 }; 
+    poolByBorough[pred.borough].total += pred.amount; 
+    poolByBorough[pred.borough].count++; 
+  });
+  res.json({ 
+    currency: 'PTS',
+    totalPool: active.reduce((s, p) => s + p.amount, 0), 
+    totalActive: active.length, 
+    poolByBorough, 
+    recentWinners: predictionHistory.filter(p => p.status === 'WON').slice(0, 10).map(p => ({
+      user: p.displayName, borough: p.borough, type: p.incidentType, amount: p.amount, winnings: p.winnings, multiplier: p.multiplier
+    }))
+  });
 });
 
-app.post('/auth/verify', (req, res) => {
-  const { walletAddress } = req.body;
-  if (!walletAddress) return res.status(400).json({ error: 'Wallet required' });
-  let profile = userProfiles.get(walletAddress);
-  if (!profile) { profile = { walletAddress, displayName: `${walletAddress.slice(0,4)}...${walletAddress.slice(-4)}`, totalBets: 0, wins: 0, totalWinnings: 0, createdAt: new Date().toISOString() }; userProfiles.set(walletAddress, profile); }
-  res.json({ success: true, profile, activeBets: Array.from(activeBets.values()).filter(b => b.walletAddress === walletAddress) });
+app.get('/predict/leaderboard', (req, res) => {
+  const leaders = Array.from(users.values())
+    .filter(u => u.totalPredictions > 0)
+    .sort((a, b) => b.pts - a.pts)
+    .slice(0, 50)
+    .map((u, rank) => ({
+      rank: rank + 1,
+      displayName: u.displayName,
+      pts: u.pts,
+      wins: u.wins,
+      losses: u.losses,
+      totalPredictions: u.totalPredictions,
+      winRate: u.totalPredictions > 0 ? ((u.wins / u.totalPredictions) * 100).toFixed(1) + '%' : '0%',
+      netProfit: u.totalWinnings - u.totalLosses
+    }));
+  res.json({ currency: 'PTS', leaderboard: leaders, totalPlayers: users.size, timestamp: new Date().toISOString() });
 });
+
+app.post('/predict/place', (req, res) => {
+  const { username, borough, incidentType, amount, timeWindow } = req.body;
+  
+  if (!username || !borough || !amount) return res.status(400).json({ error: 'Missing required fields' });
+  
+  const user = getUserByUsername(username);
+  if (!user) return res.status(401).json({ error: 'User not found. Please login first.' });
+  
+  const pts = parseInt(amount);
+  if (isNaN(pts) || pts < MIN_PREDICTION || pts > MAX_PREDICTION) {
+    return res.status(400).json({ error: `Prediction must be ${MIN_PREDICTION}-${MAX_PREDICTION} PTS` });
+  }
+  
+  if (user.pts < pts) return res.status(400).json({ error: 'Insufficient PTS', balance: user.pts, required: pts });
+  
+  const existing = Array.from(activePredictions.values()).find(p => p.username === user.username && p.status === 'ACTIVE');
+  if (existing) return res.status(400).json({ error: 'You already have an active prediction', prediction: existing });
+  
+  const type = incidentType || 'any';
+  const window = parseInt(timeWindow) || 30;
+  const odds = oddsEngine.getOdds(borough, type, window);
+  const potentialWin = Math.floor(pts * odds.multiplier);
+  
+  user.pts -= pts;
+  user.totalPredictions++;
+  
+  const predId = `pred_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const prediction = {
+    id: predId, username: user.username, displayName: user.displayName,
+    borough, incidentType: type, amount: pts, timeWindow: window,
+    multiplier: odds.multiplier, probability: odds.probability, potentialWin,
+    status: 'ACTIVE', createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + window * 60 * 1000).toISOString()
+  };
+  
+  activePredictions.set(predId, prediction);
+  pool.totalPredictions++;
+  pool.totalPtsWagered += pts;
+  
+  broadcast({ type: 'new_prediction', prediction: { id: prediction.id, user: user.displayName, borough, incidentType: type, amount: pts, multiplier: odds.multiplier, potentialWin }, timestamp: new Date().toISOString() });
+  
+  res.json({ success: true, prediction, odds, newBalance: user.pts });
+});
+
+app.delete('/predict/cancel/:predictionId', (req, res) => {
+  const { username } = req.body;
+  const pred = activePredictions.get(req.params.predictionId);
+  
+  if (!pred) return res.status(404).json({ error: 'Prediction not found' });
+  if (pred.username !== username) return res.status(403).json({ error: 'Not your prediction' });
+  if (pred.status !== 'ACTIVE') return res.status(400).json({ error: 'Prediction already resolved' });
+  
+  const elapsed = Date.now() - new Date(pred.createdAt).getTime();
+  if (elapsed > 30000) return res.status(400).json({ error: 'Can only cancel within 30 seconds' });
+  
+  const user = users.get(pred.username);
+  if (user) { user.pts += pred.amount; user.totalPredictions--; }
+  
+  pool.totalPtsWagered -= pred.amount;
+  activePredictions.delete(req.params.predictionId);
+  
+  res.json({ success: true, refunded: pred.amount, newBalance: user?.pts });
+});
+
+app.get('/predict/history', (req, res) => {
+  const { limit = 50 } = req.query;
+  res.json({
+    history: predictionHistory.slice(0, parseInt(limit)).map(p => ({
+      id: p.id, user: p.displayName, borough: p.borough, incidentType: p.incidentType,
+      amount: p.amount, multiplier: p.multiplier, status: p.status, winnings: p.winnings || 0,
+      createdAt: p.createdAt, resolvedAt: p.resolvedAt
+    })),
+    stats: { totalPredictions: pool.totalPredictions, totalWagered: pool.totalPtsWagered, totalPaidOut: pool.totalPtsPaidOut }
+  });
+});
+
+// Legacy bet endpoints (redirect to predict)
+app.get('/bet/odds', (req, res) => res.redirect('/predict/odds' + (req.query ? '?' + new URLSearchParams(req.query).toString() : '')));
+app.get('/bet/all-odds', (req, res) => res.redirect('/predict/all-odds' + (req.query ? '?' + new URLSearchParams(req.query).toString() : '')));
+app.get('/bet/leaderboard', (req, res) => res.redirect('/predict/leaderboard'));
 
 // Facility endpoints
 app.get('/facilities', (req, res) => {
