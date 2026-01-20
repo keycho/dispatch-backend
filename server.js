@@ -312,8 +312,141 @@ class DetectiveBureau {
 
     this.startProphetCycle();
     this.startPatternCycle();
+    this.startHistorianCycle();
+    this.startChaseCycle();
     
     console.log(`[DETECTIVE-${this.cityId.toUpperCase()}] Bureau initialized with`, this.memory.incidents.length, 'historical incidents');
+  }
+  
+  // HISTORIAN background training
+  startHistorianCycle() {
+    // Run every 10 minutes
+    setInterval(async () => {
+      await this.runHistorianAnalysis();
+    }, 10 * 60 * 1000);
+    
+    // Initial run after 2 minutes
+    setTimeout(() => this.runHistorianAnalysis(), 2 * 60 * 1000);
+  }
+  
+  async runHistorianAnalysis() {
+    this.agents.HISTORIAN.status = 'analyzing';
+    this.agents.HISTORIAN.stats.activations++;
+    
+    try {
+      const addressCounts = Array.from(this.memory.addressHistory.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 20);
+      
+      const response = await this.anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500,
+        system: this.agents.HISTORIAN.systemPrompt + `\n\nRespond in JSON: { "analysis": "summary", "repeatLocations": [{ "address": "...", "count": N, "concern": "HIGH/MEDIUM/LOW" }], "timePatterns": "description of time-based patterns", "recommendations": ["..."] }`,
+        messages: [{
+          role: "user",
+          content: `Analyze address history for ${this.cityId.toUpperCase()}:
+          
+ADDRESS FREQUENCY (top 20):
+${JSON.stringify(addressCounts)}
+
+TOTAL INCIDENTS IN MEMORY: ${this.memory.incidents.length}
+
+Identify repeat locations, problem areas, and time patterns. What addresses need attention?`
+        }]
+      });
+      
+      const text = response.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0]);
+        
+        this.agents.HISTORIAN.history.unshift({
+          timestamp: new Date().toISOString(),
+          addressesAnalyzed: addressCounts.length,
+          repeatLocations: result.repeatLocations?.length || 0,
+          analysis: result.analysis,
+          recommendations: result.recommendations
+        });
+        
+        if (this.agents.HISTORIAN.history.length > 100) {
+          this.agents.HISTORIAN.history = this.agents.HISTORIAN.history.slice(0, 100);
+        }
+        
+        console.log(`[HISTORIAN-${this.cityId.toUpperCase()}] Analysis complete: ${result.repeatLocations?.length || 0} repeat locations identified`);
+      }
+    } catch (error) {
+      console.error(`[HISTORIAN-${this.cityId.toUpperCase()}] Error:`, error.message);
+    }
+    
+    this.agents.HISTORIAN.status = 'idle';
+  }
+  
+  // CHASE background readiness check
+  startChaseCycle() {
+    // Run every 15 minutes
+    setInterval(async () => {
+      await this.runChaseReadiness();
+    }, 15 * 60 * 1000);
+    
+    // Initial run after 3 minutes
+    setTimeout(() => this.runChaseReadiness(), 3 * 60 * 1000);
+  }
+  
+  async runChaseReadiness() {
+    this.agents.CHASE.status = 'analyzing';
+    this.agents.CHASE.stats.activations++;
+    
+    try {
+      // Analyze recent pursuits if any
+      const recentPursuits = this.memory.incidents.filter(inc => {
+        const text = `${inc.incidentType} ${inc.summary || ''}`.toLowerCase();
+        return this.agents.CHASE.triggers.some(t => text.includes(t));
+      }).slice(0, 10);
+      
+      const response = await this.anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 400,
+        system: this.agents.CHASE.systemPrompt + `\n\nRespond in JSON: { "status": "ready/alert", "recentPursuits": N, "commonEscapeRoutes": ["..."], "highRiskAreas": ["..."], "recommendations": ["..."] }`,
+        messages: [{
+          role: "user",
+          content: `CHASE readiness check for ${this.cityId.toUpperCase()}:
+
+Time: ${new Date().toISOString()}
+Hour: ${new Date().getHours()} (${new Date().getHours() >= 22 || new Date().getHours() <= 5 ? 'HIGH pursuit risk hours' : 'Normal hours'})
+
+Recent pursuit-related incidents: ${recentPursuits.length}
+${recentPursuits.length > 0 ? JSON.stringify(recentPursuits) : 'None recently'}
+
+Analyze escape route patterns and high-risk areas for this time of day.`
+        }]
+      });
+      
+      const text = response.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0]);
+        
+        this.agents.CHASE.history.unshift({
+          timestamp: new Date().toISOString(),
+          status: result.status,
+          recentPursuits: recentPursuits.length,
+          highRiskAreas: result.highRiskAreas,
+          recommendations: result.recommendations
+        });
+        
+        if (this.agents.CHASE.history.length > 100) {
+          this.agents.CHASE.history = this.agents.CHASE.history.slice(0, 100);
+        }
+        
+        console.log(`[CHASE-${this.cityId.toUpperCase()}] Readiness: ${result.status}, watching ${result.highRiskAreas?.length || 0} areas`);
+      }
+    } catch (error) {
+      console.error(`[CHASE-${this.cityId.toUpperCase()}] Error:`, error.message);
+    }
+    
+    this.agents.CHASE.status = 'idle';
   }
 
   // ============================================
@@ -689,18 +822,17 @@ Are these connected? Is this part of an existing pattern or a new one forming? G
   // ============================================
 
   startProphetCycle() {
-    // Run every 15 minutes
+    // Run every 5 minutes (was 15)
     setInterval(async () => {
       await this.runProphet();
-    }, 15 * 60 * 1000);
+    }, 5 * 60 * 1000);
     
-    // Initial run after 2 minutes
-    setTimeout(() => this.runProphet(), 2 * 60 * 1000);
+    // Initial run after 30 seconds
+    setTimeout(() => this.runProphet(), 30 * 1000);
   }
 
   async runProphet() {
-    if (this.memory.incidents.length < 5) return;
-    
+    // Run even with 0 incidents - can make predictions based on time/patterns
     this.agents.PROPHET.status = 'analyzing';
     this.agents.PROPHET.stats.activations++;
     
@@ -717,24 +849,25 @@ Are these connected? Is this part of an existing pattern or a new one forming? G
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
         max_tokens: 600,
-        system: this.agents.PROPHET.systemPrompt + `\n\nYou have access to your prediction history. Learn from hits and misses. Respond in JSON: { "predictions": [{ "location": "specific NYC location", "borough": "string", "incidentType": "string", "timeWindowMinutes": number, "confidence": 0.0-1.0, "reasoning": "string", "basedOnPattern": "pattern name or null" }] }. Make 1-3 specific predictions.`,
+        system: this.agents.PROPHET.systemPrompt + `\n\nYou are analyzing ${this.cityId.toUpperCase()}. You have access to your prediction history. Learn from hits and misses. Respond in JSON: { "predictions": [{ "location": "specific ${this.cityId.toUpperCase()} location", "borough": "string", "incidentType": "string", "timeWindowMinutes": number, "confidence": 0.0-1.0, "reasoning": "string", "basedOnPattern": "pattern name or null" }], "analysis": "brief analysis of current situation" }. Make 1-3 specific predictions.`,
         messages: [{
           role: "user",
           content: `Current time: ${new Date().toISOString()}
 Hour: ${new Date().getHours()}
 Day: ${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][new Date().getDay()]}
+City: ${this.cityId.toUpperCase()}
 
 RECENT INCIDENTS (${recentIncidents.length}):
-${JSON.stringify(recentIncidents.slice(0, 15))}
+${recentIncidents.length > 0 ? JSON.stringify(recentIncidents.slice(0, 15)) : 'No incidents yet - make predictions based on time patterns and general knowledge'}
 
 HOTSPOTS:
-${JSON.stringify(hotspots)}
+${hotspots.length > 0 ? JSON.stringify(hotspots) : 'No hotspots identified yet'}
 
 ACTIVE PATTERNS:
-${JSON.stringify(activePatterns)}
+${activePatterns.length > 0 ? JSON.stringify(activePatterns) : 'No active patterns yet'}
 
 YOUR RECENT PREDICTION PERFORMANCE (learn from this):
-${JSON.stringify(recentPredictions)}
+${recentPredictions.length > 0 ? JSON.stringify(recentPredictions) : 'No prediction history yet - start fresh'}
 
 Based on patterns, hotspots, time of day, and your learning from past predictions, what incidents do you predict in the next 30-60 minutes? Be specific about location.`
         }]
@@ -881,37 +1014,72 @@ Based on patterns, hotspots, time of day, and your learning from past prediction
   // ============================================
 
   startPatternCycle() {
+    // Run every 3 minutes (was 5)
     setInterval(async () => {
-      if (this.memory.incidents.length < 10) return;
+      await this.runBackgroundPatternAnalysis();
+    }, 3 * 60 * 1000);
+    
+    // Initial run after 1 minute
+    setTimeout(() => this.runBackgroundPatternAnalysis(), 60 * 1000);
+  }
+  
+  async runBackgroundPatternAnalysis() {
+    // Run even with few incidents - can analyze time patterns, geographic focus, etc.
+    this.agents.PATTERN.status = 'analyzing';
       
-      this.agents.PATTERN.status = 'analyzing';
+    try {
+      // Expire old patterns (24 hours)
+      this.memory.patterns = this.memory.patterns.map(p => {
+        const age = Date.now() - new Date(p.detectedAt).getTime();
+        if (age > 24 * 60 * 60 * 1000 && p.status === 'active') {
+          return { ...p, status: 'expired' };
+        }
+        return p;
+      });
       
-      try {
-        // Expire old patterns (24 hours)
-        this.memory.patterns = this.memory.patterns.map(p => {
-          const age = Date.now() - new Date(p.detectedAt).getTime();
-          if (age > 24 * 60 * 60 * 1000 && p.status === 'active') {
-            return { ...p, status: 'expired' };
-          }
-          return p;
+      const incidentCount = this.memory.incidents.length;
+      const analysisPrompt = incidentCount > 0 
+        ? `Analyze these ${Math.min(incidentCount, 50)} incidents for patterns:\n${JSON.stringify(this.memory.incidents.slice(0, 50))}`
+        : `No incidents recorded yet. Analyze typical ${this.cityId.toUpperCase()} crime patterns for this time of day (${new Date().getHours()}:00) and day of week (${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][new Date().getDay()]}). What patterns should we watch for?`;
+      
+      const response = await this.anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 600,
+        system: this.agents.PATTERN.systemPrompt + `\n\nRespond in JSON: { "analysis": "your analysis", "patterns": [{ "name": "pattern name", "description": "description", "confidence": "HIGH/MEDIUM/LOW" }], "watchAreas": ["areas to monitor"] }`,
+        messages: [{
+          role: "user",
+          content: analysisPrompt
+        }]
+      });
+      
+      const text = response.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0]);
+        
+        // Store analysis in history
+        this.agents.PATTERN.history.unshift({
+          timestamp: new Date().toISOString(),
+          incidentsAnalyzed: incidentCount,
+          analysis: result.analysis,
+          patternsFound: result.patterns?.length || 0,
+          watchAreas: result.watchAreas
         });
         
-        const response = await this.anthropic.messages.create({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 600,
-          system: this.agents.PATTERN.systemPrompt,
-          messages: [{
-            role: "user",
-            content: `Background analysis of last 50 incidents for emerging patterns:\n${JSON.stringify(this.memory.incidents.slice(0, 50))}`
-          }]
-        });
+        // Keep history manageable
+        if (this.agents.PATTERN.history.length > 100) {
+          this.agents.PATTERN.history = this.agents.PATTERN.history.slice(0, 100);
+        }
         
-        console.log('[PATTERN] Background analysis complete');
-      } catch (error) {
-        console.error('[PATTERN] Background error:', error.message);
+        this.agents.PATTERN.stats.activations++;
+        console.log(`[PATTERN-${this.cityId.toUpperCase()}] Analysis complete: ${result.patterns?.length || 0} patterns, watching ${result.watchAreas?.length || 0} areas`);
       }
-      
-      this.agents.PATTERN.status = 'idle';
+    } catch (error) {
+      console.error(`[PATTERN-${this.cityId.toUpperCase()}] Background error:`, error.message);
+    }
+    
+    this.agents.PATTERN.status = 'idle';
     }, 5 * 60 * 1000);
   }
 
@@ -931,8 +1099,26 @@ Based on patterns, hotspots, time of day, and your learning from past prediction
       icon: agent.icon,
       role: agent.role,
       status: agent.status,
-      stats: agent.stats
+      stats: agent.stats,
+      recentHistory: agent.history?.slice(0, 10) || [],
+      historyCount: agent.history?.length || 0
     }));
+  }
+  
+  // Get full agent history for scrolling
+  getAgentHistory(agentId, limit = 50) {
+    const agent = this.agents[agentId];
+    if (!agent) return null;
+    
+    return {
+      id: agent.id,
+      name: agent.name,
+      icon: agent.icon,
+      role: agent.role,
+      stats: agent.stats,
+      history: agent.history?.slice(0, limit) || [],
+      totalHistoryCount: agent.history?.length || 0
+    };
   }
 
   getPredictionStats() {
@@ -3388,6 +3574,74 @@ app.get('/city/:cityId/detective/agents', (req, res) => {
   const bureau = detectiveBureaus[cityId];
   if (!bureau) return res.status(404).json({ error: 'City not found' });
   res.json(bureau.getAgentStatuses());
+});
+
+// Get specific agent's full history
+app.get('/city/:cityId/detective/agent/:agentId/history', (req, res) => {
+  const { cityId, agentId } = req.params;
+  const { limit = 50 } = req.query;
+  const bureau = detectiveBureaus[cityId];
+  if (!bureau) return res.status(404).json({ error: 'City not found' });
+  
+  const history = bureau.getAgentHistory(agentId.toUpperCase(), parseInt(limit));
+  if (!history) return res.status(404).json({ error: 'Agent not found' });
+  
+  res.json(history);
+});
+
+// Trigger manual agent training/analysis
+app.post('/city/:cityId/detective/train', async (req, res) => {
+  const { cityId } = req.params;
+  const bureau = detectiveBureaus[cityId];
+  if (!bureau) return res.status(404).json({ error: 'City not found' });
+  
+  console.log(`[DETECTIVE-${cityId.toUpperCase()}] Manual training triggered`);
+  
+  // Run all agents
+  const results = {
+    timestamp: new Date().toISOString(),
+    city: cityId,
+    agents: {}
+  };
+  
+  try {
+    // Run PATTERN analysis
+    await bureau.runBackgroundPatternAnalysis();
+    results.agents.PATTERN = 'completed';
+  } catch (e) {
+    results.agents.PATTERN = `error: ${e.message}`;
+  }
+  
+  try {
+    // Run PROPHET predictions
+    await bureau.runProphet();
+    results.agents.PROPHET = 'completed';
+  } catch (e) {
+    results.agents.PROPHET = `error: ${e.message}`;
+  }
+  
+  try {
+    // Run HISTORIAN analysis
+    await bureau.runHistorianAnalysis();
+    results.agents.HISTORIAN = 'completed';
+  } catch (e) {
+    results.agents.HISTORIAN = `error: ${e.message}`;
+  }
+  
+  try {
+    // Run CHASE readiness
+    await bureau.runChaseReadiness();
+    results.agents.CHASE = 'completed';
+  } catch (e) {
+    results.agents.CHASE = `error: ${e.message}`;
+  }
+  
+  res.json({
+    success: true,
+    message: 'Training cycle completed',
+    results,
+    agentStatuses: bureau.getAgentStatuses()
+  });
 });
 
 // City-specific predictions
