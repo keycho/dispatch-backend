@@ -1955,6 +1955,29 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_arrests_city ON arrests(city);
       CREATE INDEX IF NOT EXISTS idx_arrests_date ON arrests(arrest_date DESC);
 
+      -- 911 Calls (NYC 311/911)
+      CREATE TABLE IF NOT EXISTS calls_911 (
+        id SERIAL PRIMARY KEY,
+        external_id TEXT,
+        city TEXT NOT NULL DEFAULT 'nyc',
+        created_date TIMESTAMP,
+        closed_date TIMESTAMP,
+        agency TEXT,
+        incident_type TEXT,
+        descriptor TEXT,
+        location_type TEXT,
+        address TEXT,
+        borough TEXT,
+        lat DOUBLE PRECISION,
+        lng DOUBLE PRECISION,
+        source TEXT DEFAULT 'nyc_311_911',
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(city, external_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_calls_911_city ON calls_911(city);
+      CREATE INDEX IF NOT EXISTS idx_calls_911_date ON calls_911(created_date DESC);
+      CREATE INDEX IF NOT EXISTS idx_calls_911_type ON calls_911(incident_type);
+
       -- Inmates
       CREATE TABLE IF NOT EXISTS inmates (
         id SERIAL PRIMARY KEY,
@@ -2125,24 +2148,60 @@ async function updateAddressHistory(address, city) {
 // PUBLIC DATA SYNC FUNCTIONS
 // ============================================
 
-// NYC Open Data - Arrests
+// NYC Open Data - Arrests (Historic + YTD)
 async function fetchNYCArrestData() {
   if (!pool) return;
-  console.log('[DATA SYNC] Fetching NYC arrests...');
+  console.log('[DATA SYNC] Fetching NYC arrests (historic + YTD)...');
   
   try {
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const url = `https://data.cityofnewyork.us/resource/uip8-fykc.json?$where=arrest_date>='${thirtyDaysAgo}'&$limit=2000&$order=arrest_date DESC`;
     
-    const response = await fetch(url, {
-      headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+    // Historic dataset (2006 - end of previous year)
+    const historicUrl = `https://data.cityofnewyork.us/resource/8h9b-rp9u.json?$where=arrest_date>='${thirtyDaysAgo}'&$limit=2000&$order=arrest_date DESC`;
+    
+    // YTD dataset (current year, updated quarterly)
+    const ytdUrl = `https://data.cityofnewyork.us/resource/uip8-fykc.json?$where=arrest_date>='${thirtyDaysAgo}'&$limit=2000&$order=arrest_date DESC`;
+    
+    let allData = [];
+    
+    // Fetch historic
+    try {
+      const historicRes = await fetch(historicUrl, {
+        headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+      });
+      if (historicRes.ok) {
+        const historicData = await historicRes.json();
+        allData = allData.concat(historicData);
+        console.log(`[DATA SYNC] Historic arrests: ${historicData.length} fetched`);
+      }
+    } catch (e) {
+      console.log('[DATA SYNC] Historic fetch error:', e.message);
+    }
+    
+    // Fetch YTD (might be empty early in year)
+    try {
+      const ytdRes = await fetch(ytdUrl, {
+        headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+      });
+      if (ytdRes.ok) {
+        const ytdData = await ytdRes.json();
+        allData = allData.concat(ytdData);
+        console.log(`[DATA SYNC] YTD arrests: ${ytdData.length} fetched`);
+      }
+    } catch (e) {
+      console.log('[DATA SYNC] YTD fetch error:', e.message);
+    }
+    
+    // Dedupe by arrest_key
+    const seen = new Set();
+    const deduped = allData.filter(a => {
+      if (seen.has(a.arrest_key)) return false;
+      seen.add(a.arrest_key);
+      return true;
     });
     
-    if (!response.ok) return;
-    const data = await response.json();
     let inserted = 0;
-    
-    for (const arrest of data) {
+    for (const arrest of deduped) {
       try {
         const result = await pool.query(`
           INSERT INTO arrests (external_id, city, arrest_date, offense_description, offense_category, law_category, borough, precinct, age_group, sex, lat, lng, source)
@@ -2154,10 +2213,69 @@ async function fetchNYCArrestData() {
       } catch (e) { /* skip */ }
     }
     
-    await pool.query('INSERT INTO data_sync_log (source, city, records_fetched, records_inserted, status) VALUES ($1, $2, $3, $4, $5)', ['nyc_arrests', 'nyc', data.length, inserted, 'success']);
-    console.log(`[DATA SYNC] NYC arrests: ${inserted}/${data.length} inserted`);
+    await pool.query('INSERT INTO data_sync_log (source, city, records_fetched, records_inserted, status) VALUES ($1, $2, $3, $4, $5)', ['nyc_arrests', 'nyc', deduped.length, inserted, 'success']);
+    console.log(`[DATA SYNC] NYC arrests: ${inserted}/${deduped.length} inserted`);
   } catch (error) {
     console.error('[DATA SYNC] NYC arrests error:', error.message);
+    await pool.query('INSERT INTO data_sync_log (source, city, records_fetched, records_inserted, status, error_message) VALUES ($1, $2, $3, $4, $5, $6)', 
+      ['nyc_arrests', 'nyc', 0, 0, 'error', error.message]).catch(() => {});
+  }
+}
+
+// NYC 311/911 Calls - NYPD related
+async function fetchNYC911Data() {
+  if (!pool) return;
+  console.log('[DATA SYNC] Fetching NYC 911 calls...');
+  
+  try {
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const url = `https://data.cityofnewyork.us/resource/erm2-nwe9.json?$where=created_date>='${oneDayAgo}' AND agency='NYPD'&$limit=1000&$order=created_date DESC`;
+    
+    const response = await fetch(url, {
+      headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+    });
+    
+    if (!response.ok) {
+      console.log('[DATA SYNC] 911 calls API returned:', response.status);
+      return;
+    }
+    
+    const data = await response.json();
+    let inserted = 0;
+    
+    for (const call of data) {
+      try {
+        const result = await pool.query(`
+          INSERT INTO calls_911 (external_id, city, created_date, closed_date, agency, incident_type, descriptor, location_type, address, borough, lat, lng, source)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          ON CONFLICT (city, external_id) DO NOTHING
+          RETURNING id
+        `, [
+          call.unique_key, 
+          'nyc', 
+          call.created_date, 
+          call.closed_date,
+          call.agency_name || 'NYPD',
+          call.complaint_type,
+          call.descriptor,
+          call.location_type,
+          call.incident_address,
+          call.borough,
+          call.latitude,
+          call.longitude,
+          'nyc_311_911'
+        ]);
+        if (result.rows[0]) inserted++;
+      } catch (e) { /* skip dupes */ }
+    }
+    
+    await pool.query('INSERT INTO data_sync_log (source, city, records_fetched, records_inserted, status) VALUES ($1, $2, $3, $4, $5)', 
+      ['nyc_911', 'nyc', data.length, inserted, 'success']);
+    console.log(`[DATA SYNC] NYC 911 calls: ${inserted}/${data.length} inserted`);
+  } catch (error) {
+    console.error('[DATA SYNC] NYC 911 error:', error.message);
+    await pool.query('INSERT INTO data_sync_log (source, city, records_fetched, records_inserted, status, error_message) VALUES ($1, $2, $3, $4, $5, $6)', 
+      ['nyc_911', 'nyc', 0, 0, 'error', error.message]).catch(() => {});
   }
 }
 
@@ -2208,9 +2326,13 @@ function startDataSyncScheduler() {
   // NYC inmates - every 4 hours  
   setInterval(fetchNYCInmateData, 4 * 60 * 60 * 1000);
   
+  // NYC 911 calls - every hour (more frequent updates)
+  setInterval(fetchNYC911Data, 60 * 60 * 1000);
+  
   // Initial sync after startup
   setTimeout(fetchNYCArrestData, 15000);
   setTimeout(fetchNYCInmateData, 45000);
+  setTimeout(fetchNYC911Data, 30000);
   
   console.log('[DATA SYNC] Scheduler started');
 }
@@ -3741,6 +3863,25 @@ async function processOpenMHzCall(call, cityId = 'nyc') {
       if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}` });
       
       console.log(`[OPENMHZ-${cityId.toUpperCase()} INCIDENT]`, incident.incidentType, '@', incident.location, `(${incident.borough})`);
+      
+      // Log scanner-detected arrests to database
+      if (parsed.isArrest && pool) {
+        try {
+          await pool.query(`
+            INSERT INTO arrests (external_id, city, arrest_date, offense_description, offense_category, borough, lat, lng, source)
+            VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, 'scanner')
+          `, [
+            `scanner_${Date.now()}`,
+            cityId,
+            parsed.incidentType,
+            parsed.arrestType || 'unknown',
+            parsed.borough,
+            camera?.lat,
+            camera?.lng
+          ]);
+          console.log(`[SCANNER ARREST] Logged: ${parsed.incidentType} at ${parsed.location}`);
+        } catch (e) { /* skip dupes */ }
+      }
     }
     
     // ICE WATCHER: Analyze Minneapolis transcripts for ICE activity
@@ -3950,12 +4091,12 @@ async function parseTranscript(transcript) {
       system: `You are an expert NYPD radio parser. Your PRIMARY job is to extract LOCATION information.
 
 LOCATION EXTRACTION RULES:
-1. Look for street addresses: "123 West 45th Street" â†’ location: "123 W 45th St"
-2. Look for intersections: "42nd and Lexington", "at the corner of Broadway and 125th" â†’ location: "42nd St & Lexington Ave"
-3. Look for landmarks: "Times Square", "Penn Station", "Grand Central", "Port Authority" â†’ use landmark name
-4. Look for precinct references: "the 7-5", "75 precinct", "seven-five" â†’ location: "75th Precinct", borough: "Brooklyn"
+1. Look for street addresses: "123 West 45th Street" -> location: "123 W 45th St"
+2. Look for intersections: "42nd and Lexington", "at the corner of Broadway and 125th" -> location: "42nd St & Lexington Ave"
+3. Look for landmarks: "Times Square", "Penn Station", "Grand Central", "Port Authority" -> use landmark name
+4. Look for precinct references: "the 7-5", "75 precinct", "seven-five" -> location: "75th Precinct", borough: "Brooklyn"
 5. Look for sector/Adam/Boy/Charlie designations with location context
-6. Look for highways: "FDR at 96th", "BQE", "Cross Bronx" â†’ use highway location
+6. Look for highways: "FDR at 96th", "BQE", "Cross Bronx" -> use highway location
 7. Look for project names, building names, park names
 
 PRECINCT TO BOROUGH MAPPING:
@@ -3980,14 +4121,24 @@ INCIDENT TYPE MAPPING:
 - 10-53: Accident
 - 10-54: Ambulance needed
 - 10-85: Backup needed
-- Shots fired, shooting, gun â†’ Shots Fired
-- EDP, emotionally disturbed â†’ EDP
-- Pursuit, chase, fleeing â†’ Pursuit
+- Shots fired, shooting, gun -> Shots Fired
+- EDP, emotionally disturbed -> EDP
+- Pursuit, chase, fleeing -> Pursuit
+- "perp in custody", "under arrest", "one under", "collar" -> Arrest
+- "cuffed", "in cuffs", "prisoner", "bringing one in" -> Arrest
+- "booking", "central booking", "going to central" -> Arrest
+
+ARREST DETECTION:
+If the transmission indicates someone is being arrested, detained, or taken into custody:
+- Set "isArrest": true
+- Set "arrestType" to: "on-scene" (caught at scene), "warrant" (serving warrant), "pursuit" (after chase), or "unknown"
 
 Respond ONLY with valid JSON:
 {
   "hasIncident": boolean,
   "incidentType": "string describing incident",
+  "isArrest": boolean,
+  "arrestType": "on-scene/warrant/pursuit/unknown or null",
   "location": "specific location or null if none found",
   "borough": "Manhattan/Brooklyn/Bronx/Queens/Staten Island/Unknown",
   "units": ["unit IDs mentioned"],
@@ -4021,12 +4172,16 @@ Respond ONLY with valid JSON:
         parsed.location = 'Unknown';
       }
       
+      // Ensure arrest fields exist
+      parsed.isArrest = parsed.isArrest || false;
+      parsed.arrestType = parsed.arrestType || null;
+      
       return parsed;
     }
-    return { hasIncident: false };
+    return { hasIncident: false, isArrest: false };
   } catch (error) {
     console.error('[PARSE] Error:', error.message);
-    return { hasIncident: false };
+    return { hasIncident: false, isArrest: false };
   }
 }
 
@@ -4381,6 +4536,25 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}`, priority: parsed.priority });
     
     console.log(`[${feedName}] 🚨 INCIDENT (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
+    
+    // Log scanner-detected arrests to database
+    if (parsed.isArrest && pool) {
+      try {
+        await pool.query(`
+          INSERT INTO arrests (external_id, city, arrest_date, offense_description, offense_category, borough, lat, lng, source)
+          VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, 'scanner')
+        `, [
+          `scanner_${Date.now()}`,
+          cityId,
+          parsed.incidentType,
+          parsed.arrestType || 'unknown',
+          parsed.borough,
+          camera?.lat,
+          camera?.lng
+        ]);
+        console.log(`[SCANNER ARREST] Logged: ${parsed.incidentType} at ${parsed.location}`);
+      } catch (e) { /* skip dupes */ }
+    }
   } else {
     // Broadcast as monitoring even if no incident detected
     broadcastToCity(cityId, {
@@ -6214,6 +6388,47 @@ app.get('/archive/arrests', async (req, res) => {
   }
 });
 
+// Search 911 calls
+app.get('/archive/911-calls', async (req, res) => {
+  if (!pool) return res.json({ calls: [], total: 0, error: 'Database not configured' });
+  
+  try {
+    const { borough, type, from, to, limit = 100, offset = 0 } = req.query;
+    let query = 'SELECT * FROM calls_911 WHERE 1=1';
+    const params = [];
+    let i = 1;
+    
+    if (borough) { query += ` AND LOWER(borough) = LOWER($${i++})`; params.push(borough); }
+    if (type) { query += ` AND LOWER(incident_type) LIKE LOWER($${i++})`; params.push(`%${type}%`); }
+    if (from) { query += ` AND created_date >= $${i++}`; params.push(from); }
+    if (to) { query += ` AND created_date <= $${i++}`; params.push(to); }
+    
+    query += ` ORDER BY created_date DESC LIMIT $${i++} OFFSET $${i++}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    // Get total count
+    let countQuery = 'SELECT COUNT(*) FROM calls_911 WHERE 1=1';
+    const countParams = [];
+    let j = 1;
+    if (borough) { countQuery += ` AND LOWER(borough) = LOWER($${j++})`; countParams.push(borough); }
+    if (type) { countQuery += ` AND LOWER(incident_type) LIKE LOWER($${j++})`; countParams.push(`%${type}%`); }
+    
+    const countResult = await pool.query(countQuery, countParams);
+    
+    res.json({
+      calls: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (error) {
+    console.error('[API] 911 calls error:', error.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
 // Search inmates
 app.get('/archive/inmates', async (req, res) => {
   if (!pool) return res.json({ inmates: [], total: 0, error: 'Database not configured' });
@@ -6375,11 +6590,12 @@ app.get('/archive/stats', async (req, res) => {
   try {
     const cityFilter = city ? `WHERE city = '${city}'` : '';
     
-    const [incidents, arrests, inmates, ice] = await Promise.all([
+    const [incidents, arrests, inmates, ice, calls911] = await Promise.all([
       pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') as last_24h, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') as last_7d FROM incidents_db ${cityFilter}`),
       pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE arrest_date > CURRENT_DATE - INTERVAL '7 days') as last_7d FROM arrests ${cityFilter}`),
       pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE status = 'in_custody') as in_custody FROM inmates ${cityFilter}`),
-      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE verified = true) as verified FROM ice_activities ${city ? `WHERE city = '${city}'` : ''}`)
+      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE verified = true) as verified FROM ice_activities ${city ? `WHERE city = '${city}'` : ''}`),
+      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE created_date > NOW() - INTERVAL '24 hours') as last_24h FROM calls_911 ${cityFilter}`).catch(() => ({ rows: [{ total: 0, last_24h: 0 }] }))
     ]);
     
     const topTypes = await pool.query(`SELECT incident_type, COUNT(*) as count FROM incidents_db ${cityFilter} GROUP BY incident_type ORDER BY count DESC LIMIT 10`);
@@ -6391,6 +6607,7 @@ app.get('/archive/stats', async (req, res) => {
       arrests: { total: parseInt(arrests.rows[0].total), last7d: parseInt(arrests.rows[0].last_7d) },
       inmates: { total: parseInt(inmates.rows[0].total), inCustody: parseInt(inmates.rows[0].in_custody) },
       iceActivities: { total: parseInt(ice.rows[0].total), verified: parseInt(ice.rows[0].verified) },
+      calls911: { total: parseInt(calls911.rows[0].total || 0), last24h: parseInt(calls911.rows[0].last_24h || 0) },
       topIncidentTypes: topTypes.rows,
       byBorough: byBorough.rows,
       lastUpdated: new Date().toISOString()
@@ -6425,9 +6642,11 @@ app.post('/archive/sync', async (req, res) => {
     switch (source) {
       case 'nyc_arrests': await fetchNYCArrestData(); break;
       case 'nyc_inmates': await fetchNYCInmateData(); break;
+      case 'nyc_911': await fetchNYC911Data(); break;
       case 'all':
         await fetchNYCArrestData();
         await fetchNYCInmateData();
+        await fetchNYC911Data();
         break;
       default:
         return res.status(400).json({ error: 'Unknown source' });
