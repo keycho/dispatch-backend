@@ -1556,25 +1556,22 @@ const activePredictions = new Map();
 const predictionHistory = [];
 
 const oddsEngine = {
-  boroughRates: { 
-    'Manhattan': 2.5,
-    'Brooklyn': 2.0,       
-    'Bronx': 1.8,          
-    'Queens': 1.2,         
-    'Staten Island': 0.3
+  // City-specific district rates
+  districtRates: {
+    nyc: { 
+      'Manhattan': 2.5, 'Brooklyn': 2.0, 'Bronx': 1.8, 'Queens': 1.2, 'Staten Island': 0.3
+    },
+    mpls: {
+      'Downtown': 1.8, 'North': 1.5, 'Northeast': 1.0, 'Southeast': 0.8, 'South': 1.2,
+      'Southwest': 0.7, 'Calhoun-Isles': 0.5, 'Camden': 1.3, 'Near North': 1.6,
+      'Phillips': 1.4, 'Powderhorn': 1.1, 'Nokomis': 0.6, 'Longfellow': 0.8
+    }
   },
   
   incidentTypeRarity: { 
-    'any': 1.0,
-    'traffic': 0.20,
-    'medical': 0.15,       
-    'domestic': 0.12,      
-    'assault': 0.08,       
-    'suspicious': 0.10,    
-    'theft': 0.06,         
-    'robbery': 0.03,
-    'pursuit': 0.02,
-    'shots fired': 0.01
+    'any': 1.0, 'traffic': 0.20, 'medical': 0.15, 'domestic': 0.12,
+    'assault': 0.08, 'suspicious': 0.10, 'theft': 0.06, 'robbery': 0.03,
+    'pursuit': 0.02, 'shots fired': 0.01
   },
   
   timeMultipliers: { 
@@ -1584,9 +1581,14 @@ const oddsEngine = {
     18: 1.4, 19: 1.5, 20: 1.6, 21: 1.5, 22: 1.3, 23: 0.9 
   },
   
-  calculateProbability(borough, incidentType = 'any', windowMinutes = 30) {
+  getDistricts(cityId = 'nyc') {
+    return Object.keys(this.districtRates[cityId] || this.districtRates.nyc);
+  },
+  
+  calculateProbability(district, incidentType = 'any', windowMinutes = 30, cityId = 'nyc') {
     const hour = new Date().getHours();
-    const baseRate = this.boroughRates[borough] || 1.0;
+    const cityRates = this.districtRates[cityId] || this.districtRates.nyc;
+    const baseRate = cityRates[district] || 1.0;
     const timeAdjusted = baseRate * this.timeMultipliers[hour];
     const typeMultiplier = this.incidentTypeRarity[incidentType.toLowerCase()] || 0.05;
     const adjusted = timeAdjusted * typeMultiplier;
@@ -1601,11 +1603,12 @@ const oddsEngine = {
     return Math.max(1.1, Math.min(45.0, Math.round(withEdge * 10) / 10));
   },
   
-  getOdds(borough, incidentType = 'any', windowMinutes = 30) {
-    const prob = this.calculateProbability(borough, incidentType, windowMinutes);
+  getOdds(district, incidentType = 'any', windowMinutes = 30, cityId = 'nyc') {
+    const prob = this.calculateProbability(district, incidentType, windowMinutes, cityId);
     const mult = this.calculateMultiplier(prob);
     return { 
-      borough, 
+      district,
+      borough: district, // Legacy compatibility
       incidentType, 
       windowMinutes, 
       probability: Math.round(prob * 100),
@@ -1660,6 +1663,7 @@ function checkDailyBonus(user) {
 // Check predictions when incident occurs
 function checkPredictionsForIncident(incident) {
   const now = Date.now();
+  const incidentCity = incident.city || 'nyc'; // Default to nyc for backwards compatibility
   
   activePredictions.forEach((pred, predId) => {
     if (pred.status !== 'ACTIVE') return;
@@ -1675,11 +1679,19 @@ function checkPredictionsForIncident(incident) {
       return;
     }
     
-    const boroughMatch = incident.borough?.toLowerCase() === pred.borough.toLowerCase();
+    // Must match city first
+    const predCity = pred.city || 'nyc';
+    if (predCity !== incidentCity) return;
+    
+    // Match district/borough (handle both field names)
+    const predDistrict = (pred.district || pred.borough || '').toLowerCase();
+    const incidentDistrict = (incident.district || incident.borough || '').toLowerCase();
+    const districtMatch = predDistrict === incidentDistrict;
+    
     const typeMatch = pred.incidentType === 'any' || 
       incident.incidentType?.toLowerCase().includes(pred.incidentType.toLowerCase());
     
-    if (boroughMatch && typeMatch) {
+    if (districtMatch && typeMatch) {
       pred.status = 'WON';
       pred.resolvedAt = new Date().toISOString();
       pred.result = 'matched';
@@ -1697,12 +1709,12 @@ function checkPredictionsForIncident(incident) {
       
       broadcast({
         type: 'prediction_won',
-        prediction: { id: pred.id, user: pred.displayName, borough: pred.borough, amount: pred.amount, winnings, multiplier: pred.multiplier },
+        prediction: { id: pred.id, user: pred.displayName, city: pred.city, district: pred.district, amount: pred.amount, winnings, multiplier: pred.multiplier },
         incident: { id: incident.id, type: incident.incidentType, location: incident.location },
         timestamp: new Date().toISOString()
       });
       
-      console.log(`[PREDICTION] WIN! ${pred.displayName} won ${winnings} PTS`);
+      console.log(`[PREDICTION] WIN! ${pred.displayName} won ${winnings} PTS in ${pred.city}`);
     }
   });
 }
@@ -5054,23 +5066,25 @@ app.get('/auth/user/:username', (req, res) => {
 });
 
 app.get('/predict/odds', (req, res) => {
-  const { type = 'any', window = 30 } = req.query;
-  const boroughs = ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
-  res.json(boroughs.map(b => oddsEngine.getOdds(b, type, parseInt(window))));
+  const { type = 'any', window = 30, city = 'nyc' } = req.query;
+  const districts = oddsEngine.getDistricts(city);
+  res.json(districts.map(d => oddsEngine.getOdds(d, type, parseInt(window), city)));
 });
 
 app.get('/predict/all-odds', (req, res) => {
-  const { window = 30 } = req.query;
-  const boroughs = ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
+  const { window = 30, city = 'nyc' } = req.query;
+  const districts = oddsEngine.getDistricts(city);
   const types = ['any', 'assault', 'robbery', 'theft', 'pursuit', 'shots fired'];
   const odds = {};
-  boroughs.forEach(b => { odds[b] = {}; types.forEach(t => { odds[b][t] = oddsEngine.getOdds(b, t, parseInt(window)); }); });
+  districts.forEach(d => { odds[d] = {}; types.forEach(t => { odds[d][t] = oddsEngine.getOdds(d, t, parseInt(window), city); }); });
   
-  const allOdds = boroughs.flatMap(b => types.map(t => odds[b][t]));
+  const allOdds = districts.flatMap(d => types.map(t => odds[d][t]));
   const avgMultiplier = allOdds.reduce((s, o) => s + o.multiplier, 0) / allOdds.length;
   
   res.json({ 
     timestamp: new Date().toISOString(), 
+    city,
+    districts,
     windowMinutes: parseInt(window), 
     houseEdge: `${HOUSE_EDGE * 100}%`,
     currentHour: new Date().getHours(),
@@ -5123,9 +5137,16 @@ app.get('/predict/leaderboard', (req, res) => {
 });
 
 app.post('/predict/place', (req, res) => {
-  const { username, borough, incidentType, amount, timeWindow } = req.body;
+  const { username, borough, district, incidentType, amount, timeWindow, city = 'nyc' } = req.body;
+  const selectedDistrict = district || borough; // Support both district and borough names
   
-  if (!username || !borough || !amount) return res.status(400).json({ error: 'Missing required fields' });
+  if (!username || !selectedDistrict || !amount) return res.status(400).json({ error: 'Missing required fields' });
+  
+  // Validate district exists for this city
+  const validDistricts = oddsEngine.getDistricts(city);
+  if (!validDistricts.includes(selectedDistrict)) {
+    return res.status(400).json({ error: `Invalid district for ${city}`, validDistricts });
+  }
   
   const user = getUserByUsername(username);
   if (!user) return res.status(401).json({ error: 'User not found. Please login first.' });
@@ -5142,7 +5163,7 @@ app.post('/predict/place', (req, res) => {
   
   const type = incidentType || 'any';
   const window = parseInt(timeWindow) || 30;
-  const odds = oddsEngine.getOdds(borough, type, window);
+  const odds = oddsEngine.getOdds(selectedDistrict, type, window, city);
   const potentialWin = Math.floor(pts * odds.multiplier);
   
   user.pts -= pts;
@@ -5151,7 +5172,8 @@ app.post('/predict/place', (req, res) => {
   const predId = `pred_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   const prediction = {
     id: predId, username: user.username, displayName: user.displayName,
-    borough, incidentType: type, amount: pts, timeWindow: window,
+    city, district: selectedDistrict, borough: selectedDistrict, // Store both for compatibility
+    incidentType: type, amount: pts, timeWindow: window,
     multiplier: odds.multiplier, probability: odds.probability, potentialWin,
     status: 'ACTIVE', createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + window * 60 * 1000).toISOString()
@@ -5161,7 +5183,7 @@ app.post('/predict/place', (req, res) => {
   pool.totalPredictions++;
   pool.totalPtsWagered += pts;
   
-  broadcast({ type: 'new_prediction', prediction: { id: prediction.id, user: user.displayName, borough, incidentType: type, amount: pts, multiplier: odds.multiplier, potentialWin }, timestamp: new Date().toISOString() });
+  broadcast({ type: 'new_prediction', prediction: { id: prediction.id, user: user.displayName, city, district: selectedDistrict, incidentType: type, amount: pts, multiplier: odds.multiplier, potentialWin }, timestamp: new Date().toISOString() });
   
   res.json({ success: true, prediction, odds, newBalance: user.pts });
 });
