@@ -1555,6 +1555,321 @@ const users = new Map();
 const activePredictions = new Map();
 const predictionHistory = [];
 
+// ============================================
+// GAMIFICATION SYSTEM
+// ============================================
+
+// --- RANKS & TITLES ---
+const RANKS = [
+  { minPts: 0, rank: 'Rookie', icon: '👤', color: '#6b7280' },
+  { minPts: 500, rank: 'Beat Cop', icon: '👮', color: '#3b82f6' },
+  { minPts: 2000, rank: 'Detective', icon: '🔍', color: '#8b5cf6' },
+  { minPts: 5000, rank: 'Sergeant', icon: '⭐', color: '#f59e0b' },
+  { minPts: 10000, rank: 'Lieutenant', icon: '🎖️', color: '#ef4444' },
+  { minPts: 25000, rank: 'Captain', icon: '🏅', color: '#ec4899' },
+  { minPts: 50000, rank: 'Commander', icon: '👑', color: '#f97316' },
+  { minPts: 100000, rank: 'Commissioner', icon: '🏆', color: '#ffd700' }
+];
+
+function getUserRank(pts) {
+  let currentRank = RANKS[0];
+  let nextRank = RANKS[1];
+  
+  for (let i = RANKS.length - 1; i >= 0; i--) {
+    if (pts >= RANKS[i].minPts) {
+      currentRank = RANKS[i];
+      nextRank = RANKS[i + 1] || null;
+      break;
+    }
+  }
+  
+  const progress = nextRank 
+    ? ((pts - currentRank.minPts) / (nextRank.minPts - currentRank.minPts)) * 100
+    : 100;
+  
+  return {
+    ...currentRank,
+    currentPts: pts,
+    nextRank: nextRank ? {
+      rank: nextRank.rank,
+      minPts: nextRank.minPts,
+      ptsNeeded: nextRank.minPts - pts
+    } : null,
+    progress: Math.min(100, Math.round(progress))
+  };
+}
+
+// --- STREAK SYSTEM ---
+const STREAK_BONUSES = {
+  login: [
+    { days: 1, bonus: 50, label: 'Daily' },
+    { days: 3, bonus: 75, label: '3-Day Streak' },
+    { days: 7, bonus: 150, label: 'Week Warrior' },
+    { days: 14, bonus: 300, label: 'Dedicated' },
+    { days: 30, bonus: 500, label: 'Monthly Master' }
+  ],
+  prediction: [
+    { streak: 2, multiplier: 1.1, label: 'Double Down' },
+    { streak: 3, multiplier: 1.25, label: 'Hot Streak' },
+    { streak: 5, multiplier: 1.5, label: 'On Fire' },
+    { streak: 10, multiplier: 2.0, label: 'Unstoppable' }
+  ]
+};
+
+function calculateLoginStreak(user) {
+  const today = new Date().toISOString().split('T')[0];
+  const lastLogin = user.lastLoginDate;
+  
+  if (!lastLogin) return { streak: 1, isNewDay: true };
+  
+  const lastDate = new Date(lastLogin);
+  const todayDate = new Date(today);
+  const diffDays = Math.floor((todayDate - lastDate) / (1000 * 60 * 60 * 24));
+  
+  if (diffDays === 0) return { streak: user.loginStreak || 1, isNewDay: false };
+  if (diffDays === 1) return { streak: (user.loginStreak || 0) + 1, isNewDay: true };
+  return { streak: 1, isNewDay: true };
+}
+
+function getLoginBonus(streak) {
+  let bonus = STREAK_BONUSES.login[0].bonus;
+  let label = STREAK_BONUSES.login[0].label;
+  
+  for (const tier of STREAK_BONUSES.login) {
+    if (streak >= tier.days) { bonus = tier.bonus; label = tier.label; }
+  }
+  return { bonus, label, streak };
+}
+
+function getPredictionStreakMultiplier(winStreak) {
+  let multiplier = 1.0;
+  let label = null;
+  
+  for (const tier of STREAK_BONUSES.prediction) {
+    if (winStreak >= tier.streak) { multiplier = tier.multiplier; label = tier.label; }
+  }
+  return { multiplier, label, streak: winStreak };
+}
+
+// --- LIVE ACTIVITY FEED ---
+const activityFeed = [];
+const MAX_FEED_ITEMS = 100;
+
+function addToActivityFeed(activity) {
+  const item = {
+    id: `activity_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+    ...activity,
+    timestamp: new Date().toISOString()
+  };
+  
+  activityFeed.unshift(item);
+  if (activityFeed.length > MAX_FEED_ITEMS) activityFeed.pop();
+  
+  broadcast({ type: 'activity_feed', activity: item });
+  return item;
+}
+
+// --- BOUNTY BOARD ---
+const bounties = new Map();
+const bountyHistory = [];
+const BOUNTY_TYPES = {
+  PHOTO: { label: 'Photo Request', icon: '📸', basePts: 200 },
+  VERIFY: { label: 'Verification', icon: '✅', basePts: 150 },
+  TRANSLATE: { label: 'Translation', icon: '🌐', basePts: 300 },
+  INTEL: { label: 'Local Intel', icon: '🔍', basePts: 175 },
+  LOCATION: { label: 'Location Check', icon: '📍', basePts: 100 }
+};
+
+function createBounty(data) {
+  const { type, title, description, location, city, reward, expiresInMinutes = 60, createdBy } = data;
+  const bountyId = `bounty_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  const bounty = {
+    id: bountyId, type, typeInfo: BOUNTY_TYPES[type] || BOUNTY_TYPES.INTEL,
+    title, description, location, city: city || 'nyc',
+    reward: reward || BOUNTY_TYPES[type]?.basePts || 100,
+    createdBy, createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString(),
+    status: 'ACTIVE', claimedBy: null, claimedAt: null,
+    submission: null, completedAt: null, verifications: []
+  };
+  
+  bounties.set(bountyId, bounty);
+  addToActivityFeed({ type: 'bounty_created', bountyId, title, reward: bounty.reward, location, user: createdBy });
+  return bounty;
+}
+
+function claimBounty(bountyId, username) {
+  const bounty = bounties.get(bountyId);
+  if (!bounty) return { error: 'Bounty not found' };
+  if (bounty.status !== 'ACTIVE') return { error: 'Bounty not available' };
+  if (new Date() > new Date(bounty.expiresAt)) { bounty.status = 'EXPIRED'; return { error: 'Bounty expired' }; }
+  
+  bounty.status = 'CLAIMED';
+  bounty.claimedBy = username;
+  bounty.claimedAt = new Date().toISOString();
+  bounty.submissionDeadline = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  
+  addToActivityFeed({ type: 'bounty_claimed', bountyId, title: bounty.title, user: username });
+  return { success: true, bounty };
+}
+
+function submitBounty(bountyId, username, submission) {
+  const bounty = bounties.get(bountyId);
+  if (!bounty) return { error: 'Bounty not found' };
+  if (bounty.claimedBy !== username) return { error: 'Not your bounty' };
+  if (bounty.status !== 'CLAIMED') return { error: 'Invalid bounty status' };
+  
+  bounty.submission = { content: submission.content, imageUrl: submission.imageUrl || null, submittedAt: new Date().toISOString() };
+  bounty.status = 'PENDING_VERIFICATION';
+  return { success: true, bounty };
+}
+
+function verifyBountySubmission(bountyId, verifierUsername, approved) {
+  const bounty = bounties.get(bountyId);
+  if (!bounty) return { error: 'Bounty not found' };
+  if (bounty.status !== 'PENDING_VERIFICATION') return { error: 'Not pending verification' };
+  if (bounty.claimedBy === verifierUsername) return { error: 'Cannot verify your own submission' };
+  if (bounty.verifications.some(v => v.username === verifierUsername)) return { error: 'Already verified' };
+  
+  bounty.verifications.push({ username: verifierUsername, approved, timestamp: new Date().toISOString() });
+  
+  const verifier = getUserByUsername(verifierUsername);
+  if (verifier) { verifier.pts += 10; verifier.verificationsGiven = (verifier.verificationsGiven || 0) + 1; }
+  
+  const approvals = bounty.verifications.filter(v => v.approved).length;
+  const rejections = bounty.verifications.filter(v => !v.approved).length;
+  
+  if (approvals >= 3) completeBounty(bountyId);
+  else if (rejections >= 3) {
+    bounty.status = 'ACTIVE'; bounty.claimedBy = null; bounty.claimedAt = null;
+    bounty.submission = null; bounty.verifications = [];
+  }
+  
+  return { success: true, bounty, approvals, rejections };
+}
+
+function completeBounty(bountyId) {
+  const bounty = bounties.get(bountyId);
+  if (!bounty) return { error: 'Bounty not found' };
+  
+  bounty.status = 'COMPLETED';
+  bounty.completedAt = new Date().toISOString();
+  
+  const user = getUserByUsername(bounty.claimedBy);
+  if (user) {
+    user.pts += bounty.reward;
+    user.bountiesCompleted = (user.bountiesCompleted || 0) + 1;
+    user.totalBountyEarnings = (user.totalBountyEarnings || 0) + bounty.reward;
+  }
+  
+  bountyHistory.unshift(bounty);
+  bounties.delete(bountyId);
+  
+  addToActivityFeed({ type: 'bounty_completed', bountyId, title: bounty.title, reward: bounty.reward, user: bounty.claimedBy });
+  broadcast({ type: 'bounty_completed', bounty, user: bounty.claimedBy });
+  
+  return { success: true, bounty };
+}
+
+// Expire stale bounties
+setInterval(() => {
+  const now = Date.now();
+  bounties.forEach((bounty, id) => {
+    if (bounty.status === 'ACTIVE' && now > new Date(bounty.expiresAt).getTime()) {
+      bounty.status = 'EXPIRED'; bountyHistory.unshift(bounty); bounties.delete(id);
+    }
+    if (bounty.status === 'CLAIMED' && bounty.submissionDeadline && now > new Date(bounty.submissionDeadline).getTime()) {
+      bounty.status = 'ACTIVE'; bounty.claimedBy = null; bounty.claimedAt = null; bounty.submissionDeadline = null;
+    }
+  });
+}, 30000);
+
+// --- TRANSCRIPTION BOUNTIES ---
+const transcriptionQueue = [];
+const MAX_TRANSCRIPTION_QUEUE = 50;
+const TRANSCRIPTION_REWARD = 25;
+
+function addTranscriptionForVerification(transcript, audioId, source) {
+  const item = {
+    id: `trans_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+    originalText: transcript, audioId, source,
+    timestamp: new Date().toISOString(),
+    status: 'PENDING', corrections: [], verifications: []
+  };
+  
+  transcriptionQueue.unshift(item);
+  if (transcriptionQueue.length > MAX_TRANSCRIPTION_QUEUE) transcriptionQueue.pop();
+  return item;
+}
+
+function submitTranscriptionCorrection(transcriptId, username, correctedText, corrections) {
+  const item = transcriptionQueue.find(t => t.id === transcriptId);
+  if (!item) return { error: 'Transcript not found' };
+  if (item.status !== 'PENDING') return { error: 'Already processed' };
+  if (item.corrections.some(c => c.username === username)) return { error: 'Already submitted correction' };
+  
+  item.corrections.push({ username, correctedText, corrections, timestamp: new Date().toISOString() });
+  
+  if (item.corrections.length >= 3) processTranscriptionCorrections(item);
+  return { success: true, item };
+}
+
+function processTranscriptionCorrections(item) {
+  const textCounts = {};
+  item.corrections.forEach(c => {
+    const key = c.correctedText.toLowerCase().trim();
+    textCounts[key] = (textCounts[key] || 0) + 1;
+  });
+  
+  let consensusText = item.originalText;
+  let maxCount = 0;
+  Object.entries(textCounts).forEach(([text, count]) => {
+    if (count > maxCount) { maxCount = count; consensusText = text; }
+  });
+  
+  if (maxCount >= 2 && consensusText !== item.originalText.toLowerCase().trim()) {
+    item.status = 'VERIFIED';
+    item.finalText = consensusText;
+    
+    item.corrections.forEach(c => {
+      if (c.correctedText.toLowerCase().trim() === consensusText) {
+        const user = getUserByUsername(c.username);
+        if (user) {
+          user.pts += TRANSCRIPTION_REWARD;
+          user.transcriptionsVerified = (user.transcriptionsVerified || 0) + 1;
+          addToActivityFeed({ type: 'transcription_verified', user: c.username, reward: TRANSCRIPTION_REWARD });
+        }
+      }
+    });
+  } else if (item.corrections.length >= 5) {
+    item.status = 'DISPUTED';
+  }
+}
+
+function verifyTranscription(transcriptId, username, isCorrect) {
+  const item = transcriptionQueue.find(t => t.id === transcriptId);
+  if (!item) return { error: 'Transcript not found' };
+  if (item.verifications.some(v => v.username === username)) return { error: 'Already verified' };
+  
+  item.verifications.push({ username, isCorrect, timestamp: new Date().toISOString() });
+  
+  const user = getUserByUsername(username);
+  if (user) user.pts += 5;
+  
+  const correctVotes = item.verifications.filter(v => v.isCorrect).length;
+  const incorrectVotes = item.verifications.filter(v => !v.isCorrect).length;
+  
+  if (correctVotes >= 3) item.status = 'VERIFIED';
+  else if (incorrectVotes >= 3) item.needsCorrection = true;
+  
+  return { success: true, item, correctVotes, incorrectVotes };
+}
+
+// ============================================
+// END GAMIFICATION SYSTEM
+// ============================================
+
 const oddsEngine = {
   // City-specific district rates
   districtRates: {
@@ -1634,15 +1949,36 @@ function createUser(username) {
     username: username.toLowerCase().trim(),
     displayName: username.trim(),
     pts: SIGNUP_BONUS,
+    
+    // Predictions
     totalPredictions: 0,
     wins: 0,
     losses: 0,
     totalWinnings: 0,
     totalLosses: 0,
+    currentWinStreak: 0,
+    bestWinStreak: 0,
+    
+    // Streaks
+    loginStreak: 1,
+    bestLoginStreak: 1,
     lastLoginDate: new Date().toISOString().split('T')[0],
+    
+    // Bounties
+    bountiesCompleted: 0,
+    bountiesCreated: 0,
+    totalBountyEarnings: 0,
+    
+    // Transcriptions
+    transcriptionsVerified: 0,
+    verificationsGiven: 0,
+    
     createdAt: new Date().toISOString()
   };
   users.set(user.username, user);
+  
+  addToActivityFeed({ type: 'user_joined', user: user.displayName });
+  
   return user;
 }
 
@@ -1673,9 +2009,15 @@ function checkPredictionsForIncident(incident) {
       pred.resolvedAt = new Date().toISOString();
       pred.result = 'expired';
       const user = users.get(pred.username);
-      if (user) { user.losses++; user.totalLosses += pred.amount; }
+      if (user) { 
+        user.losses++; 
+        user.totalLosses += pred.amount;
+        user.currentWinStreak = 0; // Reset streak on loss
+      }
       predictionHistory.unshift(pred);
       activePredictions.delete(predId);
+      
+      addToActivityFeed({ type: 'prediction_lost', user: pred.displayName, district: pred.district, amount: pred.amount });
       return;
     }
     
@@ -1697,24 +2039,76 @@ function checkPredictionsForIncident(incident) {
       pred.result = 'matched';
       pred.matchedIncident = { id: incident.id, type: incident.incidentType, location: incident.location };
       
-      const winnings = Math.floor(pred.amount * pred.multiplier);
-      pred.winnings = winnings;
-      
       const user = users.get(pred.username);
-      if (user) { user.pts += winnings; user.wins++; user.totalWinnings += winnings; }
       
+      // Calculate base winnings
+      let winnings = Math.floor(pred.amount * pred.multiplier);
+      
+      if (user) {
+        // Update win streak
+        user.currentWinStreak = (user.currentWinStreak || 0) + 1;
+        if (user.currentWinStreak > (user.bestWinStreak || 0)) {
+          user.bestWinStreak = user.currentWinStreak;
+        }
+        
+        // Apply streak bonus multiplier
+        const streakBonus = getPredictionStreakMultiplier(user.currentWinStreak);
+        if (streakBonus.multiplier > 1) {
+          winnings = Math.floor(winnings * streakBonus.multiplier);
+          pred.streakBonus = {
+            multiplier: streakBonus.multiplier,
+            label: streakBonus.label,
+            streak: user.currentWinStreak
+          };
+        }
+        
+        user.pts += winnings;
+        user.wins++;
+        user.totalWinnings += winnings;
+        
+        // Check for rank up
+        const oldRank = getUserRank(user.pts - winnings);
+        const newRank = getUserRank(user.pts);
+        if (newRank.rank !== oldRank.rank) {
+          pred.rankUp = { from: oldRank.rank, to: newRank.rank, icon: newRank.icon };
+          addToActivityFeed({ type: 'rank_up', user: user.displayName, newRank: newRank.rank, newRankIcon: newRank.icon });
+        }
+      }
+      
+      pred.winnings = winnings;
       pool.totalPtsPaidOut += winnings;
       predictionHistory.unshift(pred);
       activePredictions.delete(predId);
       
+      // Add to activity feed
+      addToActivityFeed({
+        type: 'prediction_won',
+        user: pred.displayName,
+        district: pred.district,
+        amount: pred.amount,
+        winnings: winnings,
+        multiplier: pred.multiplier,
+        streakBonus: pred.streakBonus
+      });
+      
+      // Broadcast win with animation data
       broadcast({
         type: 'prediction_won',
-        prediction: { id: pred.id, user: pred.displayName, city: pred.city, district: pred.district, amount: pred.amount, winnings, multiplier: pred.multiplier },
+        prediction: { 
+          id: pred.id, user: pred.displayName, city: pred.city, district: pred.district, 
+          amount: pred.amount, winnings, multiplier: pred.multiplier,
+          streakBonus: pred.streakBonus, rankUp: pred.rankUp
+        },
         incident: { id: incident.id, type: incident.incidentType, location: incident.location },
+        animation: {
+          showConfetti: winnings >= 500,
+          showRankUp: !!pred.rankUp,
+          streakFire: user?.currentWinStreak >= 3
+        },
         timestamp: new Date().toISOString()
       });
       
-      console.log(`[PREDICTION] WIN! ${pred.displayName} won ${winnings} PTS in ${pred.city}`);
+      console.log(`[PREDICTION] WIN! ${pred.displayName} won ${winnings} PTS (${user?.currentWinStreak || 1}x streak)`);
     }
   });
 }
@@ -1728,9 +2122,14 @@ setInterval(() => {
       pred.resolvedAt = new Date().toISOString();
       pred.result = 'expired';
       const user = users.get(pred.username);
-      if (user) { user.losses++; user.totalLosses += pred.amount; }
+      if (user) { 
+        user.losses++; 
+        user.totalLosses += pred.amount;
+        user.currentWinStreak = 0;
+      }
       predictionHistory.unshift(pred);
       activePredictions.delete(predId);
+      addToActivityFeed({ type: 'prediction_lost', user: pred.displayName, district: pred.district, amount: pred.amount });
     }
   });
 }, 10000);
@@ -3558,6 +3957,13 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
   
   const transcriptEntry = { text: clean, source: feedName, city: cityId, timestamp: new Date().toISOString() };
   
+  // Add to transcription verification queue (random sampling - ~20% of transcripts)
+  if (Math.random() < 0.2 && clean.length > 30) {
+    const audioId = `audio_trans_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    audioClips.set(audioId, buffer);
+    addTranscriptionForVerification(clean, audioId, feedName);
+  }
+  
   // Store in city-specific state
   state.recentTranscripts.unshift(transcriptEntry);
   if (state.recentTranscripts.length > MAX_TRANSCRIPTS) state.recentTranscripts.pop();
@@ -5023,13 +5429,46 @@ app.post('/auth/login', (req, res) => {
   
   let user = getUserByUsername(cleanUsername);
   let isNewUser = false;
+  let bonuses = [];
   
   if (!user) {
     user = createUser(cleanUsername);
     isNewUser = true;
+    bonuses.push({ type: 'signup', amount: SIGNUP_BONUS, label: 'Welcome Bonus!' });
   }
   
-  const dailyBonus = checkDailyBonus(user);
+  // Calculate streak
+  const streakInfo = calculateLoginStreak(user);
+  
+  if (streakInfo.isNewDay) {
+    user.loginStreak = streakInfo.streak;
+    user.lastLoginDate = new Date().toISOString().split('T')[0];
+    
+    if (user.loginStreak > (user.bestLoginStreak || 0)) {
+      user.bestLoginStreak = user.loginStreak;
+    }
+    
+    const loginBonus = getLoginBonus(user.loginStreak);
+    user.pts += loginBonus.bonus;
+    
+    bonuses.push({
+      type: 'daily_login',
+      amount: loginBonus.bonus,
+      label: loginBonus.label,
+      streak: user.loginStreak
+    });
+    
+    if (!isNewUser) {
+      addToActivityFeed({
+        type: 'streak_bonus',
+        user: user.displayName,
+        streak: user.loginStreak,
+        bonus: loginBonus.bonus
+      });
+    }
+  }
+  
+  const rank = getUserRank(user.pts);
   
   res.json({
     success: true,
@@ -5041,11 +5480,17 @@ app.post('/auth/login', (req, res) => {
       wins: user.wins,
       losses: user.losses,
       totalPredictions: user.totalPredictions,
-      winRate: user.totalPredictions > 0 ? ((user.wins / user.totalPredictions) * 100).toFixed(1) + '%' : '0%'
+      winRate: user.totalPredictions > 0 ? ((user.wins / user.totalPredictions) * 100).toFixed(1) + '%' : '0%',
+      currentWinStreak: user.currentWinStreak || 0,
+      bestWinStreak: user.bestWinStreak || 0,
+      loginStreak: user.loginStreak || 1,
+      bestLoginStreak: user.bestLoginStreak || 1,
+      bountiesCompleted: user.bountiesCompleted || 0,
+      transcriptionsVerified: user.transcriptionsVerified || 0
     },
+    rank,
     isNewUser,
-    signupBonus: isNewUser ? SIGNUP_BONUS : 0,
-    dailyBonus,
+    bonuses,
     activePredictions: Array.from(activePredictions.values()).filter(p => p.username === user.username)
   });
 });
@@ -5054,12 +5499,21 @@ app.get('/auth/user/:username', (req, res) => {
   const user = getUserByUsername(req.params.username);
   if (!user) return res.status(404).json({ error: 'User not found' });
   
+  const rank = getUserRank(user.pts);
+  
   res.json({
     user: {
       id: user.id, username: user.username, displayName: user.displayName, pts: user.pts,
       wins: user.wins, losses: user.losses, totalPredictions: user.totalPredictions,
-      winRate: user.totalPredictions > 0 ? ((user.wins / user.totalPredictions) * 100).toFixed(1) + '%' : '0%'
+      winRate: user.totalPredictions > 0 ? ((user.wins / user.totalPredictions) * 100).toFixed(1) + '%' : '0%',
+      currentWinStreak: user.currentWinStreak || 0,
+      bestWinStreak: user.bestWinStreak || 0,
+      loginStreak: user.loginStreak || 1,
+      bountiesCompleted: user.bountiesCompleted || 0,
+      totalBountyEarnings: user.totalBountyEarnings || 0,
+      transcriptionsVerified: user.transcriptionsVerified || 0
     },
+    rank,
     activePredictions: Array.from(activePredictions.values()).filter(p => p.username === user.username),
     recentHistory: predictionHistory.filter(p => p.username === user.username).slice(0, 20)
   });
@@ -5131,10 +5585,188 @@ app.get('/predict/leaderboard', (req, res) => {
       losses: u.losses,
       totalPredictions: u.totalPredictions,
       winRate: u.totalPredictions > 0 ? ((u.wins / u.totalPredictions) * 100).toFixed(1) + '%' : '0%',
-      netProfit: u.totalWinnings - u.totalLosses
+      netProfit: u.totalWinnings - u.totalLosses,
+      ...getUserRank(u.pts)
     }));
   res.json({ currency: 'PTS', leaderboard: leaders, totalPlayers: users.size, timestamp: new Date().toISOString() });
 });
+
+// ============================================
+// GAMIFICATION ENDPOINTS
+// ============================================
+
+// --- RANKS ---
+app.get('/ranks', (req, res) => {
+  res.json({ ranks: RANKS });
+});
+
+app.get('/user/:username/rank', (req, res) => {
+  const user = getUserByUsername(req.params.username);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json(getUserRank(user.pts));
+});
+
+// --- ACTIVITY FEED ---
+app.get('/feed', (req, res) => {
+  const { limit = 50 } = req.query;
+  res.json({
+    feed: activityFeed.slice(0, parseInt(limit)),
+    total: activityFeed.length
+  });
+});
+
+// --- BOUNTIES ---
+app.get('/bounties', (req, res) => {
+  const { city, status = 'ACTIVE' } = req.query;
+  let results = Array.from(bounties.values());
+  
+  if (city) results = results.filter(b => b.city === city);
+  if (status && status !== 'ALL') results = results.filter(b => b.status === status);
+  
+  res.json({
+    bounties: results.sort((a, b) => b.reward - a.reward),
+    types: BOUNTY_TYPES,
+    total: results.length
+  });
+});
+
+app.get('/bounties/history', (req, res) => {
+  const { limit = 50 } = req.query;
+  res.json({ history: bountyHistory.slice(0, parseInt(limit)) });
+});
+
+app.post('/bounties', (req, res) => {
+  const { username, type, title, description, location, city, reward, expiresInMinutes } = req.body;
+  
+  if (!username || !type || !title || !description) {
+    return res.status(400).json({ error: 'Missing required fields: username, type, title, description' });
+  }
+  
+  const user = getUserByUsername(username);
+  if (!user) return res.status(401).json({ error: 'User not found' });
+  
+  const cost = reward || BOUNTY_TYPES[type]?.basePts || 100;
+  if (user.pts < cost) {
+    return res.status(400).json({ error: 'Insufficient PTS to fund bounty', required: cost, balance: user.pts });
+  }
+  
+  user.pts -= cost;
+  user.bountiesCreated = (user.bountiesCreated || 0) + 1;
+  
+  const bounty = createBounty({ type, title, description, location, city, reward: cost, expiresInMinutes, createdBy: username });
+  
+  res.json({ success: true, bounty, newBalance: user.pts });
+});
+
+app.post('/bounties/:bountyId/claim', (req, res) => {
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  
+  const user = getUserByUsername(username);
+  if (!user) return res.status(401).json({ error: 'User not found' });
+  
+  const result = claimBounty(req.params.bountyId, username);
+  res.json(result);
+});
+
+app.post('/bounties/:bountyId/submit', (req, res) => {
+  const { username, content, imageUrl } = req.body;
+  if (!username || !content) return res.status(400).json({ error: 'Missing username or content' });
+  
+  const result = submitBounty(req.params.bountyId, username, { content, imageUrl });
+  res.json(result);
+});
+
+app.post('/bounties/:bountyId/verify', (req, res) => {
+  const { username, approved } = req.body;
+  if (!username || approved === undefined) return res.status(400).json({ error: 'Missing username or approved' });
+  
+  const result = verifyBountySubmission(req.params.bountyId, username, approved);
+  res.json(result);
+});
+
+// --- TRANSCRIPTION BOUNTIES ---
+app.get('/transcriptions/queue', (req, res) => {
+  const pending = transcriptionQueue.filter(t => t.status === 'PENDING');
+  res.json({
+    queue: pending.slice(0, 20),
+    total: pending.length,
+    reward: TRANSCRIPTION_REWARD
+  });
+});
+
+app.post('/transcriptions/:transcriptId/correct', (req, res) => {
+  const { username, correctedText, corrections } = req.body;
+  if (!username || !correctedText) return res.status(400).json({ error: 'Missing fields' });
+  
+  const user = getUserByUsername(username);
+  if (!user) return res.status(401).json({ error: 'User not found' });
+  
+  const result = submitTranscriptionCorrection(req.params.transcriptId, username, correctedText, corrections);
+  res.json(result);
+});
+
+app.post('/transcriptions/:transcriptId/verify', (req, res) => {
+  const { username, isCorrect } = req.body;
+  if (!username || isCorrect === undefined) return res.status(400).json({ error: 'Missing fields' });
+  
+  const user = getUserByUsername(username);
+  if (!user) return res.status(401).json({ error: 'User not found' });
+  
+  const result = verifyTranscription(req.params.transcriptId, username, isCorrect);
+  res.json(result);
+});
+
+// --- ADDITIONAL LEADERBOARDS ---
+app.get('/leaderboard/bounties', (req, res) => {
+  const leaders = Array.from(users.values())
+    .filter(u => (u.bountiesCompleted || 0) > 0)
+    .sort((a, b) => (b.totalBountyEarnings || 0) - (a.totalBountyEarnings || 0))
+    .slice(0, 50)
+    .map((u, i) => ({
+      rank: i + 1,
+      displayName: u.displayName,
+      bountiesCompleted: u.bountiesCompleted || 0,
+      totalEarnings: u.totalBountyEarnings || 0,
+      ...getUserRank(u.pts)
+    }));
+  res.json({ leaderboard: leaders });
+});
+
+app.get('/leaderboard/streaks', (req, res) => {
+  const leaders = Array.from(users.values())
+    .filter(u => (u.loginStreak || 1) > 1)
+    .sort((a, b) => (b.loginStreak || 0) - (a.loginStreak || 0))
+    .slice(0, 50)
+    .map((u, i) => ({
+      rank: i + 1,
+      displayName: u.displayName,
+      currentStreak: u.loginStreak || 0,
+      bestStreak: u.bestLoginStreak || 0,
+      currentWinStreak: u.currentWinStreak || 0,
+      ...getUserRank(u.pts)
+    }));
+  res.json({ leaderboard: leaders });
+});
+
+app.get('/leaderboard/transcribers', (req, res) => {
+  const leaders = Array.from(users.values())
+    .filter(u => (u.transcriptionsVerified || 0) > 0)
+    .sort((a, b) => (b.transcriptionsVerified || 0) - (a.transcriptionsVerified || 0))
+    .slice(0, 50)
+    .map((u, i) => ({
+      rank: i + 1,
+      displayName: u.displayName,
+      transcriptionsVerified: u.transcriptionsVerified || 0,
+      verificationsGiven: u.verificationsGiven || 0,
+      ...getUserRank(u.pts)
+    }));
+  res.json({ leaderboard: leaders });
+});
+
+// ============================================
+// END GAMIFICATION ENDPOINTS
+// ============================================
 
 app.post('/predict/place', (req, res) => {
   const { username, borough, district, incidentType, amount, timeWindow, city = 'nyc' } = req.body;
@@ -5182,6 +5814,17 @@ app.post('/predict/place', (req, res) => {
   activePredictions.set(predId, prediction);
   pool.totalPredictions++;
   pool.totalPtsWagered += pts;
+  
+  // Add to activity feed
+  addToActivityFeed({
+    type: 'prediction_placed',
+    user: user.displayName,
+    district: selectedDistrict,
+    city,
+    incidentType: type,
+    amount: pts,
+    multiplier: odds.multiplier
+  });
   
   broadcast({ type: 'new_prediction', prediction: { id: prediction.id, user: user.displayName, city, district: selectedDistrict, incidentType: type, amount: pts, multiplier: odds.multiplier, potentialWin }, timestamp: new Date().toISOString() });
   
