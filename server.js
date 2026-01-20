@@ -3473,22 +3473,49 @@ app.post('/city/mpls/ice/report/:reportId/verify', (req, res) => {
 
 // Get ICE news/events from scraped sources
 app.get('/city/mpls/ice/news', async (req, res) => {
-  const { limit = 20 } = req.query;
+  const { limit = 20, refresh = false } = req.query;
   
   try {
-    // Fetch fresh news if cache is stale
-    const news = await fetchICENewsLive();
+    // Fetch fresh news if requested or cache is stale
+    const news = refresh === 'true' ? await fetchICENewsLive() : iceNewsEvents;
+    
+    // Group by source type
+    const bySource = {};
+    news.forEach(n => {
+      const source = n.source || 'Unknown';
+      if (!bySource[source]) bySource[source] = 0;
+      bySource[source]++;
+    });
+    
     res.json({
-      news: news.slice(0, parseInt(limit)),
-      sources: ['Star Tribune', 'Minnesota Reformer', 'MPR News', 'WCCO', 'Community Reports'],
+      news: (news.length > 0 ? news : iceNewsEvents).slice(0, parseInt(limit)),
+      sources: ['Star Tribune', 'Minnesota Reformer', 'Reddit', 'Bluesky', 'Community Reports'],
+      sourceBreakdown: bySource,
+      lastFetch: new Date().toISOString(),
       timestamp: new Date().toISOString()
     });
   } catch (error) {
     res.json({
       news: iceNewsEvents.slice(0, parseInt(limit)),
-      error: 'Using cached data',
+      error: 'Using cached data: ' + error.message,
       timestamp: new Date().toISOString()
     });
+  }
+});
+
+// Force refresh news
+app.post('/city/mpls/ice/news/refresh', async (req, res) => {
+  try {
+    console.log('[ICE NEWS] Manual refresh triggered');
+    const news = await fetchICENewsLive();
+    res.json({
+      success: true,
+      count: news.length,
+      sources: [...new Set(news.map(n => n.source))],
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -3542,8 +3569,97 @@ app.get('/city/mpls/ice/dashboard', async (req, res) => {
 async function fetchICENewsLive() {
   const news = [];
   
+  // --- REDDIT SCRAPING ---
   try {
-    // Fetch from Minnesota Reformer RSS
+    // Search Reddit for ICE Minneapolis posts
+    const subreddits = ['Minneapolis', 'minnesota', 'immigration'];
+    
+    for (const sub of subreddits) {
+      try {
+        const redditResponse = await fetch(
+          `https://www.reddit.com/r/${sub}/search.json?q=ICE+OR+immigration+OR+deportation+OR+raid&sort=new&t=week&limit=10`,
+          { 
+            headers: { 'User-Agent': 'DispatchNYC/1.0' },
+            timeout: 5000 
+          }
+        );
+        
+        if (redditResponse.ok) {
+          const data = await redditResponse.json();
+          const posts = data?.data?.children || [];
+          
+          for (const post of posts) {
+            const p = post.data;
+            if (p.title && (
+              p.title.toLowerCase().includes('ice') ||
+              p.title.toLowerCase().includes('immigration') ||
+              p.title.toLowerCase().includes('deportation') ||
+              p.title.toLowerCase().includes('raid') ||
+              p.title.toLowerCase().includes('cbp') ||
+              p.title.toLowerCase().includes('border patrol')
+            )) {
+              news.push({
+                id: `reddit_${p.id}`,
+                type: 'social',
+                source: `Reddit r/${sub}`,
+                title: p.title.substring(0, 200),
+                url: `https://reddit.com${p.permalink}`,
+                timestamp: new Date(p.created_utc * 1000).toISOString(),
+                verified: false,
+                upvotes: p.ups,
+                comments: p.num_comments
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.log(`[ICE NEWS] Reddit r/${sub} fetch failed:`, e.message);
+      }
+    }
+    console.log(`[ICE NEWS] Reddit: found ${news.length} posts`);
+  } catch (e) {
+    console.log('[ICE NEWS] Reddit fetch failed:', e.message);
+  }
+  
+  // --- BLUESKY SCRAPING ---
+  try {
+    const bskyResponse = await fetch(
+      'https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=ICE+Minneapolis+OR+immigration+Minnesota&limit=20',
+      { 
+        headers: { 'User-Agent': 'DispatchNYC/1.0' },
+        timeout: 5000 
+      }
+    );
+    
+    if (bskyResponse.ok) {
+      const data = await bskyResponse.json();
+      const posts = data?.posts || [];
+      
+      for (const post of posts) {
+        const text = post.record?.text || '';
+        if (text.toLowerCase().includes('ice') || 
+            text.toLowerCase().includes('immigration') ||
+            text.toLowerCase().includes('deportation')) {
+          news.push({
+            id: `bsky_${post.uri.split('/').pop()}`,
+            type: 'social',
+            source: 'Bluesky',
+            title: text.substring(0, 200),
+            url: `https://bsky.app/profile/${post.author.handle}/post/${post.uri.split('/').pop()}`,
+            timestamp: post.record?.createdAt || new Date().toISOString(),
+            verified: false,
+            author: post.author?.displayName || post.author?.handle
+          });
+        }
+      }
+      console.log(`[ICE NEWS] Bluesky: found ${posts.length} posts`);
+    }
+  } catch (e) {
+    console.log('[ICE NEWS] Bluesky fetch failed:', e.message);
+  }
+  
+  // --- MINNESOTA REFORMER RSS ---
+  try {
     const reformerResponse = await fetch('https://minnesotareformer.com/feed/', {
       headers: { 'User-Agent': 'Mozilla/5.0' },
       timeout: 5000
@@ -3565,7 +3681,11 @@ async function fetchICENewsLive() {
           title.toLowerCase().includes('immigration') ||
           title.toLowerCase().includes('deportation') ||
           title.toLowerCase().includes('raid') ||
-          title.toLowerCase().includes('patrol')
+          title.toLowerCase().includes('patrol') ||
+          title.toLowerCase().includes('enforcement') ||
+          title.toLowerCase().includes('border') ||
+          title.toLowerCase().includes('undocumented') ||
+          title.toLowerCase().includes('migrant')
         )) {
           news.push({
             id: `reformer_${Date.now()}_${i}`,
@@ -3583,8 +3703,8 @@ async function fetchICENewsLive() {
     console.log('[ICE NEWS] Minnesota Reformer fetch failed:', e.message);
   }
   
+  // --- STAR TRIBUNE RSS ---
   try {
-    // Fetch from Star Tribune
     const stribResponse = await fetch('https://www.startribune.com/local/rss/', {
       headers: { 'User-Agent': 'Mozilla/5.0' },
       timeout: 5000
@@ -3603,7 +3723,10 @@ async function fetchICENewsLive() {
         if (title && (
           title.toLowerCase().includes('ice') ||
           title.toLowerCase().includes('immigration') ||
-          title.toLowerCase().includes('deportation')
+          title.toLowerCase().includes('deportation') ||
+          title.toLowerCase().includes('federal') ||
+          title.toLowerCase().includes('enforcement') ||
+          title.toLowerCase().includes('raid')
         )) {
           news.push({
             id: `strib_${Date.now()}_${i}`,
