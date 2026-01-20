@@ -2288,7 +2288,7 @@ const oddsEngine = {
   }
 };
 
-const pool = { 
+const predictionPool = { 
   totalPredictions: 0, 
   totalPtsWagered: 0, 
   totalPtsPaidOut: 0,
@@ -2430,7 +2430,7 @@ function checkPredictionsForIncident(incident) {
       }
       
       pred.winnings = winnings;
-      pool.totalPtsPaidOut += winnings;
+      predictionPool.totalPtsPaidOut += winnings;
       predictionHistory.unshift(pred);
       activePredictions.delete(predId);
       
@@ -5906,7 +5906,7 @@ app.get('/predict/all-odds', (req, res) => {
       highestOdds: allOdds.reduce((max, o) => o.multiplier > max.multiplier ? o : max)
     },
     odds,
-    pool: { totalPredictions: pool.totalPredictions, totalWagered: pool.totalPtsWagered, totalPaidOut: pool.totalPtsPaidOut }
+    pool: { totalPredictions: predictionPool.totalPredictions, totalWagered: predictionPool.totalPtsWagered, totalPaidOut: predictionPool.totalPtsPaidOut }
   });
 });
 
@@ -6558,8 +6558,8 @@ app.post('/predict/place', (req, res) => {
   };
   
   activePredictions.set(predId, prediction);
-  pool.totalPredictions++;
-  pool.totalPtsWagered += pts;
+  predictionPool.totalPredictions++;
+  predictionPool.totalPtsWagered += pts;
   
   // Add to activity feed
   addToActivityFeed({
@@ -6591,7 +6591,7 @@ app.delete('/predict/cancel/:predictionId', (req, res) => {
   const user = users.get(pred.username);
   if (user) { user.pts += pred.amount; user.totalPredictions--; }
   
-  pool.totalPtsWagered -= pred.amount;
+  predictionPool.totalPtsWagered -= pred.amount;
   activePredictions.delete(req.params.predictionId);
   
   res.json({ success: true, refunded: pred.amount, newBalance: user?.pts });
@@ -6605,7 +6605,7 @@ app.get('/predict/history', (req, res) => {
       amount: p.amount, multiplier: p.multiplier, status: p.status, winnings: p.winnings || 0,
       createdAt: p.createdAt, resolvedAt: p.resolvedAt
     })),
-    stats: { totalPredictions: pool.totalPredictions, totalWagered: pool.totalPtsWagered, totalPaidOut: pool.totalPtsPaidOut }
+    stats: { totalPredictions: predictionPool.totalPredictions, totalWagered: predictionPool.totalPtsWagered, totalPaidOut: predictionPool.totalPtsPaidOut }
   });
 });
 
