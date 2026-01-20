@@ -1898,6 +1898,124 @@ const ICE_HOTSPOTS_MPLS = [
 ];
 
 // ============================================
+// MINNEAPOLIS GEOCODER - Convert locations to coordinates
+// ============================================
+
+const MPLS_KNOWN_LOCATIONS = {
+  // ICE Facilities
+  'whipple': { lat: 44.8808, lng: -93.2108, name: 'Whipple Federal Building' },
+  'whipple federal': { lat: 44.8808, lng: -93.2108, name: 'Whipple Federal Building' },
+  'fort snelling': { lat: 44.8808, lng: -93.2108, name: 'Fort Snelling' },
+  'sherburne': { lat: 45.4441, lng: -93.7677, name: 'Sherburne County Jail' },
+  'sherburne county': { lat: 45.4441, lng: -93.7677, name: 'Sherburne County Jail' },
+  'freeborn': { lat: 43.6480, lng: -93.3677, name: 'Freeborn County Jail' },
+  'kandiyohi': { lat: 45.1219, lng: -95.0403, name: 'Kandiyohi County Jail' },
+  
+  // Major Streets
+  'lake street': { lat: 44.9486, lng: -93.2590, name: 'Lake Street' },
+  'east lake': { lat: 44.9486, lng: -93.2300, name: 'East Lake Street' },
+  'lake st': { lat: 44.9486, lng: -93.2590, name: 'Lake Street' },
+  'hennepin': { lat: 44.9778, lng: -93.2780, name: 'Hennepin Avenue' },
+  'hennepin ave': { lat: 44.9778, lng: -93.2780, name: 'Hennepin Avenue' },
+  'nicollet': { lat: 44.9650, lng: -93.2780, name: 'Nicollet Avenue' },
+  'nicollet mall': { lat: 44.9750, lng: -93.2720, name: 'Nicollet Mall' },
+  'lyndale': { lat: 44.9500, lng: -93.2880, name: 'Lyndale Avenue' },
+  'franklin': { lat: 44.9625, lng: -93.2700, name: 'Franklin Avenue' },
+  'franklin ave': { lat: 44.9625, lng: -93.2700, name: 'Franklin Avenue' },
+  'broadway': { lat: 45.0000, lng: -93.2900, name: 'Broadway' },
+  'central ave': { lat: 45.0000, lng: -93.2470, name: 'Central Avenue' },
+  'washington ave': { lat: 44.9800, lng: -93.2600, name: 'Washington Avenue' },
+  'university ave': { lat: 44.9550, lng: -93.2300, name: 'University Avenue' },
+  'chicago ave': { lat: 44.9400, lng: -93.2616, name: 'Chicago Avenue' },
+  'portland ave': { lat: 44.9366, lng: -93.2616, name: 'Portland Avenue' },
+  'bloomington ave': { lat: 44.9400, lng: -93.2450, name: 'Bloomington Avenue' },
+  '38th street': { lat: 44.9340, lng: -93.2616, name: '38th Street' },
+  '38th st': { lat: 44.9340, lng: -93.2616, name: '38th Street' },
+  '46th street': { lat: 44.9220, lng: -93.2616, name: '46th Street' },
+  
+  // Neighborhoods
+  'cedar riverside': { lat: 44.9697, lng: -93.2543, name: 'Cedar-Riverside' },
+  'cedar-riverside': { lat: 44.9697, lng: -93.2543, name: 'Cedar-Riverside' },
+  'west bank': { lat: 44.9697, lng: -93.2543, name: 'West Bank' },
+  'phillips': { lat: 44.9550, lng: -93.2616, name: 'Phillips' },
+  'powderhorn': { lat: 44.9366, lng: -93.2590, name: 'Powderhorn' },
+  'uptown': { lat: 44.9480, lng: -93.2980, name: 'Uptown' },
+  'downtown': { lat: 44.9778, lng: -93.2650, name: 'Downtown' },
+  'north minneapolis': { lat: 45.0050, lng: -93.2950, name: 'North Minneapolis' },
+  'north mpls': { lat: 45.0050, lng: -93.2950, name: 'North Minneapolis' },
+  'northeast': { lat: 45.0000, lng: -93.2470, name: 'Northeast Minneapolis' },
+  'northeast minneapolis': { lat: 45.0000, lng: -93.2470, name: 'Northeast Minneapolis' },
+  'south minneapolis': { lat: 44.9200, lng: -93.2680, name: 'South Minneapolis' },
+  'south mpls': { lat: 44.9200, lng: -93.2680, name: 'South Minneapolis' },
+  'longfellow': { lat: 44.9400, lng: -93.2200, name: 'Longfellow' },
+  'nokomis': { lat: 44.9100, lng: -93.2400, name: 'Nokomis' },
+  'calhoun': { lat: 44.9480, lng: -93.3100, name: 'Calhoun/Bde Maka Ska' },
+  'bde maka ska': { lat: 44.9480, lng: -93.3100, name: 'Bde Maka Ska' },
+  'loring park': { lat: 44.9690, lng: -93.2850, name: 'Loring Park' },
+  'elliot park': { lat: 44.9680, lng: -93.2600, name: 'Elliot Park' },
+  'midtown': { lat: 44.9486, lng: -93.2590, name: 'Midtown' },
+  'seward': { lat: 44.9550, lng: -93.2350, name: 'Seward' },
+  
+  // Landmarks
+  'target center': { lat: 44.9795, lng: -93.2761, name: 'Target Center' },
+  'us bank stadium': { lat: 44.9736, lng: -93.2575, name: 'US Bank Stadium' },
+  'mall of america': { lat: 44.8549, lng: -93.2422, name: 'Mall of America' },
+  'msp airport': { lat: 44.8848, lng: -93.2223, name: 'MSP Airport' },
+  'minneapolis airport': { lat: 44.8848, lng: -93.2223, name: 'MSP Airport' },
+  'target field': { lat: 44.9817, lng: -93.2776, name: 'Target Field' },
+  'stone arch bridge': { lat: 44.9808, lng: -93.2558, name: 'Stone Arch Bridge' },
+  'minnehaha falls': { lat: 44.9153, lng: -93.2110, name: 'Minnehaha Falls' },
+  'george floyd square': { lat: 44.9340, lng: -93.2616, name: 'George Floyd Square' },
+  'cup foods': { lat: 44.9340, lng: -93.2616, name: '38th & Chicago' },
+  
+  // St. Paul
+  'st paul': { lat: 44.9537, lng: -93.0900, name: 'St. Paul' },
+  'saint paul': { lat: 44.9537, lng: -93.0900, name: 'St. Paul' },
+  'west st paul': { lat: 44.9163, lng: -93.1066, name: 'West St. Paul' },
+  'east side st paul': { lat: 44.9700, lng: -93.0500, name: 'East Side St. Paul' },
+  
+  // Transit
+  'lake street station': { lat: 44.9486, lng: -93.2040, name: 'Lake Street Station' },
+  'target field station': { lat: 44.9830, lng: -93.2770, name: 'Target Field Station' },
+  'warehouse district': { lat: 44.9830, lng: -93.2750, name: 'Warehouse District' },
+  
+  // Generic Minneapolis
+  'minneapolis': { lat: 44.9778, lng: -93.2650, name: 'Minneapolis' },
+  'mpls': { lat: 44.9778, lng: -93.2650, name: 'Minneapolis' },
+  'twin cities': { lat: 44.9600, lng: -93.1700, name: 'Twin Cities' },
+  'minnesota': { lat: 44.9778, lng: -93.2650, name: 'Minnesota' }
+};
+
+// Note: extractLocationFromText is defined below with MPLS_LOCATION_PATTERNS (regex-based)
+// This geocodeNewsItems function works with that version
+
+// Geocode a batch of news items (uses the regex-based extractLocationFromText defined later)
+async function geocodeNewsItems(newsItems) {
+  return newsItems.map(item => {
+    // If already has coordinates, skip
+    if (item.lat && item.lng) return item;
+    
+    // Try to extract location from title/text using the regex-based function
+    const location = extractLocationFromTextRegex(item.title) || 
+                     extractLocationFromTextRegex(item.summary) ||
+                     extractLocationFromTextRegex(item.description);
+    
+    if (location) {
+      return {
+        ...item,
+        lat: location.lat,
+        lng: location.lng,
+        locationName: location.name,
+        locationConfidence: location.confidence,
+        locationSource: 'extracted'
+      };
+    }
+    
+    return item;
+  });
+}
+
+// ============================================
 // ICE WATCHER - AI Agent for ICE Activity Detection
 // ============================================
 
@@ -3519,6 +3637,45 @@ app.post('/city/mpls/ice/news/refresh', async (req, res) => {
   }
 });
 
+// Get only geolocated news for map display
+app.get('/city/mpls/ice/news/map', async (req, res) => {
+  const { limit = 50 } = req.query;
+  
+  try {
+    // Get news items that have coordinates
+    const newsWithCoords = iceNewsEvents.filter(n => n.lat && n.lng);
+    
+    // Format for map markers
+    const mapMarkers = newsWithCoords.slice(0, parseInt(limit)).map(n => ({
+      id: n.id,
+      type: n.type, // 'social', 'news', 'alert'
+      source: n.source,
+      title: n.title.substring(0, 100),
+      lat: n.lat,
+      lng: n.lng,
+      locationName: n.locationName || n.location,
+      timestamp: n.timestamp,
+      imageUrl: n.imageUrl || null,
+      thumbnailUrl: n.thumbnailUrl || null,
+      hasMedia: n.hasMedia || false,
+      verified: n.verified || false,
+      url: n.url,
+      // Social media specific
+      upvotes: n.upvotes,
+      likes: n.likes,
+      comments: n.comments
+    }));
+    
+    res.json({
+      markers: mapMarkers,
+      total: newsWithCoords.length,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message, markers: [] });
+  }
+});
+
 // Combined ICE dashboard data
 app.get('/city/mpls/ice/dashboard', async (req, res) => {
   const activeReports = getActiveICEReports();
@@ -3556,6 +3713,32 @@ app.get('/city/mpls/ice/dashboard', async (req, res) => {
         lng: r.lng,
         verified: r.verified,
         timestamp: r.timestamp
+      })),
+      // Social media posts with locations
+      socialPosts: iceNewsEvents.filter(n => n.lat && n.lng && n.type === 'social').slice(0, 20).map(n => ({
+        id: n.id,
+        source: n.source,
+        title: n.title.substring(0, 80),
+        lat: n.lat,
+        lng: n.lng,
+        locationName: n.locationName,
+        timestamp: n.timestamp,
+        imageUrl: n.imageUrl,
+        thumbnailUrl: n.thumbnailUrl,
+        hasMedia: n.hasMedia,
+        url: n.url
+      })),
+      // News articles with locations
+      newsArticles: iceNewsEvents.filter(n => n.lat && n.lng && n.type === 'news').slice(0, 10).map(n => ({
+        id: n.id,
+        source: n.source,
+        title: n.title.substring(0, 80),
+        lat: n.lat,
+        lng: n.lng,
+        locationName: n.locationName,
+        timestamp: n.timestamp,
+        url: n.url,
+        verified: n.verified
       }))
     },
     timestamp: new Date().toISOString()
@@ -3565,6 +3748,86 @@ app.get('/city/mpls/ice/dashboard', async (req, res) => {
 // ============================================
 // ICE NEWS LIVE SCRAPING
 // ============================================
+
+// Minneapolis location patterns for geocoding social media posts
+const MPLS_LOCATION_PATTERNS = [
+  // Major streets
+  { pattern: /lake\s*(?:st(?:reet)?|ave)/i, name: 'Lake Street', lat: 44.9486, lng: -93.2590 },
+  { pattern: /east\s*lake/i, name: 'East Lake Street', lat: 44.9486, lng: -93.2300 },
+  { pattern: /hennepin/i, name: 'Hennepin Avenue', lat: 44.9700, lng: -93.2780 },
+  { pattern: /nicollet/i, name: 'Nicollet Avenue', lat: 44.9600, lng: -93.2710 },
+  { pattern: /lyndale/i, name: 'Lyndale Avenue', lat: 44.9500, lng: -93.2880 },
+  { pattern: /franklin/i, name: 'Franklin Avenue', lat: 44.9627, lng: -93.2700 },
+  { pattern: /broadway/i, name: 'Broadway', lat: 45.0000, lng: -93.2900 },
+  { pattern: /central\s*ave/i, name: 'Central Avenue', lat: 45.0050, lng: -93.2470 },
+  { pattern: /chicago\s*ave/i, name: 'Chicago Avenue', lat: 44.9400, lng: -93.2616 },
+  { pattern: /portland\s*ave/i, name: 'Portland Avenue', lat: 44.9366, lng: -93.2616 },
+  { pattern: /bloomington\s*ave/i, name: 'Bloomington Avenue', lat: 44.9400, lng: -93.2450 },
+  { pattern: /38th\s*(st|street|&)/i, name: '38th Street', lat: 44.9340, lng: -93.2616 },
+  { pattern: /46th\s*(st|street)/i, name: '46th Street', lat: 44.9220, lng: -93.2700 },
+  
+  // Neighborhoods
+  { pattern: /cedar[\s-]*riverside/i, name: 'Cedar-Riverside', lat: 44.9697, lng: -93.2543 },
+  { pattern: /phillips/i, name: 'Phillips', lat: 44.9550, lng: -93.2616 },
+  { pattern: /powderhorn/i, name: 'Powderhorn', lat: 44.9366, lng: -93.2590 },
+  { pattern: /uptown/i, name: 'Uptown', lat: 44.9480, lng: -93.2980 },
+  { pattern: /north\s*(?:side|minneapolis|mpls)/i, name: 'North Minneapolis', lat: 45.0050, lng: -93.2950 },
+  { pattern: /south\s*(?:side|minneapolis|mpls)/i, name: 'South Minneapolis', lat: 44.9200, lng: -93.2680 },
+  { pattern: /northeast|ne\s*mpls/i, name: 'Northeast Minneapolis', lat: 45.0000, lng: -93.2500 },
+  { pattern: /downtown/i, name: 'Downtown', lat: 44.9778, lng: -93.2650 },
+  { pattern: /longfellow/i, name: 'Longfellow', lat: 44.9400, lng: -93.2200 },
+  { pattern: /nokomis/i, name: 'Nokomis', lat: 44.9100, lng: -93.2400 },
+  { pattern: /seward/i, name: 'Seward', lat: 44.9550, lng: -93.2350 },
+  { pattern: /whittier/i, name: 'Whittier', lat: 44.9580, lng: -93.2750 },
+  { pattern: /dinkytown/i, name: 'Dinkytown', lat: 44.9810, lng: -93.2360 },
+  { pattern: /stadium\s*village/i, name: 'Stadium Village', lat: 44.9750, lng: -93.2250 },
+  
+  // Landmarks
+  { pattern: /whipple|fort\s*snelling|ice\s*(?:hq|headquarters|office)/i, name: 'Whipple Federal Building (ICE HQ)', lat: 44.8808, lng: -93.2108 },
+  { pattern: /target\s*center/i, name: 'Target Center', lat: 44.9795, lng: -93.2761 },
+  { pattern: /us\s*bank\s*stadium/i, name: 'US Bank Stadium', lat: 44.9738, lng: -93.2575 },
+  { pattern: /mall\s*of\s*america|moa/i, name: 'Mall of America', lat: 44.8549, lng: -93.2422 },
+  { pattern: /msp\s*airport|airport/i, name: 'MSP Airport', lat: 44.8848, lng: -93.2223 },
+  { pattern: /u\s*of\s*m|university\s*of\s*minnesota/i, name: 'University of Minnesota', lat: 44.9740, lng: -93.2277 },
+  { pattern: /midtown\s*global/i, name: 'Midtown Global Market', lat: 44.9486, lng: -93.2600 },
+  { pattern: /george\s*floyd|cup\s*foods|38th\s*and\s*chicago/i, name: '38th & Chicago', lat: 44.9340, lng: -93.2616 },
+  
+  // St. Paul
+  { pattern: /st\.?\s*paul|saint\s*paul/i, name: 'St. Paul', lat: 44.9537, lng: -93.0900 },
+  { pattern: /west\s*st\.?\s*paul/i, name: 'West St. Paul', lat: 44.9163, lng: -93.1066 },
+  
+  // Detention facilities
+  { pattern: /sherburne/i, name: 'Sherburne County Jail', lat: 45.4580, lng: -93.7650 },
+  { pattern: /freeborn/i, name: 'Freeborn County Jail', lat: 43.6481, lng: -93.3677 },
+  { pattern: /kandiyohi/i, name: 'Kandiyohi County Jail', lat: 45.1219, lng: -95.0403 },
+  
+  // General Minneapolis mention
+  { pattern: /minneapolis|mpls/i, name: 'Minneapolis', lat: 44.9778, lng: -93.2650 },
+  { pattern: /minnesota|mn/i, name: 'Minnesota', lat: 44.9778, lng: -93.2650 }
+];
+
+// Extract location from text and return coordinates (regex-based)
+function extractLocationFromTextRegex(text) {
+  if (!text) return null;
+  
+  const lower = text.toLowerCase();
+  
+  // Try to match against known patterns (most specific first)
+  for (const loc of MPLS_LOCATION_PATTERNS) {
+    if (loc.pattern.test(text)) {
+      // Add some randomness to prevent exact overlap on map
+      const jitter = 0.002; // ~200m
+      return {
+        name: loc.name,
+        lat: loc.lat + (Math.random() - 0.5) * jitter,
+        lng: loc.lng + (Math.random() - 0.5) * jitter,
+        confidence: loc.pattern.toString().includes('minneapolis') ? 'low' : 'medium'
+      };
+    }
+  }
+  
+  return null;
+}
 
 async function fetchICENewsLive() {
   const news = [];
@@ -3598,6 +3861,35 @@ async function fetchICENewsLive() {
               p.title.toLowerCase().includes('cbp') ||
               p.title.toLowerCase().includes('border patrol')
             )) {
+              // Extract images from Reddit post
+              let imageUrl = null;
+              let thumbnailUrl = null;
+              
+              // Check for preview images
+              if (p.preview?.images?.[0]) {
+                const img = p.preview.images[0];
+                imageUrl = img.source?.url?.replace(/&amp;/g, '&');
+                // Get a medium resolution version if available
+                const resolutions = img.resolutions || [];
+                if (resolutions.length > 0) {
+                  thumbnailUrl = resolutions[Math.min(2, resolutions.length - 1)]?.url?.replace(/&amp;/g, '&');
+                }
+              }
+              
+              // Check for direct image link
+              if (!imageUrl && p.url && /\.(jpg|jpeg|png|gif|webp)$/i.test(p.url)) {
+                imageUrl = p.url;
+              }
+              
+              // Check thumbnail
+              if (!thumbnailUrl && p.thumbnail && p.thumbnail.startsWith('http')) {
+                thumbnailUrl = p.thumbnail;
+              }
+              
+              // Extract location from title and selftext
+              const fullText = `${p.title} ${p.selftext || ''}`;
+              const location = extractLocationFromTextRegex(fullText);
+              
               news.push({
                 id: `reddit_${p.id}`,
                 type: 'social',
@@ -3607,7 +3899,16 @@ async function fetchICENewsLive() {
                 timestamp: new Date(p.created_utc * 1000).toISOString(),
                 verified: false,
                 upvotes: p.ups,
-                comments: p.num_comments
+                comments: p.num_comments,
+                imageUrl,
+                thumbnailUrl,
+                hasMedia: !!imageUrl || !!p.is_video,
+                // Location data for map
+                location: location?.name || null,
+                lat: location?.lat || null,
+                lng: location?.lng || null,
+                locationConfidence: location?.confidence || null,
+                canMapPin: !!location
               });
             }
           }
@@ -3640,6 +3941,35 @@ async function fetchICENewsLive() {
         if (text.toLowerCase().includes('ice') || 
             text.toLowerCase().includes('immigration') ||
             text.toLowerCase().includes('deportation')) {
+          
+          // Extract images from Bluesky post
+          let imageUrl = null;
+          let thumbnailUrl = null;
+          const images = [];
+          
+          // Check for embedded images
+          if (post.embed?.images && post.embed.images.length > 0) {
+            imageUrl = post.embed.images[0].fullsize;
+            thumbnailUrl = post.embed.images[0].thumb;
+            
+            // Collect all images
+            post.embed.images.forEach(img => {
+              images.push({
+                fullsize: img.fullsize,
+                thumb: img.thumb,
+                alt: img.alt
+              });
+            });
+          }
+          
+          // Check for external embed with thumbnail
+          if (!imageUrl && post.embed?.external?.thumb) {
+            thumbnailUrl = post.embed.external.thumb;
+          }
+          
+          // Extract location from post text
+          const location = extractLocationFromTextRegex(text);
+          
           news.push({
             id: `bsky_${post.uri.split('/').pop()}`,
             type: 'social',
@@ -3648,7 +3978,20 @@ async function fetchICENewsLive() {
             url: `https://bsky.app/profile/${post.author.handle}/post/${post.uri.split('/').pop()}`,
             timestamp: post.record?.createdAt || new Date().toISOString(),
             verified: false,
-            author: post.author?.displayName || post.author?.handle
+            author: post.author?.displayName || post.author?.handle,
+            authorAvatar: post.author?.avatar,
+            imageUrl,
+            thumbnailUrl,
+            images: images.length > 0 ? images : null,
+            hasMedia: images.length > 0,
+            likes: post.likeCount || 0,
+            reposts: post.repostCount || 0,
+            // Location data for map
+            location: location?.name || null,
+            lat: location?.lat || null,
+            lng: location?.lng || null,
+            locationConfidence: location?.confidence || null,
+            canMapPin: !!location
           });
         }
       }
@@ -3850,11 +4193,18 @@ async function fetchICENewsLive() {
   // Sort by timestamp, newest first
   combined.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
   
+  // Geocode items that don't have coordinates
+  const geocoded = await geocodeNewsItems(combined);
+  
+  // Log geocoding stats
+  const withCoords = geocoded.filter(n => n.lat && n.lng).length;
+  console.log(`[ICE NEWS] Geocoded ${withCoords}/${geocoded.length} items with coordinates`);
+  
   // Update cache
   iceNewsEvents.length = 0;
-  iceNewsEvents.push(...combined.slice(0, MAX_ICE_NEWS));
+  iceNewsEvents.push(...geocoded.slice(0, MAX_ICE_NEWS));
   
-  return combined;
+  return geocoded;
 }
 
 // Fetch news on startup and periodically
