@@ -121,19 +121,20 @@ const BCFY_KEY_ID = process.env.BCFY_API_KEY_ID;
 const BCFY_KEY_SECRET = process.env.BCFY_API_KEY_SECRET;
 const BCFY_APP_ID = process.env.BCFY_APP_ID;
 
+// Broadcastify user authentication (for Calls API)
+let bcfyUserId = null;
+let bcfyUserToken = null;
+let bcfyAuthExpires = 0;
+
 workerStats.bcfyCalls.enabled = !!(BCFY_KEY_ID && BCFY_KEY_SECRET && BCFY_APP_ID);
 
 // ============================================
 // BROADCASTIFY CALLS API (JWT Auth)
 // ============================================
 
-function generateBcfyJWT() {
-  console.log(`[BCFY DEBUG] Key ID: ${BCFY_KEY_ID ? BCFY_KEY_ID.substring(0,3) + '...' : 'MISSING'} (${BCFY_KEY_ID?.length || 0} chars)`);
-  console.log(`[BCFY DEBUG] Secret: ${BCFY_KEY_SECRET ? '***' : 'MISSING'} (${BCFY_KEY_SECRET?.length || 0} chars)`);
-  console.log(`[BCFY DEBUG] App ID: ${BCFY_APP_ID ? BCFY_APP_ID.substring(0,3) + '...' : 'MISSING'} (${BCFY_APP_ID?.length || 0} chars)`);
-  
+function generateBcfyJWT(includeUserAuth = false) {
   if (!BCFY_KEY_ID || !BCFY_KEY_SECRET || !BCFY_APP_ID) {
-    console.log('[BCFY DEBUG] Missing credentials - cannot generate JWT');
+    console.log('[BCFY] Missing credentials - cannot generate JWT');
     return null;
   }
   
@@ -142,9 +143,11 @@ function generateBcfyJWT() {
   const header = { alg: 'HS256', typ: 'JWT', kid: BCFY_KEY_ID };
   const payload = { iss: BCFY_APP_ID, iat: now, exp: now + 3600 };
   
-  console.log('[BCFY DEBUG] JWT Header kid:', BCFY_KEY_ID);
-  console.log('[BCFY DEBUG] JWT Payload iss:', BCFY_APP_ID);
-  console.log('[BCFY DEBUG] JWT Payload iat:', now, 'exp:', now + 3600);
+  // Add user authentication if available and requested
+  if (includeUserAuth && bcfyUserId && bcfyUserToken) {
+    payload.sub = bcfyUserId;
+    payload.utk = bcfyUserToken;
+  }
   
   const base64urlEncode = (obj) => {
     return Buffer.from(JSON.stringify(obj))
@@ -166,17 +169,78 @@ function generateBcfyJWT() {
     .replace(/\+/g, '-')
     .replace(/\//g, '_');
   
-  const jwt = `${headerEncoded}.${payloadEncoded}.${signature}`;
-  console.log('[BCFY DEBUG] Generated JWT:', jwt.substring(0, 80) + '...');
-  
-  return jwt;
+  return `${headerEncoded}.${payloadEncoded}.${signature}`;
 }
 
-async function bcfyApiRequest(endpoint, options = {}) {
-  const jwt = generateBcfyJWT();
+// Authenticate Broadcastify user to get userId and userToken
+async function authenticateBcfyUser() {
+  if (!BROADCASTIFY_USERNAME || !BROADCASTIFY_PASSWORD) {
+    console.log('[BCFY AUTH] Missing BROADCASTIFY_USERNAME or BROADCASTIFY_PASSWORD');
+    return false;
+  }
+  
+  // Check if we already have valid auth
+  if (bcfyUserId && bcfyUserToken && Date.now() < bcfyAuthExpires) {
+    console.log('[BCFY AUTH] Using cached authentication');
+    return true;
+  }
+  
+  console.log('[BCFY AUTH] Authenticating user:', BROADCASTIFY_USERNAME);
+  
+  try {
+    const jwt = generateBcfyJWT(false); // JWT without user auth for the auth endpoint
+    if (!jwt) return false;
+    
+    const response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${jwt}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        username: BROADCASTIFY_USERNAME,
+        password: BROADCASTIFY_PASSWORD
+      })
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[BCFY AUTH] Failed:', response.status, errorText);
+      return false;
+    }
+    
+    const data = await response.json();
+    
+    if (data.userId && data.userToken) {
+      bcfyUserId = data.userId;
+      bcfyUserToken = data.userToken;
+      bcfyAuthExpires = Date.now() + (3600 * 1000); // 1 hour
+      console.log('[BCFY AUTH] Success! userId:', bcfyUserId);
+      return true;
+    } else {
+      console.error('[BCFY AUTH] No userId/userToken in response:', data);
+      return false;
+    }
+  } catch (error) {
+    console.error('[BCFY AUTH] Error:', error.message);
+    return false;
+  }
+}
+
+async function bcfyApiRequest(endpoint, options = {}, requireAuth = true) {
+  // Authenticate first if required
+  if (requireAuth) {
+    const authSuccess = await authenticateBcfyUser();
+    if (!authSuccess) {
+      throw new Error('Failed to authenticate Broadcastify user');
+    }
+  }
+  
+  const jwt = generateBcfyJWT(requireAuth); // Include user auth in JWT
   if (!jwt) throw new Error('Could not generate JWT - missing credentials');
   
   const url = `${BCFY_API_URL}${endpoint}`;
+  console.log('[BCFY API] Request:', url);
   
   try {
     const response = await fetch(url, {
@@ -201,9 +265,12 @@ async function bcfyApiRequest(endpoint, options = {}) {
   }
 }
 
+// NYPD System ID on RadioReference (for Broadcastify Calls)
+const NYPD_SYSTEM_ID = 7636;
+
 async function fetchNYCGroups() {
   try {
-    const data = await bcfyApiRequest(`/calls/v1/groups?ctid=${NYC_COUNTY_ID}`);
+    const data = await bcfyApiRequest(`/calls/v1/groups?sid=${NYPD_SYSTEM_ID}`);
     workerStats.bcfyCalls.groups = data.groups || data || [];
     console.log(`[BCFY CALLS] Found ${workerStats.bcfyCalls.groups.length} groups in NYC`);
     return workerStats.bcfyCalls.groups;
@@ -217,9 +284,11 @@ async function fetchLiveCalls() {
   if (!workerStats.bcfyCalls.enabled) return [];
   
   try {
-    const data = await bcfyApiRequest(`/calls/v1/live?ctid=${NYC_COUNTY_ID}&limit=20`);
+    // Use sid parameter for NYPD system
+    const data = await bcfyApiRequest(`/calls/v1/live?sid=${NYPD_SYSTEM_ID}`);
     workerStats.bcfyCalls.lastPoll = new Date().toISOString();
     workerStats.bcfyCalls.callsFetched += (data.calls?.length || 0);
+    console.log(`[BCFY CALLS] Fetched ${data.calls?.length || 0} live calls`);
     return data.calls || data || [];
   } catch (error) {
     console.error('[BCFY CALLS] Error fetching live calls:', error.message);
