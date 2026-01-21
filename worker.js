@@ -194,48 +194,16 @@ async function authenticateBcfyUser() {
     const jwt = generateBcfyJWT(false); // JWT without user auth for the auth endpoint
     if (!jwt) return false;
     
-    // Try the common auth endpoint with different body formats
-    // Format 1: JSON with "username" and "password"
-    let response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
+    // IMPORTANT: Auth endpoint uses form-urlencoded, NOT JSON!
+    // Per docs: -d "username=<username>&password=<password>"
+    const response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${jwt}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: JSON.stringify({
-        username: BROADCASTIFY_USERNAME,
-        password: BROADCASTIFY_PASSWORD
-      })
+      body: `username=${encodeURIComponent(BROADCASTIFY_USERNAME)}&password=${encodeURIComponent(BROADCASTIFY_PASSWORD)}`
     });
-    
-    // If that fails, try "user" and "pass" fields
-    if (!response.ok && response.status === 400) {
-      console.log('[BCFY AUTH] Trying alternate field names...');
-      response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${jwt}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          user: BROADCASTIFY_USERNAME,
-          pass: BROADCASTIFY_PASSWORD
-        })
-      });
-    }
-    
-    // If that fails, try form-urlencoded
-    if (!response.ok && response.status === 400) {
-      console.log('[BCFY AUTH] Trying form-urlencoded...');
-      response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${jwt}`,
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: `username=${encodeURIComponent(BROADCASTIFY_USERNAME)}&password=${encodeURIComponent(BROADCASTIFY_PASSWORD)}`
-      });
-    }
     
     if (!response.ok) {
       const errorText = await response.text();
@@ -244,20 +212,16 @@ async function authenticateBcfyUser() {
     }
     
     const data = await response.json();
-    console.log('[BCFY AUTH] Response:', JSON.stringify(data));
+    // Response format: { "username": "...", "uid": "431215", "token": "...", "exp": ... }
     
-    // Try different response field names
-    const userId = data.userId || data.user_id || data.uid || data.sub;
-    const userToken = data.userToken || data.user_token || data.token || data.utk;
-    
-    if (userId && userToken) {
-      bcfyUserId = userId;
-      bcfyUserToken = userToken;
-      bcfyAuthExpires = Date.now() + (3600 * 1000); // 1 hour
-      console.log('[BCFY AUTH] Success! userId:', bcfyUserId);
+    if (data.uid && data.token) {
+      bcfyUserId = parseInt(data.uid); // IMPORTANT: sub must be integer, not string
+      bcfyUserToken = data.token;
+      bcfyAuthExpires = data.exp ? (data.exp * 1000) : (Date.now() + 3600 * 1000);
+      console.log('[BCFY AUTH] Success! userId:', bcfyUserId, 'expires:', new Date(bcfyAuthExpires).toISOString());
       return true;
     } else {
-      console.error('[BCFY AUTH] No userId/userToken in response:', data);
+      console.error('[BCFY AUTH] Unexpected response format:', data);
       return false;
     }
   } catch (error) {
@@ -265,7 +229,6 @@ async function authenticateBcfyUser() {
     return false;
   }
 }
-
 async function bcfyApiRequest(endpoint, options = {}, requireAuth = true) {
   // Authenticate first if required
   if (requireAuth) {
@@ -440,28 +403,72 @@ async function fetchLiveCalls() {
       }
     }
     
-    // If no playlists work, try using System ID directly (may require auth)
-    if (allCalls.length === 0 && workerStats.bcfyCalls.groups.length > 0) {
-      console.log('[BCFY CALLS] Trying System ID approach...');
-      try {
-        // Try with NYPD System ID (7636)
-        const url = `${BCFY_API_URL}/calls/v1/live?sid=7636&init=1`;
-        const response = await fetch(url, {
-          headers: {
-            'Authorization': `Bearer ${jwt}`,
-            'Content-Type': 'application/json'
+    // If no playlists work, try using System ID directly (REQUIRES user auth)
+    if (allCalls.length === 0) {
+      console.log('[BCFY CALLS] Playlists empty, trying authenticated System ID approach...');
+      
+      // Authenticate user first
+      const authSuccess = await authenticateBcfyUser();
+      if (authSuccess) {
+        try {
+          const authJwt = generateBcfyJWT(true); // Include user auth!
+          // Try with NYPD System ID (7636)
+          const url = `${BCFY_API_URL}/calls/v1/live?sid=7636&init=1`;
+          console.log('[BCFY CALLS] Fetching with auth from NYPD System (sid=7636)');
+          
+          const response = await fetch(url, {
+            headers: {
+              'Authorization': `Bearer ${authJwt}`,
+              'Content-Type': 'application/json'
+            }
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            allCalls = data.calls || data || [];
+            console.log(`[BCFY CALLS] System ID approach SUCCESS: ${allCalls.length} calls`);
+          } else {
+            const errorText = await response.text();
+            console.log(`[BCFY CALLS] System ID approach failed: ${response.status}`, errorText);
           }
-        });
-        
-        if (response.ok) {
-          const data = await response.json();
-          allCalls = data.calls || data || [];
-          console.log(`[BCFY CALLS] System ID approach: ${allCalls.length} calls`);
-        } else {
-          console.log(`[BCFY CALLS] System ID approach failed (likely needs user auth)`);
+        } catch (err) {
+          console.log('[BCFY CALLS] System ID error:', err.message);
         }
-      } catch (err) {
-        console.log('[BCFY CALLS] System ID error:', err.message);
+      } else {
+        console.log('[BCFY CALLS] Cannot try System ID - user auth failed');
+      }
+    }
+    
+    // Also try groups approach with auth if still no calls
+    if (allCalls.length === 0 && workerStats.bcfyCalls.groups.length > 0) {
+      console.log('[BCFY CALLS] Trying groups approach with auth...');
+      
+      const authSuccess = await authenticateBcfyUser();
+      if (authSuccess) {
+        try {
+          const authJwt = generateBcfyJWT(true);
+          const groupIds = workerStats.bcfyCalls.groups.slice(0, 5).map(g => g.groupId);
+          const url = `${BCFY_API_URL}/calls/v1/live?groups=${groupIds.join(',')}&init=1`;
+          console.log('[BCFY CALLS] Fetching with auth from groups:', groupIds.join(','));
+          
+          const response = await fetch(url, {
+            headers: {
+              'Authorization': `Bearer ${authJwt}`,
+              'Content-Type': 'application/json'
+            }
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            allCalls = data.calls || data || [];
+            console.log(`[BCFY CALLS] Groups approach SUCCESS: ${allCalls.length} calls`);
+          } else {
+            const errorText = await response.text();
+            console.log(`[BCFY CALLS] Groups approach failed: ${response.status}`, errorText);
+          }
+        } catch (err) {
+          console.log('[BCFY CALLS] Groups error:', err.message);
+        }
       }
     }
     
@@ -500,8 +507,9 @@ async function processBcfyCall(call, cityId = 'nyc') {
   try {
     let audioUrl = call.audioUrl || call.url;
     if (!audioUrl) {
-      const callDetails = await bcfyApiRequest(`/calls/v1/call/${call.groupId}/${call.ts}`);
-      audioUrl = callDetails?.audioUrl || callDetails?.url;
+      // Get call details to find audio URL - endpoint is /calls/v1/call_get/{groupId}/{ts}
+      const callDetails = await bcfyApiRequest(`/calls/v1/call_get/${call.groupId}/${call.ts}`, {}, false);
+      audioUrl = callDetails?.url; // Response has "url" field per docs
     }
     
     if (!audioUrl) {
