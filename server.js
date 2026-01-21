@@ -8090,6 +8090,188 @@ app.get('/', (req, res) => res.json({
 }));
 app.get('/cameras', (req, res) => res.json(cameras));
 app.get('/incidents', (req, res) => res.json(incidents));
+
+// ============================================
+// RICH INCIDENT DETAIL ENDPOINT
+// Returns everything needed for Citizen-style detail panel
+// ============================================
+app.get('/incident/:id/detail', async (req, res) => {
+  const incidentId = parseInt(req.params.id);
+  const cityId = req.query.city || 'nyc';
+  
+  // Find incident in memory first
+  let incident = cityState[cityId]?.incidents.find(i => i.id === incidentId);
+  
+  // If not in memory, try database
+  if (!incident && pool) {
+    try {
+      const result = await pool.query(
+        'SELECT * FROM incidents_db WHERE id = $1',
+        [incidentId]
+      );
+      if (result.rows[0]) {
+        const row = result.rows[0];
+        incident = {
+          id: row.id,
+          incidentType: row.incident_type,
+          location: row.location,
+          borough: row.borough,
+          lat: parseFloat(row.lat),
+          lng: parseFloat(row.lng),
+          priority: row.priority,
+          summary: row.summary,
+          transcript: row.transcript,
+          units: row.units,
+          source: row.source,
+          audioUrl: row.audio_url,
+          timestamp: row.created_at,
+          city: row.city
+        };
+      }
+    } catch (e) {
+      console.error('[INCIDENT DETAIL] DB error:', e.message);
+    }
+  }
+  
+  if (!incident) {
+    return res.status(404).json({ error: 'Incident not found' });
+  }
+  
+  // Get camera for this location
+  const state = cityState[cityId] || cityState.nyc;
+  let camera = incident.camera;
+  
+  if (!camera && state.cameras.length > 0) {
+    // Find nearest camera by borough/area match
+    const matchingCameras = state.cameras.filter(c => {
+      if (incident.borough && c.area) {
+        return c.area.toLowerCase().includes(incident.borough.toLowerCase());
+      }
+      return false;
+    });
+    
+    if (matchingCameras.length > 0) {
+      // Pick one with closest location name match if possible
+      const locationLower = (incident.location || '').toLowerCase();
+      camera = matchingCameras.find(c => {
+        const camLoc = (c.location || '').toLowerCase();
+        return locationLower.split(/[\s&@]+/).some(word => 
+          word.length > 2 && camLoc.includes(word)
+        );
+      }) || matchingCameras[0];
+    } else {
+      camera = state.cameras[Math.floor(Math.random() * Math.min(10, state.cameras.length))];
+    }
+  }
+  
+  // Get AI agent insights for this incident
+  const bureau = detectiveBureaus[cityId] || detectiveBureaus.nyc;
+  const agentInsights = bureau.memory.agentInsights
+    ?.filter(insight => insight.incidentId === incidentId)
+    ?.slice(0, 5) || [];
+  
+  // Get location history
+  const addressKey = (incident.location || '').toLowerCase();
+  const locationCallCount = bureau.memory.addressHistory?.get(addressKey) || 0;
+  
+  // Get related incidents (same area, last 24h)
+  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const relatedIncidents = state.incidents
+    .filter(i => 
+      i.id !== incidentId && 
+      i.borough === incident.borough &&
+      new Date(i.timestamp).getTime() > oneDayAgo
+    )
+    .slice(0, 5)
+    .map(i => ({
+      id: i.id,
+      incidentType: i.incidentType,
+      location: i.location,
+      timestamp: i.timestamp,
+      priority: i.priority
+    }));
+  
+  // Get any patterns this incident is part of
+  const linkedPatterns = bureau.memory.patterns
+    ?.filter(p => p.linkedIncidentIds?.includes(incidentId))
+    ?.slice(0, 3) || [];
+  
+  // Calculate time ago
+  const incidentTime = new Date(incident.timestamp);
+  const minutesAgo = Math.floor((Date.now() - incidentTime.getTime()) / 60000);
+  const timeAgo = minutesAgo < 60 
+    ? `${minutesAgo}m ago` 
+    : minutesAgo < 1440 
+      ? `${Math.floor(minutesAgo / 60)}h ago`
+      : `${Math.floor(minutesAgo / 1440)}d ago`;
+  
+  res.json({
+    incident: {
+      ...incident,
+      timeAgo,
+      minutesAgo
+    },
+    camera: camera ? {
+      id: camera.id,
+      location: camera.location,
+      lat: camera.lat,
+      lng: camera.lng,
+      area: camera.area,
+      imageUrl: camera.imageUrl || `/camera-image/${camera.id}`,
+      // Direct NYC camera URL for frontend
+      liveUrl: cityId === 'nyc' 
+        ? `https://webcams.nyctmc.org/api/cameras/${camera.id}/image`
+        : camera.imageUrl
+    } : null,
+    audio: incident.audioUrl ? {
+      url: incident.audioUrl,
+      available: audioClips.has(incident.audioUrl?.replace('/audio/', ''))
+    } : null,
+    transcript: incident.transcript || null,
+    aiInsights: agentInsights.map(i => ({
+      agent: i.agent,
+      agentIcon: i.agentIcon,
+      analysis: i.analysis,
+      timestamp: i.timestamp
+    })),
+    locationHistory: {
+      address: incident.location,
+      callCount: locationCallCount,
+      isRepeatLocation: locationCallCount > 2,
+      warning: locationCallCount > 5 ? 'HIGH ACTIVITY LOCATION' : null
+    },
+    relatedIncidents,
+    patterns: linkedPatterns.map(p => ({
+      name: p.patternName,
+      confidence: p.confidence,
+      linkedCount: p.linkedIncidentIds?.length || 0
+    })),
+    meta: {
+      city: cityId,
+      generatedAt: new Date().toISOString()
+    }
+  });
+});
+
+// Get multiple incidents' basic camera info (for map optimization)
+app.get('/incidents/cameras', (req, res) => {
+  const cityId = req.query.city || 'nyc';
+  const state = cityState[cityId] || cityState.nyc;
+  
+  // Return incident IDs with their camera locations for map clustering
+  const incidentCameras = state.incidents.slice(0, 50).map(i => ({
+    id: i.id,
+    lat: i.lat || i.camera?.lat,
+    lng: i.lng || i.camera?.lng,
+    cameraId: i.camera?.id,
+    priority: i.priority,
+    incidentType: i.incidentType,
+    minutesAgo: Math.floor((Date.now() - new Date(i.timestamp).getTime()) / 60000)
+  }));
+  
+  res.json(incidentCameras);
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 app.get('/audio/:id', (req, res) => { const buffer = audioClips.get(req.params.id); if (!buffer) return res.status(404).json({ error: 'Not found' }); res.set('Content-Type', 'audio/mpeg'); res.send(buffer); });
 app.get('/camera-image/:id', async (req, res) => { try { const response = await fetch(`https://webcams.nyctmc.org/api/cameras/${req.params.id}/image`); const buffer = await response.arrayBuffer(); res.set('Content-Type', 'image/jpeg'); res.send(Buffer.from(buffer)); } catch (e) { res.status(500).json({ error: 'Failed' }); } });
