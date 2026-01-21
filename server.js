@@ -2,6 +2,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import https from 'https';
+import crypto from 'crypto';
 import fs from 'fs';
 import pg from 'pg';
 import Anthropic from '@anthropic-ai/sdk';
@@ -26,6 +27,350 @@ if (pool) {
   console.log('[DATABASE] PostgreSQL connection configured');
 } else {
   console.log('[DATABASE] No DATABASE_URL - running without persistent storage');
+}
+
+// ============================================
+// BROADCASTIFY CALLS API INTEGRATION
+// ============================================
+
+const BCFY_API_URL = 'https://api.bcfy.io';
+const BCFY_KEY_ID = process.env.BCFY_API_KEY_ID;
+const BCFY_KEY_SECRET = process.env.BCFY_API_KEY_SECRET;
+const BCFY_APP_ID = process.env.BCFY_APP_ID;
+
+// NYC County ID in RadioReference database
+const NYC_COUNTY_ID = 1855;
+
+// Track processed calls to avoid duplicates
+const processedCallsCache = new Set();
+const MAX_PROCESSED_CACHE = 1000;
+
+// Broadcastify Calls stats
+const bcfyCallsStats = {
+  enabled: !!(BCFY_KEY_ID && BCFY_KEY_SECRET && BCFY_APP_ID),
+  lastPoll: null,
+  callsFetched: 0,
+  callsProcessed: 0,
+  errors: 0,
+  lastError: null,
+  groups: []
+};
+
+if (bcfyCallsStats.enabled) {
+  console.log('[BCFY CALLS] API credentials configured');
+} else {
+  console.log('[BCFY CALLS] Missing credentials - using legacy stream method');
+}
+
+// Generate JWT for Broadcastify API
+function generateBcfyJWT() {
+  if (!BCFY_KEY_ID || !BCFY_KEY_SECRET || !BCFY_APP_ID) {
+    return null;
+  }
+  
+  const now = Math.floor(Date.now() / 1000);
+  
+  const header = {
+    alg: 'HS256',
+    typ: 'JWT',
+    kid: BCFY_KEY_ID
+  };
+  
+  const payload = {
+    iss: BCFY_APP_ID,
+    iat: now,
+    exp: now + 3600 // 1 hour expiry
+  };
+  
+  // Base64url encode (no padding)
+  const base64urlEncode = (obj) => {
+    return Buffer.from(JSON.stringify(obj))
+      .toString('base64')
+      .replace(/=/g, '')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_');
+  };
+  
+  const headerEncoded = base64urlEncode(header);
+  const payloadEncoded = base64urlEncode(payload);
+  
+  const signatureInput = `${headerEncoded}.${payloadEncoded}`;
+  const signature = crypto
+    .createHmac('sha256', BCFY_KEY_SECRET)
+    .update(signatureInput)
+    .digest('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+  
+  return `${headerEncoded}.${payloadEncoded}.${signature}`;
+}
+
+// Make authenticated request to Broadcastify API
+async function bcfyApiRequest(endpoint, options = {}) {
+  const jwt = generateBcfyJWT();
+  if (!jwt) {
+    throw new Error('Could not generate JWT - missing credentials');
+  }
+  
+  const url = `${BCFY_API_URL}${endpoint}`;
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${jwt}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`API ${response.status}: ${errorText}`);
+    }
+    
+    return await response.json();
+  } catch (error) {
+    bcfyCallsStats.errors++;
+    bcfyCallsStats.lastError = error.message;
+    throw error;
+  }
+}
+
+// Get available groups (talkgroups/frequencies) for NYC
+async function fetchNYCGroups() {
+  try {
+    const data = await bcfyApiRequest(`/calls/v1/groups?ctid=${NYC_COUNTY_ID}`);
+    bcfyCallsStats.groups = data.groups || data || [];
+    console.log(`[BCFY CALLS] Found ${bcfyCallsStats.groups.length} groups in NYC`);
+    return bcfyCallsStats.groups;
+  } catch (error) {
+    console.error('[BCFY CALLS] Error fetching NYC groups:', error.message);
+    return [];
+  }
+}
+
+// Get live calls for NYC
+async function fetchLiveCalls() {
+  if (!bcfyCallsStats.enabled) return [];
+  
+  try {
+    // Try fetching live calls for NYC county
+    const data = await bcfyApiRequest(`/calls/v1/live?ctid=${NYC_COUNTY_ID}&limit=20`);
+    bcfyCallsStats.lastPoll = new Date().toISOString();
+    bcfyCallsStats.callsFetched += (data.calls?.length || 0);
+    return data.calls || data || [];
+  } catch (error) {
+    console.error('[BCFY CALLS] Error fetching live calls:', error.message);
+    return [];
+  }
+}
+
+// Get call audio URL
+async function getCallAudio(groupId, timestamp) {
+  try {
+    const data = await bcfyApiRequest(`/calls/v1/call/${groupId}/${timestamp}`);
+    return data.audioUrl || data.url || null;
+  } catch (error) {
+    console.error('[BCFY CALLS] Error getting call audio:', error.message);
+    return null;
+  }
+}
+
+// Download audio from URL
+async function downloadCallAudio(audioUrl) {
+  try {
+    const response = await fetch(audioUrl);
+    if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    console.error('[BCFY CALLS] Audio download error:', error.message);
+    return null;
+  }
+}
+
+// Process a single call from Broadcastify Calls API
+async function processBcfyCall(call, cityId = 'nyc') {
+  const callKey = `${call.groupId}-${call.ts}`;
+  
+  // Skip if already processed
+  if (processedCallsCache.has(callKey)) {
+    return null;
+  }
+  
+  // Add to cache
+  processedCallsCache.add(callKey);
+  if (processedCallsCache.size > MAX_PROCESSED_CACHE) {
+    const firstKey = processedCallsCache.values().next().value;
+    processedCallsCache.delete(firstKey);
+  }
+  
+  try {
+    // Get audio URL
+    let audioUrl = call.audioUrl || call.url;
+    if (!audioUrl) {
+      const callDetails = await getCallAudio(call.groupId, call.ts);
+      audioUrl = callDetails;
+    }
+    
+    if (!audioUrl) {
+      console.log(`[BCFY CALLS] No audio URL for call ${callKey}`);
+      return null;
+    }
+    
+    // Download audio
+    const audioBuffer = await downloadCallAudio(audioUrl);
+    if (!audioBuffer || audioBuffer.length < 1000) {
+      return null;
+    }
+    
+    // Transcribe with Whisper
+    const transcript = await transcribeAudio(audioBuffer);
+    if (!transcript || transcript.trim().length < 5) {
+      return null;
+    }
+    
+    console.log(`[BCFY CALLS] Transcribed: "${transcript.substring(0, 100)}..."`);
+    
+    // Parse with Claude
+    const parsed = await parseTranscriptForCity(transcript, cityId);
+    
+    if (!parsed.hasIncident) {
+      // Still broadcast as monitoring
+      broadcastToCity(cityId, {
+        type: 'transcript',
+        text: transcript,
+        source: `BCFY Calls: ${call.groupId}`,
+        talkgroup: call.tg,
+        timestamp: new Date(call.ts * 1000).toISOString()
+      });
+      return null;
+    }
+    
+    // Create incident
+    const state = cityState[cityId];
+    state.incidentId++;
+    
+    const camera = findNearestCameraForCity(parsed.location, parsed.borough, cityId);
+    
+    // Store audio
+    const audioId = `bcfy_${cityId}_${state.incidentId}_${Date.now()}`;
+    audioClips.set(audioId, audioBuffer);
+    if (audioClips.size > MAX_AUDIO_CLIPS) {
+      audioClips.delete(audioClips.keys().next().value);
+    }
+    
+    const incident = {
+      id: state.incidentId,
+      ...parsed,
+      transcript,
+      audioUrl: `/audio/${audioId}`,
+      camera,
+      lat: camera?.lat,
+      lng: camera?.lng,
+      source: `BCFY Calls: ${call.groupId}`,
+      talkgroup: call.tg,
+      talkgroupName: call.tgName || call.groupName,
+      city: cityId,
+      timestamp: new Date(call.ts * 1000).toISOString()
+    };
+    
+    // Save to state
+    state.incidents.unshift(incident);
+    if (state.incidents.length > 50) state.incidents.pop();
+    
+    // Save to database
+    saveIncidentToDb(incident);
+    
+    // Also store in global for backwards compatibility (NYC only)
+    if (cityId === 'nyc') {
+      incidents.unshift(incident);
+      if (incidents.length > 50) incidents.pop();
+    }
+    
+    // Process through Detective Bureau
+    detectiveBureaus[cityId].processIncident(incident, (data) => broadcastToCity(cityId, data));
+    
+    // Check bets (NYC only)
+    if (cityId === 'nyc') checkBetsForIncident(incident);
+    
+    // Broadcast
+    broadcastToCity(cityId, { type: 'incident', incident });
+    if (camera) {
+      broadcastToCity(cityId, { 
+        type: 'camera_switch', 
+        camera, 
+        reason: `${parsed.incidentType} at ${parsed.location}`,
+        priority: parsed.priority 
+      });
+    }
+    
+    // Log scanner arrest if applicable
+    if (parsed.isArrest && pool) {
+      try {
+        await pool.query(`
+          INSERT INTO arrests (external_id, city, arrest_date, offense_description, offense_category, borough, lat, lng, source)
+          VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, 'bcfy_calls')
+        `, [
+          `bcfy_${Date.now()}`,
+          cityId,
+          parsed.incidentType,
+          parsed.arrestType || 'unknown',
+          parsed.borough,
+          camera?.lat,
+          camera?.lng
+        ]);
+        console.log(`[BCFY CALLS] Arrest logged: ${parsed.incidentType} at ${parsed.location}`);
+      } catch (e) { /* skip */ }
+    }
+    
+    bcfyCallsStats.callsProcessed++;
+    console.log(`[BCFY CALLS] 🚨 INCIDENT: ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
+    
+    return incident;
+  } catch (error) {
+    console.error('[BCFY CALLS] Process error:', error.message);
+    return null;
+  }
+}
+
+// Poll Broadcastify Calls API
+async function pollBcfyCalls() {
+  if (!bcfyCallsStats.enabled) return;
+  
+  try {
+    const calls = await fetchLiveCalls();
+    
+    for (const call of calls) {
+      await processBcfyCall(call, 'nyc');
+    }
+  } catch (error) {
+    console.error('[BCFY CALLS] Poll error:', error.message);
+  }
+}
+
+// Start Broadcastify Calls polling
+function startBcfyCallsPolling() {
+  if (!bcfyCallsStats.enabled) {
+    console.log('[BCFY CALLS] Disabled - missing credentials');
+    return;
+  }
+  
+  console.log('[BCFY CALLS] Starting live calls polling...');
+  
+  // Fetch available groups on startup
+  fetchNYCGroups().then(groups => {
+    if (groups.length > 0) {
+      console.log(`[BCFY CALLS] Monitoring ${groups.length} NYC groups`);
+    }
+  });
+  
+  // Poll every 5 seconds
+  setInterval(pollBcfyCalls, 5000);
+  
+  // Initial poll after 10 seconds
+  setTimeout(pollBcfyCalls, 10000);
 }
 
 // ============================================
@@ -4569,6 +4914,9 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
 
 setTimeout(startBroadcastifyStream, 5000);
 
+// Start Broadcastify Calls API polling (preferred method when credentials available)
+setTimeout(startBcfyCallsPolling, 8000);
+
 // ============================================
 // BETTING FUNCTIONS
 // ============================================
@@ -7656,6 +8004,7 @@ app.get('/debug', (req, res) => res.json({
     allFeeds: NYPD_FEEDS.map(f => f.name),
     uptime: process.uptime()
   },
+  bcfyCalls: bcfyCallsStats,
   openMHz: openMHzStats,
   connections: clients.size, 
   incidents: incidents.length, 
@@ -7663,6 +8012,21 @@ app.get('/debug', (req, res) => res.json({
   agents: detectiveBureau.getAgentStatuses(), 
   predictions: detectiveBureau.getPredictionStats() 
 }));
+
+// Broadcastify Calls API status
+app.get('/bcfy/status', (req, res) => res.json({
+  ...bcfyCallsStats,
+  processedCacheSize: processedCallsCache.size
+}));
+
+app.get('/bcfy/groups', async (req, res) => {
+  try {
+    const groups = await fetchNYCGroups();
+    res.json({ groups, count: groups.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Scanner control endpoints
 app.post('/scanner/restart', (req, res) => {
