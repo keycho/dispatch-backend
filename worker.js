@@ -89,7 +89,8 @@ const workerStats = {
     callsProcessed: 0,
     errors: 0,
     lastError: null,
-    groups: []
+    groups: [],
+    playlists: []
   },
   openMHz: {},
   dataSync: {
@@ -303,10 +304,62 @@ async function bcfyApiRequest(endpoint, options = {}, requireAuth = true) {
   }
 }
 
+// Store public playlists
+let publicPlaylists = [];
+
+async function fetchNYCPublicPlaylists() {
+  try {
+    // Use County Playlists endpoint - returns PUBLIC playlists for a county
+    // These don't require user auth to access via Live Calls
+    const jwt = generateBcfyJWT(false); // No user auth needed
+    if (!jwt) throw new Error('Could not generate JWT');
+    
+    console.log('[BCFY CALLS] Fetching public playlists for NYC county:', NYC_COUNTY_ID);
+    
+    const response = await fetch(`${BCFY_API_URL}/calls/v1/playlists_ctid/${NYC_COUNTY_ID}`, {
+      headers: {
+        'Authorization': `Bearer ${jwt}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Playlists API ${response.status}: ${errorText}`);
+    }
+    
+    const data = await response.json();
+    publicPlaylists = data.playlists || data || [];
+    console.log(`[BCFY CALLS] Found ${publicPlaylists.length} public playlists in NYC`);
+    
+    // Filter for law enforcement playlists
+    const lawPlaylists = publicPlaylists.filter(p => 
+      p.name?.toLowerCase().includes('police') ||
+      p.name?.toLowerCase().includes('nypd') ||
+      p.name?.toLowerCase().includes('pd') ||
+      p.name?.toLowerCase().includes('law') ||
+      p.name?.toLowerCase().includes('dispatch')
+    );
+    
+    if (lawPlaylists.length > 0) {
+      console.log('[BCFY CALLS] Law enforcement playlists:', lawPlaylists.map(p => `${p.name} (${p.uuid})`));
+      workerStats.bcfyCalls.playlists = lawPlaylists;
+    } else {
+      console.log('[BCFY CALLS] All playlists:', publicPlaylists.slice(0, 5).map(p => p.name));
+      workerStats.bcfyCalls.playlists = publicPlaylists;
+    }
+    
+    return workerStats.bcfyCalls.playlists;
+  } catch (error) {
+    console.error('[BCFY CALLS] Error fetching playlists:', error.message);
+    return [];
+  }
+}
+
+// Also try to get groups for reference
 async function fetchNYCGroups() {
   try {
-    // Use County Groups endpoint - POST /calls/v1/groups_ctid/{ctid}
-    const jwt = generateBcfyJWT(false); // No user auth needed for this endpoint
+    const jwt = generateBcfyJWT(false);
     if (!jwt) throw new Error('Could not generate JWT');
     
     console.log('[BCFY CALLS] Fetching NYC groups for county:', NYC_COUNTY_ID);
@@ -317,26 +370,25 @@ async function fetchNYCGroups() {
         'Authorization': `Bearer ${jwt}`,
         'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: 'tagId=2&secs_ago=3600' // tagId=2 is Law Dispatch, last hour
+      body: 'tagId=2&secs_ago=3600' // tagId=2 is Law Dispatch
     });
     
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`API ${response.status}: ${errorText}`);
+      throw new Error(`Groups API ${response.status}: ${errorText}`);
     }
     
     const data = await response.json();
     workerStats.bcfyCalls.groups = data || [];
     console.log(`[BCFY CALLS] Found ${workerStats.bcfyCalls.groups.length} groups in NYC`);
     
-    // Log first few groups for debugging
     if (workerStats.bcfyCalls.groups.length > 0) {
       console.log('[BCFY CALLS] Sample groups:', workerStats.bcfyCalls.groups.slice(0, 3).map(g => g.groupId));
     }
     
     return workerStats.bcfyCalls.groups;
   } catch (error) {
-    console.error('[BCFY CALLS] Error fetching NYC groups:', error.message);
+    console.error('[BCFY CALLS] Error fetching groups:', error.message);
     return [];
   }
 }
@@ -345,43 +397,78 @@ async function fetchLiveCalls() {
   if (!workerStats.bcfyCalls.enabled) return [];
   
   try {
-    // First make sure we have groups
+    // First try to get playlists if we don't have them
+    if (!workerStats.bcfyCalls.playlists || workerStats.bcfyCalls.playlists.length === 0) {
+      await fetchNYCPublicPlaylists();
+    }
+    
+    // Also fetch groups for reference
     if (workerStats.bcfyCalls.groups.length === 0) {
       await fetchNYCGroups();
     }
     
-    // Get list of group IDs to monitor (max 5 per API call)
-    const groupIds = workerStats.bcfyCalls.groups.slice(0, 5).map(g => g.groupId);
-    if (groupIds.length === 0) {
-      console.log('[BCFY CALLS] No groups to monitor');
-      return [];
-    }
-    
-    // Use Live Calls endpoint with groups parameter
-    const jwt = generateBcfyJWT(true); // Try with user auth first
+    const jwt = generateBcfyJWT(false); // No user auth for public playlists
     if (!jwt) throw new Error('Could not generate JWT');
     
-    const url = `${BCFY_API_URL}/calls/v1/live?groups=${groupIds.join(',')}&init=1`;
-    console.log('[BCFY CALLS] Fetching live calls:', url);
+    let allCalls = [];
     
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${jwt}`,
-        'Content-Type': 'application/json'
+    // Try each public playlist (public playlists don't need user auth)
+    const playlists = workerStats.bcfyCalls.playlists || [];
+    for (const playlist of playlists.slice(0, 3)) { // Limit to first 3
+      try {
+        const url = `${BCFY_API_URL}/calls/v1/live?playlist_uuid=${playlist.uuid}&init=1`;
+        console.log(`[BCFY CALLS] Fetching from playlist: ${playlist.name}`);
+        
+        const response = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${jwt}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          const calls = data.calls || data || [];
+          console.log(`[BCFY CALLS] Playlist ${playlist.name}: ${calls.length} calls`);
+          allCalls = allCalls.concat(calls);
+        } else {
+          const errorText = await response.text();
+          console.log(`[BCFY CALLS] Playlist ${playlist.name} error: ${response.status}`);
+        }
+      } catch (err) {
+        console.error(`[BCFY CALLS] Playlist error:`, err.message);
       }
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`API ${response.status}: ${errorText}`);
     }
     
-    const data = await response.json();
+    // If no playlists work, try using System ID directly (may require auth)
+    if (allCalls.length === 0 && workerStats.bcfyCalls.groups.length > 0) {
+      console.log('[BCFY CALLS] Trying System ID approach...');
+      try {
+        // Try with NYPD System ID (7636)
+        const url = `${BCFY_API_URL}/calls/v1/live?sid=7636&init=1`;
+        const response = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${jwt}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          allCalls = data.calls || data || [];
+          console.log(`[BCFY CALLS] System ID approach: ${allCalls.length} calls`);
+        } else {
+          console.log(`[BCFY CALLS] System ID approach failed (likely needs user auth)`);
+        }
+      } catch (err) {
+        console.log('[BCFY CALLS] System ID error:', err.message);
+      }
+    }
+    
     workerStats.bcfyCalls.lastPoll = new Date().toISOString();
-    const calls = data.calls || data || [];
-    workerStats.bcfyCalls.callsFetched += calls.length;
-    console.log(`[BCFY CALLS] Fetched ${calls.length} live calls`);
-    return calls;
+    workerStats.bcfyCalls.callsFetched += allCalls.length;
+    console.log(`[BCFY CALLS] Total calls fetched: ${allCalls.length}`);
+    return allCalls;
   } catch (error) {
     console.error('[BCFY CALLS] Error fetching live calls:', error.message);
     return [];

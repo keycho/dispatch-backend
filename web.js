@@ -897,6 +897,259 @@ app.get('/camera-image/:id', async (req, res) => {
 });
 
 // ============================================
+// DATA API ENDPOINTS (PostgreSQL)
+// ============================================
+
+// Arrests data
+app.get('/data/arrests', async (req, res) => {
+  const pool = getPool();
+  if (!pool) return res.json({ error: 'Database not available', data: [] });
+  
+  try {
+    const { city = 'nyc', limit = 100, offset = 0, borough, date } = req.query;
+    let query = 'SELECT * FROM arrests WHERE city = $1';
+    const params = [city];
+    let paramIndex = 2;
+    
+    if (borough) {
+      query += ` AND borough ILIKE $${paramIndex++}`;
+      params.push(`%${borough}%`);
+    }
+    if (date) {
+      query += ` AND arrest_date >= $${paramIndex++}`;
+      params.push(date);
+    }
+    
+    query += ` ORDER BY arrest_date DESC NULLS LAST, created_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    // Get total count
+    const countResult = await pool.query('SELECT COUNT(*) FROM arrests WHERE city = $1', [city]);
+    
+    res.json({
+      data: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (error) {
+    console.error('[DATA] Arrests query error:', error.message);
+    res.status(500).json({ error: error.message, data: [] });
+  }
+});
+
+// 911 Calls data
+app.get('/data/911-calls', async (req, res) => {
+  const pool = getPool();
+  if (!pool) return res.json({ error: 'Database not available', data: [] });
+  
+  try {
+    const { city = 'nyc', limit = 100, offset = 0, borough, type, since } = req.query;
+    let query = 'SELECT * FROM calls_911 WHERE city = $1';
+    const params = [city];
+    let paramIndex = 2;
+    
+    if (borough) {
+      query += ` AND borough ILIKE $${paramIndex++}`;
+      params.push(`%${borough}%`);
+    }
+    if (type) {
+      query += ` AND incident_type ILIKE $${paramIndex++}`;
+      params.push(`%${type}%`);
+    }
+    if (since) {
+      query += ` AND created_date >= $${paramIndex++}`;
+      params.push(since);
+    }
+    
+    query += ` ORDER BY created_date DESC NULLS LAST LIMIT $${paramIndex++} OFFSET $${paramIndex}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    // Get total count
+    const countResult = await pool.query('SELECT COUNT(*) FROM calls_911 WHERE city = $1', [city]);
+    
+    res.json({
+      data: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (error) {
+    console.error('[DATA] 911 calls query error:', error.message);
+    res.status(500).json({ error: error.message, data: [] });
+  }
+});
+
+// Inmates/Facility data
+app.get('/data/inmates', async (req, res) => {
+  const pool = getPool();
+  if (!pool) return res.json({ error: 'Database not available', data: [] });
+  
+  try {
+    const { city = 'nyc', limit = 100, offset = 0, facility } = req.query;
+    let query = 'SELECT * FROM inmates WHERE city = $1';
+    const params = [city];
+    let paramIndex = 2;
+    
+    if (facility) {
+      query += ` AND facility ILIKE $${paramIndex++}`;
+      params.push(`%${facility}%`);
+    }
+    
+    query += ` ORDER BY admission_date DESC NULLS LAST, created_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    // Get total count
+    const countResult = await pool.query('SELECT COUNT(*) FROM inmates WHERE city = $1', [city]);
+    
+    // Get facility breakdown
+    const facilityBreakdown = await pool.query(`
+      SELECT facility, COUNT(*) as count 
+      FROM inmates 
+      WHERE city = $1 
+      GROUP BY facility 
+      ORDER BY count DESC
+    `, [city]);
+    
+    res.json({
+      data: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+      byFacility: facilityBreakdown.rows
+    });
+  } catch (error) {
+    console.error('[DATA] Inmates query error:', error.message);
+    res.status(500).json({ error: error.message, data: [] });
+  }
+});
+
+// ICE Activities
+app.get('/data/ice', async (req, res) => {
+  const pool = getPool();
+  if (!pool) return res.json({ error: 'Database not available', data: [] });
+  
+  try {
+    const { city = 'nyc', limit = 100, offset = 0, type, since } = req.query;
+    let query = 'SELECT * FROM ice_activities WHERE city = $1';
+    const params = [city];
+    let paramIndex = 2;
+    
+    if (type) {
+      query += ` AND activity_type ILIKE $${paramIndex++}`;
+      params.push(`%${type}%`);
+    }
+    if (since) {
+      query += ` AND created_at >= $${paramIndex++}`;
+      params.push(since);
+    }
+    
+    query += ` ORDER BY created_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    // Get total count
+    const countResult = await pool.query('SELECT COUNT(*) FROM ice_activities WHERE city = $1', [city]);
+    
+    res.json({
+      data: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (error) {
+    console.error('[DATA] ICE query error:', error.message);
+    res.status(500).json({ error: error.message, data: [] });
+  }
+});
+
+// Detention Facilities
+app.get('/data/facilities', async (req, res) => {
+  const pool = getPool();
+  if (!pool) return res.json({ error: 'Database not available', data: [] });
+  
+  try {
+    const { city, state: stateParam, type } = req.query;
+    let query = 'SELECT * FROM detention_facilities WHERE 1=1';
+    const params = [];
+    let paramIndex = 1;
+    
+    if (city) {
+      query += ` AND city = $${paramIndex++}`;
+      params.push(city);
+    }
+    if (stateParam) {
+      query += ` AND state = $${paramIndex++}`;
+      params.push(stateParam);
+    }
+    if (type) {
+      query += ` AND facility_type ILIKE $${paramIndex++}`;
+      params.push(`%${type}%`);
+    }
+    
+    query += ' ORDER BY name';
+    
+    const result = await pool.query(query, params);
+    
+    res.json({
+      data: result.rows,
+      total: result.rows.length
+    });
+  } catch (error) {
+    console.error('[DATA] Facilities query error:', error.message);
+    res.status(500).json({ error: error.message, data: [] });
+  }
+});
+
+// Data stats summary
+app.get('/data/stats', async (req, res) => {
+  const pool = getPool();
+  if (!pool) return res.json({ error: 'Database not available' });
+  
+  try {
+    const { city = 'nyc' } = req.query;
+    
+    const [arrests, calls911, inmates, ice, incidents] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM arrests WHERE city = $1', [city]),
+      pool.query('SELECT COUNT(*) FROM calls_911 WHERE city = $1', [city]),
+      pool.query('SELECT COUNT(*) FROM inmates WHERE city = $1', [city]),
+      pool.query('SELECT COUNT(*) FROM ice_activities WHERE city = $1', [city]),
+      pool.query('SELECT COUNT(*) FROM incidents_db WHERE city = $1', [city])
+    ]);
+    
+    // Get recent activity dates
+    const recentArrest = await pool.query('SELECT MAX(arrest_date) as latest FROM arrests WHERE city = $1', [city]);
+    const recent911 = await pool.query('SELECT MAX(created_date) as latest FROM calls_911 WHERE city = $1', [city]);
+    
+    res.json({
+      city,
+      counts: {
+        arrests: parseInt(arrests.rows[0].count),
+        calls_911: parseInt(calls911.rows[0].count),
+        inmates: parseInt(inmates.rows[0].count),
+        ice_activities: parseInt(ice.rows[0].count),
+        scanner_incidents: parseInt(incidents.rows[0].count)
+      },
+      latestData: {
+        arrests: recentArrest.rows[0].latest,
+        calls_911: recent911.rows[0].latest
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[DATA] Stats query error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // WEBSOCKET
 // ============================================
 
