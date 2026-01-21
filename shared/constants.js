@@ -76,7 +76,8 @@ export const OPENMHZ_POLL_INTERVAL = 10000; // 10 seconds
 
 export const BCFY_API_URL = 'https://api.bcfy.io';
 export const NYC_COUNTY_ID = 1855; // NYC County ID in RadioReference database
-export const BCFY_POLL_INTERVAL = 5000; // 5 seconds
+export const HENNEPIN_COUNTY_ID = 1336; // Hennepin County (Minneapolis) - Note: Police is encrypted, mostly fire/EMS available
+export const BCFY_POLL_INTERVAL = 30000; // 30 seconds - archives have 15min delay anyway
 
 // ============================================
 // NYPD PRECINCT TO BOROUGH MAPPING
