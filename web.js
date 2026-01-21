@@ -851,9 +851,59 @@ app.get('/', async (req, res) => {
   });
 });
 
-app.get('/incidents', (req, res) => {
+app.get('/incidents', async (req, res) => {
   const city = req.query.city || 'nyc';
-  res.json(localState[city]?.incidents || []);
+  const limit = parseInt(req.query.limit) || 50;
+  const fromDb = req.query.db === '1';
+  
+  // If specifically requesting from DB, or if in-memory is empty
+  const memoryIncidents = localState[city]?.incidents || [];
+  
+  if (fromDb || memoryIncidents.length === 0) {
+    const pool = getPool();
+    if (pool) {
+      try {
+        const result = await pool.query(`
+          SELECT * FROM incidents_db 
+          WHERE city = $1 
+          ORDER BY created_at DESC 
+          LIMIT $2
+        `, [city, limit]);
+        
+        // Merge with memory incidents, dedup by id
+        const dbIncidents = result.rows.map(row => ({
+          id: row.id,
+          incidentType: row.incident_type,
+          location: row.location,
+          borough: row.borough,
+          lat: parseFloat(row.lat),
+          lng: parseFloat(row.lng),
+          priority: row.priority,
+          summary: row.summary,
+          transcript: row.transcript,
+          units: row.units,
+          source: row.source,
+          audioUrl: row.audio_url,
+          timestamp: row.created_at
+        }));
+        
+        // Combine: memory first (most recent), then DB (historical)
+        const seenIds = new Set(memoryIncidents.map(i => i.id));
+        const combined = [...memoryIncidents];
+        for (const inc of dbIncidents) {
+          if (!seenIds.has(inc.id)) {
+            combined.push(inc);
+          }
+        }
+        
+        return res.json(combined.slice(0, limit));
+      } catch (error) {
+        console.error('[INCIDENTS] DB query error:', error.message);
+      }
+    }
+  }
+  
+  res.json(memoryIncidents);
 });
 
 app.get('/cameras', async (req, res) => {
@@ -1070,7 +1120,7 @@ app.get('/data/ice', async (req, res) => {
   }
 });
 
-// Detention Facilities
+// Detention Facilities with bus routes
 app.get('/data/facilities', async (req, res) => {
   const pool = getPool();
   if (!pool) return res.json({ error: 'Database not available', data: [] });
@@ -1098,9 +1148,68 @@ app.get('/data/facilities', async (req, res) => {
     
     const result = await pool.query(query, params);
     
+    // Add Rikers bus routes for NYC
+    const busRoutes = city === 'nyc' || !city ? [
+      { 
+        route_id: 'Q100', 
+        name: 'Q100 - Rikers Island', 
+        type: 'Public',
+        description: 'MTA Bus from Queens Plaza to Rikers Island Visitor Center',
+        stops: [
+          { name: 'Queens Plaza', lat: 40.7505, lng: -73.9407 },
+          { name: '21st St-Queensbridge', lat: 40.7540, lng: -73.9424 },
+          { name: 'Astoria Blvd', lat: 40.7702, lng: -73.9175 },
+          { name: '19th Ave/Hazen St', lat: 40.7813, lng: -73.8925 },
+          { name: 'Rikers Island Bridge', lat: 40.7880, lng: -73.8890 },
+          { name: 'Rikers Island Visitor Center', lat: 40.7920, lng: -73.8860 }
+        ]
+      },
+      { 
+        route_id: 'DOC_SHUTTLE', 
+        name: 'DOC Shuttle - Manhattan', 
+        type: 'DOC',
+        description: 'Department of Correction shuttle from Queens Plaza',
+        stops: [
+          { name: 'Queens Plaza (DOC Pickup)', lat: 40.7505, lng: -73.9407 },
+          { name: 'Rikers Island', lat: 40.7920, lng: -73.8860 }
+        ]
+      }
+    ] : [];
+    
+    // Get inmate counts per facility
+    let facilitiesWithCounts = result.rows;
+    try {
+      const countsResult = await pool.query(`
+        SELECT facility, COUNT(*) as population
+        FROM inmates
+        WHERE city = $1
+        GROUP BY facility
+      `, [city || 'nyc']);
+      
+      const countMap = {};
+      countsResult.rows.forEach(r => {
+        countMap[r.facility?.toLowerCase()] = parseInt(r.population);
+      });
+      
+      facilitiesWithCounts = result.rows.map(f => ({
+        ...f,
+        current_population: Object.entries(countMap).find(([k]) => 
+          f.name?.toLowerCase().includes(k)
+        )?.[1] || 0
+      }));
+    } catch (e) {
+      // Ignore count errors
+    }
+    
     res.json({
-      data: result.rows,
-      total: result.rows.length
+      data: facilitiesWithCounts,
+      busRoutes,
+      total: result.rows.length,
+      rikersIsland: {
+        lat: 40.7930,
+        lng: -73.8860,
+        facilities: result.rows.filter(f => f.address?.includes('Rikers')).length
+      }
     });
   } catch (error) {
     console.error('[DATA] Facilities query error:', error.message);

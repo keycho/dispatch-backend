@@ -96,7 +96,8 @@ const workerStats = {
   dataSync: {
     lastArrestSync: null,
     last911Sync: null,
-    lastInmateSync: null
+    lastInmateSync: null,
+    lastFacilitySync: null
   }
 };
 
@@ -605,6 +606,11 @@ async function processBcfyCall(call, cityId = 'nyc') {
       await saveScannerArrest(incident, cityId);
     }
     
+    // Check for ICE activity
+    if (parsed.isICE) {
+      await saveICEActivity(incident, cityId);
+    }
+    
     workerStats.bcfyCalls.callsProcessed++;
     console.log(`[BCFY CALLS] 🚨 INCIDENT: ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
     
@@ -928,6 +934,11 @@ async function processOpenMHzCall(call, cityId = 'nyc') {
         await saveScannerArrest(incident, cityId);
       }
       
+      // Check for ICE activity
+      if (parsed.isICE) {
+        await saveICEActivity(incident, cityId);
+      }
+      
       console.log(`[OPENMHZ-${cityId.toUpperCase()} INCIDENT]`, incident.incidentType, '@', incident.location, `(${incident.borough})`);
     }
   } catch (error) { /* silent */ }
@@ -1069,6 +1080,11 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
       await saveScannerArrest(incident, cityId);
     }
     
+    // Check for ICE activity (especially for Minneapolis)
+    if (parsed.isICE) {
+      await saveICEActivity(incident, cityId);
+    }
+    
     workerStats.scanner.feedStats[feedId].incidents++;
     console.log(`[INCIDENT]`, incident.incidentType, '@', incident.location, `(${incident.borough})`);
   }
@@ -1174,6 +1190,11 @@ MINNEAPOLIS PRECINCTS:
 - 4th Precinct: North Minneapolis
 - 5th Precinct: Southwest Minneapolis (Uptown, Calhoun, Lyndale)
 
+ICE/IMMIGRATION KEYWORDS to detect:
+- "ICE", "immigration", "customs enforcement", "federal agents"
+- "detainer", "deportation", "CBP", "Border Patrol"
+- "warrant for immigration", "fugitive operations"
+
 If NO location can be determined, set location to null.
 
 Respond ONLY with valid JSON:
@@ -1186,7 +1207,9 @@ Respond ONLY with valid JSON:
   "priority": "CRITICAL/HIGH/MEDIUM/LOW",
   "summary": "brief summary",
   "precinctMentioned": "number or null",
-  "isArrest": boolean
+  "isArrest": boolean,
+  "isICE": boolean,
+  "iceDetails": "description of ICE activity if applicable"
 }`,
       messages: [{ role: "user", content: `Parse this Minneapolis police radio transmission:\n\n"${transcript}"` }]
     });
@@ -1197,12 +1220,54 @@ Respond ONLY with valid JSON:
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
       if (parsed.location === null) parsed.location = 'Unknown';
+      
+      // Check for ICE keywords if not already detected
+      if (!parsed.isICE) {
+        const iceKeywords = ['ice', 'immigration', 'customs', 'deportation', 'detainer', 'cbp', 'border patrol', 'federal agent'];
+        const lower = transcript.toLowerCase();
+        parsed.isICE = iceKeywords.some(kw => lower.includes(kw));
+      }
+      
       return parsed;
     }
     return { hasIncident: false };
   } catch (error) {
     console.error('[PARSE-MPLS] Error:', error.message);
     return { hasIncident: false };
+  }
+}
+
+// Save ICE activity to database
+async function saveICEActivity(incident, cityId) {
+  const pool = getPool();
+  if (!pool) return;
+  
+  try {
+    await pool.query(`
+      INSERT INTO ice_activities (city, activity_type, location, lat, lng, description, agencies, source, reported_by, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+    `, [
+      cityId,
+      incident.incidentType,
+      incident.location,
+      incident.lat,
+      incident.lng,
+      incident.iceDetails || incident.summary,
+      incident.units || [],
+      'scanner',
+      'automated'
+    ]);
+    
+    // Publish ICE alert
+    await publishICEAlert({
+      ...incident,
+      cityId,
+      alertType: 'ICE_ACTIVITY'
+    });
+    
+    console.log(`[ICE ALERT] ${incident.incidentType} at ${incident.location} (${cityId})`);
+  } catch (error) {
+    console.error('[ICE] Save error:', error.message);
   }
 }
 
@@ -1389,6 +1454,113 @@ async function fetchNYCInmateData() {
   }
 }
 
+// ============================================
+// NYC DETENTION FACILITIES DATA
+// ============================================
+
+const NYC_DETENTION_FACILITIES = [
+  // Rikers Island Complex
+  { facility_id: 'RIKERS_AMKC', name: 'Anna M. Kross Center (AMKC)', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7930, lng: -73.8860, facility_type: 'Jail', capacity: 2000 },
+  { facility_id: 'RIKERS_EMTC', name: 'Eric M. Taylor Center (EMTC)', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7925, lng: -73.8850, facility_type: 'Jail', capacity: 1500 },
+  { facility_id: 'RIKERS_GRVC', name: 'George R. Vierno Center (GRVC)', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7935, lng: -73.8845, facility_type: 'Jail', capacity: 1400 },
+  { facility_id: 'RIKERS_OBCC', name: 'Otis Bantum Correctional Center (OBCC)', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7920, lng: -73.8855, facility_type: 'Jail', capacity: 1800 },
+  { facility_id: 'RIKERS_RNDC', name: 'Robert N. Davoren Center (RNDC)', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7940, lng: -73.8840, facility_type: 'Jail', capacity: 1600 },
+  { facility_id: 'RIKERS_RMSC', name: 'Rose M. Singer Center (RMSC)', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7915, lng: -73.8865, facility_type: 'Jail - Women', capacity: 800 },
+  { facility_id: 'RIKERS_GMDC', name: 'George Motchan Detention Center (GMDC)', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7910, lng: -73.8870, facility_type: 'Jail', capacity: 700 },
+  { facility_id: 'RIKERS_NIC', name: 'North Infirmary Command (NIC)', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7945, lng: -73.8835, facility_type: 'Medical', capacity: 300 },
+  { facility_id: 'RIKERS_WEST', name: 'West Facility', city: 'nyc', state: 'NY', address: 'Rikers Island, East Elmhurst, NY', lat: 40.7905, lng: -73.8875, facility_type: 'Jail', capacity: 500 },
+  
+  // Manhattan Detention Complex
+  { facility_id: 'MDC_TOMBS', name: 'Manhattan Detention Complex (The Tombs)', city: 'nyc', state: 'NY', address: '125 White Street, New York, NY', lat: 40.7163, lng: -74.0018, facility_type: 'Jail', capacity: 900 },
+  
+  // Brooklyn Detention
+  { facility_id: 'BKDC', name: 'Brooklyn Detention Complex', city: 'nyc', state: 'NY', address: '275 Atlantic Avenue, Brooklyn, NY', lat: 40.6895, lng: -73.9857, facility_type: 'Jail', capacity: 800 },
+  
+  // Queens Detention
+  { facility_id: 'QCDC', name: 'Queens Detention Complex', city: 'nyc', state: 'NY', address: '126-02 82nd Avenue, Kew Gardens, NY', lat: 40.7050, lng: -73.8283, facility_type: 'Jail', capacity: 400 },
+  
+  // Bronx
+  { facility_id: 'VCBC', name: 'Vernon C. Bain Center (The Boat)', city: 'nyc', state: 'NY', address: 'Hunts Point, Bronx, NY', lat: 40.8072, lng: -73.8756, facility_type: 'Jail - Barge', capacity: 800 },
+  
+  // Federal Facilities
+  { facility_id: 'MCC_NYC', name: 'Metropolitan Correctional Center (MCC)', city: 'nyc', state: 'NY', address: '150 Park Row, New York, NY', lat: 40.7128, lng: -74.0024, facility_type: 'Federal Jail', capacity: 450 },
+  { facility_id: 'MDC_BROOKLYN', name: 'Metropolitan Detention Center Brooklyn', city: 'nyc', state: 'NY', address: '80 29th Street, Brooklyn, NY', lat: 40.6688, lng: -74.0100, facility_type: 'Federal Jail', capacity: 1800 },
+];
+
+// Rikers Island bus routes (Q100 and DOC buses)
+const RIKERS_BUS_ROUTES = [
+  { route_id: 'Q100', name: 'Q100 - Rikers Island', type: 'Public', stops: [
+    { name: 'Queens Plaza', lat: 40.7505, lng: -73.9407 },
+    { name: '21st St-Queensbridge', lat: 40.7540, lng: -73.9424 },
+    { name: 'Astoria Blvd', lat: 40.7702, lng: -73.9175 },
+    { name: '19th Ave/Hazen St', lat: 40.7813, lng: -73.8925 },
+    { name: 'Rikers Island Bridge', lat: 40.7880, lng: -73.8890 },
+    { name: 'Rikers Island Visitor Center', lat: 40.7920, lng: -73.8860 }
+  ]},
+  { route_id: 'DOC_SHUTTLE', name: 'DOC Shuttle - Manhattan', type: 'DOC', stops: [
+    { name: 'Queens Plaza (DOC)', lat: 40.7505, lng: -73.9407 },
+    { name: 'Rikers Island', lat: 40.7920, lng: -73.8860 }
+  ]}
+];
+
+async function syncNYCFacilities() {
+  const pool = getPool();
+  if (!pool) return;
+  
+  console.log('[DATA SYNC] Syncing NYC detention facilities...');
+  
+  try {
+    let inserted = 0;
+    for (const facility of NYC_DETENTION_FACILITIES) {
+      try {
+        await pool.query(`
+          INSERT INTO detention_facilities (facility_id, name, city, state, address, lat, lng, facility_type, capacity, last_updated)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+          ON CONFLICT (facility_id) DO UPDATE SET
+            name = EXCLUDED.name,
+            capacity = EXCLUDED.capacity,
+            last_updated = NOW()
+        `, [facility.facility_id, facility.name, facility.city, facility.state, facility.address, facility.lat, facility.lng, facility.facility_type, facility.capacity]);
+        inserted++;
+      } catch (err) {
+        console.error(`[FACILITIES] Error inserting ${facility.name}:`, err.message);
+      }
+    }
+    
+    console.log(`[DATA SYNC] NYC facilities: ${inserted}/${NYC_DETENTION_FACILITIES.length} synced`);
+    workerStats.dataSync.lastFacilitySync = new Date().toISOString();
+  } catch (error) {
+    console.error('[DATA SYNC] Facilities sync error:', error.message);
+  }
+}
+
+// Get facilities with current inmate counts
+async function getFacilitiesWithCounts() {
+  const pool = getPool();
+  if (!pool) return NYC_DETENTION_FACILITIES;
+  
+  try {
+    const result = await pool.query(`
+      SELECT 
+        f.*,
+        COALESCE(i.count, 0) as current_population
+      FROM detention_facilities f
+      LEFT JOIN (
+        SELECT facility, COUNT(*) as count 
+        FROM inmates 
+        WHERE city = 'nyc' 
+        GROUP BY facility
+      ) i ON f.name ILIKE '%' || i.facility || '%'
+      ORDER BY f.name
+    `);
+    
+    return result.rows;
+  } catch (error) {
+    console.error('[FACILITIES] Query error:', error.message);
+    return NYC_DETENTION_FACILITIES;
+  }
+}
+
 function startDataSyncScheduler() {
   const pool = getPool();
   if (!pool) {
@@ -1405,7 +1577,11 @@ function startDataSyncScheduler() {
   // NYC 911 calls - every hour
   setInterval(fetchNYC911Data, 60 * 60 * 1000);
   
+  // Facilities - once per day (they don't change often)
+  setInterval(syncNYCFacilities, 24 * 60 * 60 * 1000);
+  
   // Initial sync after startup
+  setTimeout(syncNYCFacilities, 5000);  // Facilities first (static data)
   setTimeout(fetchNYCArrestData, 15000);
   setTimeout(fetchNYCInmateData, 45000);
   setTimeout(fetchNYC911Data, 30000);
