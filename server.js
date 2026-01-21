@@ -2239,37 +2239,55 @@ async function fetchNYCArrestData() {
   try {
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     
-    // Historic dataset (2006 - end of previous year)
-    const historicUrl = `https://data.cityofnewyork.us/resource/8h9b-rp9u.json?$where=arrest_date>='${thirtyDaysAgo}'&$limit=2000&$order=arrest_date DESC`;
-    
-    // YTD dataset (current year, updated quarterly)
-    const ytdUrl = `https://data.cityofnewyork.us/resource/uip8-fykc.json?$where=arrest_date>='${thirtyDaysAgo}'&$limit=2000&$order=arrest_date DESC`;
-    
     let allData = [];
     
-    // Fetch historic
+    // Historic dataset (2006 - end of previous year)
     try {
+      const historicParams = new URLSearchParams({
+        '$where': `arrest_date >= '${thirtyDaysAgo}'`,
+        '$limit': '2000',
+        '$order': 'arrest_date DESC'
+      });
+      const historicUrl = `https://data.cityofnewyork.us/resource/8h9b-rp9u.json?${historicParams.toString()}`;
+      
       const historicRes = await fetch(historicUrl, {
-        headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+        headers: { 
+          'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '',
+          'Accept': 'application/json'
+        }
       });
       if (historicRes.ok) {
         const historicData = await historicRes.json();
         allData = allData.concat(historicData);
         console.log(`[DATA SYNC] Historic arrests: ${historicData.length} fetched`);
+      } else {
+        console.log(`[DATA SYNC] Historic arrests API returned: ${historicRes.status}`);
       }
     } catch (e) {
       console.log('[DATA SYNC] Historic fetch error:', e.message);
     }
     
-    // Fetch YTD (might be empty early in year)
+    // YTD dataset (current year, updated quarterly)
     try {
+      const ytdParams = new URLSearchParams({
+        '$where': `arrest_date >= '${thirtyDaysAgo}'`,
+        '$limit': '2000',
+        '$order': 'arrest_date DESC'
+      });
+      const ytdUrl = `https://data.cityofnewyork.us/resource/uip8-fykc.json?${ytdParams.toString()}`;
+      
       const ytdRes = await fetch(ytdUrl, {
-        headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+        headers: { 
+          'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '',
+          'Accept': 'application/json'
+        }
       });
       if (ytdRes.ok) {
         const ytdData = await ytdRes.json();
         allData = allData.concat(ytdData);
         console.log(`[DATA SYNC] YTD arrests: ${ytdData.length} fetched`);
+      } else {
+        console.log(`[DATA SYNC] YTD arrests API returned: ${ytdRes.status}`);
       }
     } catch (e) {
       console.log('[DATA SYNC] YTD fetch error:', e.message);
@@ -2311,19 +2329,35 @@ async function fetchNYC911Data() {
   console.log('[DATA SYNC] Fetching NYC 911 calls...');
   
   try {
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const url = `https://data.cityofnewyork.us/resource/erm2-nwe9.json?$where=created_date>='${oneDayAgo}' AND agency='NYPD'&$limit=1000&$order=created_date DESC`;
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
+    // Use SoQL query with proper encoding
+    const baseUrl = 'https://data.cityofnewyork.us/resource/erm2-nwe9.json';
+    const params = new URLSearchParams({
+      '$where': `created_date >= '${oneDayAgo}' AND agency = 'NYPD'`,
+      '$limit': '1000',
+      '$order': 'created_date DESC'
+    });
+    
+    const url = `${baseUrl}?${params.toString()}`;
+    console.log('[DATA SYNC] 911 URL:', url.substring(0, 150) + '...');
     
     const response = await fetch(url, {
-      headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+      headers: { 
+        'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '',
+        'Accept': 'application/json'
+      }
     });
     
     if (!response.ok) {
-      console.log('[DATA SYNC] 911 calls API returned:', response.status);
+      const errorText = await response.text();
+      console.log('[DATA SYNC] 911 calls API returned:', response.status, errorText.substring(0, 200));
       return;
     }
     
     const data = await response.json();
+    console.log(`[DATA SYNC] 911 calls fetched: ${data.length}`);
+    
     let inserted = 0;
     
     for (const call of data) {
@@ -2338,7 +2372,7 @@ async function fetchNYC911Data() {
           'nyc', 
           call.created_date, 
           call.closed_date,
-          call.agency_name || 'NYPD',
+          call.agency_name || call.agency || 'NYPD',
           call.complaint_type,
           call.descriptor,
           call.location_type,
