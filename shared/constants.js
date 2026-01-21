@@ -47,11 +47,13 @@ export const NYPD_FEEDS = [
   { id: '40184', name: 'NYPD Citywide 1', city: 'nyc' },
   { id: '40185', name: 'NYPD Citywide 2', city: 'nyc' },
   { id: '40186', name: 'NYPD Citywide 3', city: 'nyc' },
-  { id: '32119', name: 'NYPD Dispatch Citywide', city: 'nyc' },
+  { id: '1189', name: 'NYPD SOD/ESU/Transit', city: 'nyc' }, // Special Operations Division - reliable
+  { id: '36687', name: 'NYPD Manhattan 1/5/7', city: 'nyc' },
 ];
 
+// Minneapolis police is encrypted on ARMER - these are Fire/EMS and Sheriff only
 export const MPLS_FEEDS = [
-  { id: '13544', name: 'Minneapolis Police', city: 'mpls' },
+  // { id: '13544', name: 'Minneapolis Police', city: 'mpls' }, // Likely encrypted/offline
   { id: '26049', name: 'Hennepin County Sheriff', city: 'mpls' },
   { id: '30435', name: 'Hennepin County Fire/EMS', city: 'mpls' },
   { id: '741', name: 'Minneapolis Fire', city: 'mpls' },
