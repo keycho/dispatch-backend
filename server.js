@@ -8165,38 +8165,94 @@ wss.on('connection', (ws, req) => {
   const city = CITIES[requestedCity] || CITIES.nyc;
   const state = cityState[requestedCity] || cityState.nyc;
   
-  // Send city-specific init data
-  const cameraStatus = requestedCity === 'mpls' ? {
-    status: 'maintenance',
-    message: 'MnDOT camera system may be under seasonal maintenance. Camera feeds may be temporarily unavailable.'
-  } : { status: 'operational' };
+  // Send city-specific init data (async to load from DB)
+  (async () => {
+    const cameraStatus = requestedCity === 'mpls' ? {
+      status: 'maintenance',
+      message: 'MnDOT camera system may be under seasonal maintenance. Camera feeds may be temporarily unavailable.'
+    } : { status: 'operational' };
+    
+    // Load incidents - combine memory + database
+    let incidents = state.incidents.slice(0, 20);
+    
+    // If memory is low, fetch from database (last 2 hours only)
+    if (incidents.length < 10 && pool) {
+      try {
+        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+        const result = await pool.query(`
+          SELECT * FROM incidents_db 
+          WHERE city = $1 AND created_at > $2
+          ORDER BY created_at DESC 
+          LIMIT 50
+        `, [requestedCity, twoHoursAgo]);
+        
+        const dbIncidents = result.rows.map(row => ({
+          id: row.id,
+          incidentType: row.incident_type,
+          location: row.location,
+          borough: row.borough,
+          lat: parseFloat(row.lat),
+          lng: parseFloat(row.lng),
+          priority: row.priority,
+          summary: row.summary,
+          transcript: row.transcript,
+          units: row.units,
+          source: row.source,
+          audioUrl: row.audio_url,
+          timestamp: row.created_at,
+          city: row.city
+        }));
+        
+        // Merge: memory first, then DB (deduped)
+        const seenIds = new Set(incidents.map(i => i.id));
+        for (const inc of dbIncidents) {
+          if (!seenIds.has(inc.id) && incidents.length < 50) {
+            incidents.push(inc);
+            seenIds.add(inc.id);
+          }
+        }
+        
+        console.log(`[WS INIT] ${requestedCity}: ${state.incidents.length} memory + ${dbIncidents.length} DB = ${incidents.length} total`);
+      } catch (err) {
+        console.error('[WS INIT] DB load error:', err.message);
+      }
+    }
   
-  ws.send(JSON.stringify({
-    type: "init",
-    city: {
-      id: city.id,
-      name: city.name,
-      shortName: city.shortName,
-      mapCenter: city.mapCenter,
-      mapZoom: city.mapZoom,
-      districts: city.districts,
-      color: city.color
-    },
-    cities: Object.values(CITIES).map(c => ({ id: c.id, name: c.name, shortName: c.shortName, color: c.color })),
-    incidents: state.incidents.slice(0, 20),
-    cameras: state.cameras,
-    cameraStatus,
-    transcripts: state.recentTranscripts.slice(0, 10),
-    activeFeeds: Array.from(state.activeStreams?.keys() || []),
-    streamCount: state.activeStreams?.size || 0,
-    agents: detectiveBureaus[requestedCity].getAgentStatuses(),
-    predictions: detectiveBureaus[requestedCity].getPredictionStats(),
-    facilities: requestedCity === 'nyc' ? NYC_FACILITIES.map(f => ({
-      id: f.id, name: f.name, shortName: f.shortName, borough: f.borough,
-      lat: f.lat, lng: f.lng, currentPopulation: f.currentPopulation
-    })) : [],
-    facilityStatus: requestedCity === 'nyc' ? getAllFacilitiesStatus() : null
-  }));
+    ws.send(JSON.stringify({
+      type: "init",
+      city: {
+        id: city.id,
+        name: city.name,
+        shortName: city.shortName,
+        mapCenter: city.mapCenter,
+        mapZoom: city.mapZoom,
+        districts: city.districts,
+        color: city.color
+      },
+      cities: Object.values(CITIES).map(c => ({ id: c.id, name: c.name, shortName: c.shortName, color: c.color })),
+      incidents,
+      cameras: state.cameras,
+      cameraStatus,
+      transcripts: state.recentTranscripts.slice(0, 10),
+      activeFeeds: Array.from(state.activeStreams?.keys() || []),
+      streamCount: state.activeStreams?.size || 0,
+      scannerStats: {
+        ...state.scannerStats,
+        totalChunks: scannerStats.totalChunks || 0,
+        successfulTranscripts: scannerStats.successfulTranscripts || 0,
+        lastTranscript: scannerStats.lastTranscript,
+        lastChunkTime: scannerStats.lastChunkTime,
+        feedStats: scannerStats.feedStats || {}
+      },
+      agents: detectiveBureaus[requestedCity].getAgentStatuses(),
+      predictions: detectiveBureaus[requestedCity].getPredictionStats(),
+      facilities: requestedCity === 'nyc' ? NYC_FACILITIES.map(f => ({
+        id: f.id, name: f.name, shortName: f.shortName, borough: f.borough,
+        lat: f.lat, lng: f.lng, currentPopulation: f.currentPopulation
+      })) : [],
+      facilityStatus: requestedCity === 'nyc' ? getAllFacilitiesStatus() : null
+    }));
+  })();
   
   ws.on('close', () => {
     clients.delete(ws);
@@ -8250,6 +8306,33 @@ wss.on('connection', (ws, req) => {
     } catch (e) { console.error('WS error:', e); }
   });
 });
+
+// Broadcast scanner stats to all clients every 5 seconds
+setInterval(() => {
+  const statsMessage = {
+    type: 'scanner_stats',
+    stats: {
+      totalChunks: scannerStats.totalChunks || 0,
+      successfulTranscripts: scannerStats.successfulTranscripts || 0,
+      lastTranscript: scannerStats.lastTranscript,
+      lastChunkTime: scannerStats.lastChunkTime,
+      feedStats: scannerStats.feedStats || {},
+      activeFeeds: Object.keys(scannerStats.feedStats || {}).filter(k => scannerStats.feedStats[k]?.chunks > 0),
+      uptime: Math.floor((Date.now() - serverStartTime) / 60000) // minutes
+    },
+    timestamp: new Date().toISOString()
+  };
+  
+  // Broadcast to all clients
+  clients.forEach(client => {
+    if (client.readyState === 1) {
+      client.send(JSON.stringify(statsMessage));
+    }
+  });
+}, 5000);
+
+// Track server start time for uptime
+const serverStartTime = Date.now();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
