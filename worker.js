@@ -128,12 +128,23 @@ workerStats.bcfyCalls.enabled = !!(BCFY_KEY_ID && BCFY_KEY_SECRET && BCFY_APP_ID
 // ============================================
 
 function generateBcfyJWT() {
-  if (!BCFY_KEY_ID || !BCFY_KEY_SECRET || !BCFY_APP_ID) return null;
+  console.log(`[BCFY DEBUG] Key ID: ${BCFY_KEY_ID ? BCFY_KEY_ID.substring(0,3) + '...' : 'MISSING'} (${BCFY_KEY_ID?.length || 0} chars)`);
+  console.log(`[BCFY DEBUG] Secret: ${BCFY_KEY_SECRET ? '***' : 'MISSING'} (${BCFY_KEY_SECRET?.length || 0} chars)`);
+  console.log(`[BCFY DEBUG] App ID: ${BCFY_APP_ID ? BCFY_APP_ID.substring(0,3) + '...' : 'MISSING'} (${BCFY_APP_ID?.length || 0} chars)`);
+  
+  if (!BCFY_KEY_ID || !BCFY_KEY_SECRET || !BCFY_APP_ID) {
+    console.log('[BCFY DEBUG] Missing credentials - cannot generate JWT');
+    return null;
+  }
   
   const now = Math.floor(Date.now() / 1000);
   
   const header = { alg: 'HS256', typ: 'JWT', kid: BCFY_KEY_ID };
   const payload = { iss: BCFY_APP_ID, iat: now, exp: now + 3600 };
+  
+  console.log('[BCFY DEBUG] JWT Header kid:', BCFY_KEY_ID);
+  console.log('[BCFY DEBUG] JWT Payload iss:', BCFY_APP_ID);
+  console.log('[BCFY DEBUG] JWT Payload iat:', now, 'exp:', now + 3600);
   
   const base64urlEncode = (obj) => {
     return Buffer.from(JSON.stringify(obj))
@@ -155,7 +166,10 @@ function generateBcfyJWT() {
     .replace(/\+/g, '-')
     .replace(/\//g, '_');
   
-  return `${headerEncoded}.${payloadEncoded}.${signature}`;
+  const jwt = `${headerEncoded}.${payloadEncoded}.${signature}`;
+  console.log('[BCFY DEBUG] Generated JWT:', jwt.substring(0, 80) + '...');
+  
+  return jwt;
 }
 
 async function bcfyApiRequest(endpoint, options = {}) {
