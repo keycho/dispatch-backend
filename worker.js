@@ -114,8 +114,13 @@ Object.keys(OPENMHZ_SYSTEMS).forEach(cityId => {
 // BROADCASTIFY CREDENTIALS
 // ============================================
 
-const BROADCASTIFY_USERNAME = 'whitefang123';
-const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
+// Broadcastify credentials - docs provide test creds:
+// Standard: spook42069 / df7a0nqagl
+// Premium: motion42069 / ef7a0n5a5ml
+// Set TEST_BCFY_CREDS=premium to use premium test credentials
+const TEST_MODE = process.env.TEST_BCFY_CREDS;
+const BROADCASTIFY_USERNAME = TEST_MODE === 'premium' ? 'motion42069' : (TEST_MODE === 'standard' ? 'spook42069' : 'whitefang123');
+const BROADCASTIFY_PASSWORD = TEST_MODE === 'premium' ? 'ef7a0n5a5ml' : (TEST_MODE === 'standard' ? 'df7a0nqagl' : process.env.BROADCASTIFY_PASSWORD);
 
 console.log(`[BCFY] Username: ${BROADCASTIFY_USERNAME}, Password set: ${BROADCASTIFY_PASSWORD ? 'YES (' + BROADCASTIFY_PASSWORD.length + ' chars)' : 'NO'}`);
 
@@ -130,6 +135,12 @@ let bcfyUserToken = null;
 let bcfyAuthExpires = 0;
 
 workerStats.bcfyCalls.enabled = !!(BCFY_KEY_ID && BCFY_KEY_SECRET && BCFY_APP_ID);
+
+// Log BCFY credentials info (masked)
+console.log('[BCFY] API Key ID:', BCFY_KEY_ID);
+console.log('[BCFY] API Key Secret length:', BCFY_KEY_SECRET?.length);
+console.log('[BCFY] App ID:', BCFY_APP_ID);
+console.log('[BCFY] Username:', BROADCASTIFY_USERNAME, 'Password set:', BROADCASTIFY_PASSWORD ? 'YES' : 'NO');
 
 // ============================================
 // BROADCASTIFY CALLS API (JWT Auth)
@@ -148,9 +159,15 @@ function generateBcfyJWT(includeUserAuth = false) {
   
   // Add user authentication if available and requested
   if (includeUserAuth && bcfyUserId && bcfyUserToken) {
-    payload.sub = bcfyUserId;
+    payload.sub = bcfyUserId; // Must be integer
     payload.utk = bcfyUserToken;
+    console.log('[BCFY JWT] Including user auth - sub:', bcfyUserId, '(type:', typeof bcfyUserId, '), utk length:', bcfyUserToken?.length);
   }
+  
+  // Debug: Log the full payload (but mask the token)
+  const debugPayload = { ...payload };
+  if (debugPayload.utk) debugPayload.utk = debugPayload.utk.substring(0, 8) + '...';
+  console.log('[BCFY JWT] Payload:', JSON.stringify(debugPayload));
   
   const base64urlEncode = (obj) => {
     return Buffer.from(JSON.stringify(obj))
@@ -172,7 +189,12 @@ function generateBcfyJWT(includeUserAuth = false) {
     .replace(/\+/g, '-')
     .replace(/\//g, '_');
   
-  return `${headerEncoded}.${payloadEncoded}.${signature}`;
+  const jwt = `${headerEncoded}.${payloadEncoded}.${signature}`;
+  
+  // Debug: Log first 50 chars of JWT
+  console.log('[BCFY JWT] Generated:', jwt.substring(0, 50) + '...');
+  
+  return jwt;
 }
 
 // Authenticate Broadcastify user to get userId and userToken
@@ -213,15 +235,18 @@ async function authenticateBcfyUser() {
     
     const data = await response.json();
     // Response format: { "username": "...", "uid": "431215", "token": "...", "exp": ... }
+    console.log('[BCFY AUTH] Response fields:', Object.keys(data).join(', '));
+    console.log('[BCFY AUTH] uid:', data.uid, 'type:', typeof data.uid);
+    console.log('[BCFY AUTH] token length:', data.token?.length);
     
     if (data.uid && data.token) {
-      bcfyUserId = parseInt(data.uid); // IMPORTANT: sub must be integer, not string
+      bcfyUserId = parseInt(data.uid, 10); // IMPORTANT: sub must be integer, not string
       bcfyUserToken = data.token;
       bcfyAuthExpires = data.exp ? (data.exp * 1000) : (Date.now() + 3600 * 1000);
-      console.log('[BCFY AUTH] Success! userId:', bcfyUserId, 'expires:', new Date(bcfyAuthExpires).toISOString());
+      console.log('[BCFY AUTH] Success! userId:', bcfyUserId, '(type:', typeof bcfyUserId, ') expires:', new Date(bcfyAuthExpires).toISOString());
       return true;
     } else {
-      console.error('[BCFY AUTH] Unexpected response format:', data);
+      console.error('[BCFY AUTH] Unexpected response format:', JSON.stringify(data));
       return false;
     }
   } catch (error) {
