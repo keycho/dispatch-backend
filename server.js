@@ -168,62 +168,90 @@ function getPrecinctBorough(precinctNum) {
 
 
 // ============================================
-// PERSISTENT MEMORY SYSTEM
+// PERSISTENT MEMORY SYSTEM (PostgreSQL-based)
 // ============================================
 
-const MEMORY_BASE_PATH = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
 const MEMORY_SAVE_INTERVAL = 60000; // Save every minute
 
-function getMemoryFile(cityId = 'nyc') {
-  return `${MEMORY_BASE_PATH}/detective_memory_${cityId}.json`;
-}
+console.log(`[MEMORY] Using PostgreSQL for agent memory persistence`);
 
-console.log(`[MEMORY] Storage base: ${MEMORY_BASE_PATH}`);
-console.log(`[MEMORY] Railway volume: ${process.env.RAILWAY_VOLUME_MOUNT_PATH || 'NOT CONFIGURED'}`);
-
-function loadMemoryFromDisk(cityId = 'nyc') {
+async function loadMemoryFromDb(cityId = 'nyc') {
+  if (!pool) {
+    console.log(`[MEMORY-${cityId.toUpperCase()}] No database - using fresh memory`);
+    return null;
+  }
+  
   try {
-    const memFile = getMemoryFile(cityId);
-    if (fs.existsSync(memFile)) {
-      const data = JSON.parse(fs.readFileSync(memFile, 'utf8'));
-      console.log(`[MEMORY-${cityId.toUpperCase()}] Loaded from disk:`, data.incidents?.length || 0, 'incidents,', data.predictionStats?.total || 0, 'predictions');
+    const result = await pool.query(
+      'SELECT memory_data FROM agent_memory WHERE city = $1',
+      [cityId]
+    );
+    
+    if (result.rows.length > 0) {
+      const data = result.rows[0].memory_data;
+      console.log(`[MEMORY-${cityId.toUpperCase()}] Loaded from database:`, 
+        data.incidents?.length || 0, 'incidents,', 
+        data.predictionStats?.total || 0, 'predictions');
       return data;
     }
   } catch (error) {
-    console.error(`[MEMORY-${cityId.toUpperCase()}] Load error:`, error.message);
+    console.error(`[MEMORY-${cityId.toUpperCase()}] DB load error:`, error.message);
   }
   return null;
 }
 
-function saveMemoryToDisk(memory, predictionStats, agents, cityId = 'nyc') {
+async function saveMemoryToDb(memory, predictionStats, agents, cityId = 'nyc') {
+  if (!pool) return;
+  
   try {
-    const memFile = getMemoryFile(cityId);
     const serializable = {
-      incidents: memory.incidents,
-      predictions: memory.predictions,
-      predictionHistory: memory.predictionHistory,
-      patterns: memory.patterns,
-      suspectProfiles: memory.suspectProfiles,
-      agentInsights: memory.agentInsights,
-      collaborations: memory.collaborations,
-      hotspots: Array.from(memory.hotspots.entries()),
-      addressHistory: Array.from(memory.addressHistory.entries()),
-      cases: Array.from(memory.cases.entries()),
+      incidents: memory.incidents?.slice(0, 500) || [], // Limit to prevent huge JSON
+      predictions: memory.predictions?.slice(0, 100) || [],
+      predictionHistory: memory.predictionHistory?.slice(0, 200) || [],
+      patterns: memory.patterns?.slice(0, 100) || [],
+      suspectProfiles: memory.suspectProfiles?.slice(0, 100) || [],
+      agentInsights: memory.agentInsights?.slice(0, 200) || [],
+      collaborations: memory.collaborations?.slice(0, 100) || [],
+      hotspots: Array.from(memory.hotspots?.entries() || []).slice(0, 200),
+      addressHistory: Array.from(memory.addressHistory?.entries() || []).slice(0, 500),
+      cases: Array.from(memory.cases?.entries() || []).slice(0, 100),
       predictionStats: {
-        total: predictionStats.total,
-        correct: predictionStats.correct,
-        pending: predictionStats.pending,
-        accuracyHistory: predictionStats.accuracyHistory
+        total: predictionStats.total || 0,
+        correct: predictionStats.correct || 0,
+        pending: predictionStats.pending?.slice(0, 50) || [],
+        accuracyHistory: predictionStats.accuracyHistory?.slice(0, 200) || []
       },
       agentStats: Object.fromEntries(
-        Object.entries(agents).map(([k, v]) => [k, { stats: v.stats, history: v.history.slice(-100) }])
+        Object.entries(agents).map(([k, v]) => [k, { 
+          stats: v.stats || {}, 
+          history: (v.history || []).slice(-100) 
+        }])
       ),
       savedAt: new Date().toISOString()
     };
-    fs.writeFileSync(memFile, JSON.stringify(serializable, null, 2));
+    
+    await pool.query(`
+      INSERT INTO agent_memory (city, memory_data, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (city) DO UPDATE SET
+        memory_data = $2,
+        updated_at = NOW()
+    `, [cityId, JSON.stringify(serializable)]);
+    
   } catch (error) {
-    console.error(`[MEMORY-${cityId.toUpperCase()}] Save error:`, error.message);
+    console.error(`[MEMORY-${cityId.toUpperCase()}] DB save error:`, error.message);
   }
+}
+
+// Legacy function names for compatibility
+function loadMemoryFromDisk(cityId = 'nyc') {
+  // This is now async, but we handle it in DetectiveBureau constructor
+  return null; // Return null initially, then load async
+}
+
+function saveMemoryToDisk(memory, predictionStats, agents, cityId = 'nyc') {
+  // Call async version
+  saveMemoryToDb(memory, predictionStats, agents, cityId);
 }
 
 // ============================================
@@ -235,9 +263,7 @@ class DetectiveBureau {
   constructor(anthropicClient, cityId = 'nyc') {
     this.anthropic = anthropicClient;
     this.cityId = cityId;
-    
-    const savedMemory = loadMemoryFromDisk(cityId);
-    const savedAgentStats = savedMemory?.agentStats || {};
+    this.initialized = false;
     
     // City-specific knowledge for system prompts
     const cityKnowledge = {
@@ -264,8 +290,8 @@ class DetectiveBureau {
         status: 'idle',
         triggers: ['pursuit', 'fled', 'fleeing', 'chase', 'vehicle pursuit', 'on foot', 'running', 'high speed', 'foot pursuit', '10-13'],
         systemPrompt: `You are CHASE, a pursuit specialist AI for ${cityId.toUpperCase()}. You predict escape routes, containment points, and track active pursuits. You know ${cityInfo.streets}. Keep responses to 2-3 sentences. Be tactical and specific.`,
-        stats: savedAgentStats.CHASE?.stats || { activations: 0, insights: 0, successfulContainments: 0 },
-        history: savedAgentStats.CHASE?.history || []
+        stats: { activations: 0, insights: 0, successfulContainments: 0 },
+        history: []
       },
       PATTERN: {
         id: 'PATTERN',
@@ -275,8 +301,8 @@ class DetectiveBureau {
         status: 'idle',
         triggers: [],
         systemPrompt: `You are PATTERN, a serial crime analyst AI. You find connections between incidents - matching MOs, geographic clusters, temporal patterns, suspect descriptions. You name the patterns you discover. Keep responses to 2-3 sentences. Reference specific incident details.`,
-        stats: savedAgentStats.PATTERN?.stats || { activations: 0, patternsFound: 0, linkedIncidents: 0 },
-        history: savedAgentStats.PATTERN?.history || []
+        stats: { activations: 0, patternsFound: 0, linkedIncidents: 0 },
+        history: []
       },
       PROPHET: {
         id: 'PROPHET',
@@ -286,8 +312,8 @@ class DetectiveBureau {
         status: 'idle',
         triggers: [],
         systemPrompt: `You are PROPHET, a predictive analyst AI. You make specific, testable predictions about where and when incidents will occur. Always include location, time window, incident type, and confidence percentage. Your accuracy is tracked publicly. Learn from your hits and misses.`,
-        stats: savedAgentStats.PROPHET?.stats || { activations: 0, totalPredictions: 0, hits: 0, misses: 0 },
-        history: savedAgentStats.PROPHET?.history || []
+        stats: { activations: 0, totalPredictions: 0, hits: 0, misses: 0 },
+        history: []
       },
       HISTORIAN: {
         id: 'HISTORIAN',
@@ -297,35 +323,35 @@ class DetectiveBureau {
         status: 'idle',
         triggers: [],
         systemPrompt: `You are HISTORIAN, the memory of the Detective Bureau. You remember every incident, every address, every suspect description. When new incidents occur, you surface relevant history - "this address had 4 calls this week", "suspect matches description from yesterday". Keep responses to 2-3 sentences.`,
-        stats: savedAgentStats.HISTORIAN?.stats || { activations: 0, contextsProvided: 0, repeatAddresses: 0 },
-        history: savedAgentStats.HISTORIAN?.history || []
+        stats: { activations: 0, contextsProvided: 0, repeatAddresses: 0 },
+        history: []
       }
     };
 
-    // Load persistent memory or initialize fresh
+    // Initialize fresh memory (will be populated by init())
     this.memory = {
-      incidents: savedMemory?.incidents || [],
-      cases: new Map(savedMemory?.cases || []),
-      predictions: savedMemory?.predictions || [],
-      predictionHistory: savedMemory?.predictionHistory || [],
-      patterns: savedMemory?.patterns || [],
-      suspectProfiles: savedMemory?.suspectProfiles || [],
-      hotspots: new Map(savedMemory?.hotspots || []),
-      addressHistory: new Map(savedMemory?.addressHistory || []),
-      agentInsights: savedMemory?.agentInsights || [],
-      collaborations: savedMemory?.collaborations || []
+      incidents: [],
+      cases: new Map(),
+      predictions: [],
+      predictionHistory: [],
+      patterns: [],
+      suspectProfiles: [],
+      hotspots: new Map(),
+      addressHistory: new Map(),
+      agentInsights: [],
+      collaborations: []
     };
 
     this.predictionStats = {
-      total: savedMemory?.predictionStats?.total || 0,
-      correct: savedMemory?.predictionStats?.correct || 0,
-      pending: savedMemory?.predictionStats?.pending || [],
-      accuracyHistory: savedMemory?.predictionStats?.accuracyHistory || []
+      total: 0,
+      correct: 0,
+      pending: [],
+      accuracyHistory: []
     };
 
-    // Start memory persistence
+    // Start memory persistence (saves to DB)
     setInterval(() => {
-      saveMemoryToDisk(this.memory, this.predictionStats, this.agents, this.cityId);
+      saveMemoryToDb(this.memory, this.predictionStats, this.agents, this.cityId);
     }, MEMORY_SAVE_INTERVAL);
 
     this.startProphetCycle();
@@ -333,7 +359,54 @@ class DetectiveBureau {
     this.startHistorianCycle();
     this.startChaseCycle();
     
-    console.log(`[DETECTIVE-${this.cityId.toUpperCase()}] Bureau initialized with`, this.memory.incidents.length, 'historical incidents');
+    console.log(`[DETECTIVE-${this.cityId.toUpperCase()}] Bureau initialized (loading memory from database...)`);
+    
+    // Load memory asynchronously
+    this.loadMemoryAsync();
+  }
+  
+  async loadMemoryAsync() {
+    try {
+      const savedMemory = await loadMemoryFromDb(this.cityId);
+      
+      if (savedMemory) {
+        // Restore memory
+        this.memory.incidents = savedMemory.incidents || [];
+        this.memory.cases = new Map(savedMemory.cases || []);
+        this.memory.predictions = savedMemory.predictions || [];
+        this.memory.predictionHistory = savedMemory.predictionHistory || [];
+        this.memory.patterns = savedMemory.patterns || [];
+        this.memory.suspectProfiles = savedMemory.suspectProfiles || [];
+        this.memory.hotspots = new Map(savedMemory.hotspots || []);
+        this.memory.addressHistory = new Map(savedMemory.addressHistory || []);
+        this.memory.agentInsights = savedMemory.agentInsights || [];
+        this.memory.collaborations = savedMemory.collaborations || [];
+        
+        // Restore prediction stats
+        this.predictionStats.total = savedMemory.predictionStats?.total || 0;
+        this.predictionStats.correct = savedMemory.predictionStats?.correct || 0;
+        this.predictionStats.pending = savedMemory.predictionStats?.pending || [];
+        this.predictionStats.accuracyHistory = savedMemory.predictionStats?.accuracyHistory || [];
+        
+        // Restore agent stats
+        const savedAgentStats = savedMemory.agentStats || {};
+        for (const [agentId, data] of Object.entries(savedAgentStats)) {
+          if (this.agents[agentId]) {
+            this.agents[agentId].stats = data.stats || this.agents[agentId].stats;
+            this.agents[agentId].history = data.history || [];
+          }
+        }
+        
+        console.log(`[DETECTIVE-${this.cityId.toUpperCase()}] ✓ Loaded from database: ${this.memory.incidents.length} incidents, ${this.predictionStats.total} predictions`);
+      } else {
+        console.log(`[DETECTIVE-${this.cityId.toUpperCase()}] No saved memory found - starting fresh`);
+      }
+      
+      this.initialized = true;
+    } catch (error) {
+      console.error(`[DETECTIVE-${this.cityId.toUpperCase()}] Memory load error:`, error.message);
+      this.initialized = true; // Continue with fresh memory
+    }
   }
   
   // HISTORIAN background training
@@ -2066,6 +2139,15 @@ async function initDatabase() {
         error_message TEXT,
         completed_at TIMESTAMP DEFAULT NOW()
       );
+
+      -- Agent Memory (for Detective Bureau persistence)
+      CREATE TABLE IF NOT EXISTS agent_memory (
+        id SERIAL PRIMARY KEY,
+        city VARCHAR(10) UNIQUE NOT NULL,
+        memory_data JSONB NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_memory_city ON agent_memory(city);
     `);
     
     console.log('[DATABASE] Tables initialized');
