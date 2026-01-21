@@ -116,6 +116,8 @@ Object.keys(OPENMHZ_SYSTEMS).forEach(cityId => {
 const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
+console.log(`[BCFY] Username: ${BROADCASTIFY_USERNAME}, Password set: ${BROADCASTIFY_PASSWORD ? 'YES (' + BROADCASTIFY_PASSWORD.length + ' chars)' : 'NO'}`);
+
 // Broadcastify Calls API credentials
 const BCFY_KEY_ID = process.env.BCFY_API_KEY_ID;
 const BCFY_KEY_SECRET = process.env.BCFY_API_KEY_SECRET;
@@ -191,7 +193,9 @@ async function authenticateBcfyUser() {
     const jwt = generateBcfyJWT(false); // JWT without user auth for the auth endpoint
     if (!jwt) return false;
     
-    const response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
+    // Try the common auth endpoint with different body formats
+    // Format 1: JSON with "username" and "password"
+    let response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${jwt}`,
@@ -203,6 +207,35 @@ async function authenticateBcfyUser() {
       })
     });
     
+    // If that fails, try "user" and "pass" fields
+    if (!response.ok && response.status === 400) {
+      console.log('[BCFY AUTH] Trying alternate field names...');
+      response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${jwt}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          user: BROADCASTIFY_USERNAME,
+          pass: BROADCASTIFY_PASSWORD
+        })
+      });
+    }
+    
+    // If that fails, try form-urlencoded
+    if (!response.ok && response.status === 400) {
+      console.log('[BCFY AUTH] Trying form-urlencoded...');
+      response = await fetch(`${BCFY_API_URL}/common/v1/auth`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${jwt}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: `username=${encodeURIComponent(BROADCASTIFY_USERNAME)}&password=${encodeURIComponent(BROADCASTIFY_PASSWORD)}`
+      });
+    }
+    
     if (!response.ok) {
       const errorText = await response.text();
       console.error('[BCFY AUTH] Failed:', response.status, errorText);
@@ -210,10 +243,15 @@ async function authenticateBcfyUser() {
     }
     
     const data = await response.json();
+    console.log('[BCFY AUTH] Response:', JSON.stringify(data));
     
-    if (data.userId && data.userToken) {
-      bcfyUserId = data.userId;
-      bcfyUserToken = data.userToken;
+    // Try different response field names
+    const userId = data.userId || data.user_id || data.uid || data.sub;
+    const userToken = data.userToken || data.user_token || data.token || data.utk;
+    
+    if (userId && userToken) {
+      bcfyUserId = userId;
+      bcfyUserToken = userToken;
       bcfyAuthExpires = Date.now() + (3600 * 1000); // 1 hour
       console.log('[BCFY AUTH] Success! userId:', bcfyUserId);
       return true;
@@ -265,14 +303,37 @@ async function bcfyApiRequest(endpoint, options = {}, requireAuth = true) {
   }
 }
 
-// NYPD System ID on RadioReference (for Broadcastify Calls)
-const NYPD_SYSTEM_ID = 7636;
-
 async function fetchNYCGroups() {
   try {
-    const data = await bcfyApiRequest(`/calls/v1/groups?sid=${NYPD_SYSTEM_ID}`);
-    workerStats.bcfyCalls.groups = data.groups || data || [];
+    // Use County Groups endpoint - POST /calls/v1/groups_ctid/{ctid}
+    const jwt = generateBcfyJWT(false); // No user auth needed for this endpoint
+    if (!jwt) throw new Error('Could not generate JWT');
+    
+    console.log('[BCFY CALLS] Fetching NYC groups for county:', NYC_COUNTY_ID);
+    
+    const response = await fetch(`${BCFY_API_URL}/calls/v1/groups_ctid/${NYC_COUNTY_ID}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${jwt}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'tagId=2&secs_ago=3600' // tagId=2 is Law Dispatch, last hour
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`API ${response.status}: ${errorText}`);
+    }
+    
+    const data = await response.json();
+    workerStats.bcfyCalls.groups = data || [];
     console.log(`[BCFY CALLS] Found ${workerStats.bcfyCalls.groups.length} groups in NYC`);
+    
+    // Log first few groups for debugging
+    if (workerStats.bcfyCalls.groups.length > 0) {
+      console.log('[BCFY CALLS] Sample groups:', workerStats.bcfyCalls.groups.slice(0, 3).map(g => g.groupId));
+    }
+    
     return workerStats.bcfyCalls.groups;
   } catch (error) {
     console.error('[BCFY CALLS] Error fetching NYC groups:', error.message);
@@ -284,12 +345,43 @@ async function fetchLiveCalls() {
   if (!workerStats.bcfyCalls.enabled) return [];
   
   try {
-    // Use sid parameter for NYPD system
-    const data = await bcfyApiRequest(`/calls/v1/live?sid=${NYPD_SYSTEM_ID}`);
+    // First make sure we have groups
+    if (workerStats.bcfyCalls.groups.length === 0) {
+      await fetchNYCGroups();
+    }
+    
+    // Get list of group IDs to monitor (max 5 per API call)
+    const groupIds = workerStats.bcfyCalls.groups.slice(0, 5).map(g => g.groupId);
+    if (groupIds.length === 0) {
+      console.log('[BCFY CALLS] No groups to monitor');
+      return [];
+    }
+    
+    // Use Live Calls endpoint with groups parameter
+    const jwt = generateBcfyJWT(true); // Try with user auth first
+    if (!jwt) throw new Error('Could not generate JWT');
+    
+    const url = `${BCFY_API_URL}/calls/v1/live?groups=${groupIds.join(',')}&init=1`;
+    console.log('[BCFY CALLS] Fetching live calls:', url);
+    
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${jwt}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`API ${response.status}: ${errorText}`);
+    }
+    
+    const data = await response.json();
     workerStats.bcfyCalls.lastPoll = new Date().toISOString();
-    workerStats.bcfyCalls.callsFetched += (data.calls?.length || 0);
-    console.log(`[BCFY CALLS] Fetched ${data.calls?.length || 0} live calls`);
-    return data.calls || data || [];
+    const calls = data.calls || data || [];
+    workerStats.bcfyCalls.callsFetched += calls.length;
+    console.log(`[BCFY CALLS] Fetched ${calls.length} live calls`);
+    return calls;
   } catch (error) {
     console.error('[BCFY CALLS] Error fetching live calls:', error.message);
     return [];
