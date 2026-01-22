@@ -14,6 +14,23 @@ import cors from 'cors';
 dotenv.config();
 
 // ============================================
+// PASSWORD HASHING
+// ============================================
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedHash) {
+  if (!storedHash || !storedHash.includes(':')) return false;
+  const [salt, hash] = storedHash.split(':');
+  const verifyHash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+  return hash === verifyHash;
+}
+
+// ============================================
 // DATABASE CONNECTION
 // ============================================
 
@@ -1771,6 +1788,212 @@ const BOUNTY_TYPES = {
   LOCATION: { label: 'Location Check', icon: '📍', basePts: 100 }
 };
 
+// --- ACHIEVEMENTS SYSTEM ---
+const ACHIEVEMENTS = {
+  FIRST_BLOOD: { id: 'FIRST_BLOOD', name: 'First Blood', description: 'Win your first prediction', icon: '🎯', pts: 100, category: 'milestone' },
+  CENTURY: { id: 'CENTURY', name: 'Century', description: 'Make 100 predictions', icon: '💯', pts: 500, category: 'milestone' },
+  SHARPSHOOTER: { id: 'SHARPSHOOTER', name: 'Sharpshooter', description: '5 wins in a row', icon: '🔫', pts: 300, category: 'streak' },
+  HOT_STREAK: { id: 'HOT_STREAK', name: 'Hot Streak', description: '10 wins in a row', icon: '🔥', pts: 750, category: 'streak' },
+  UNSTOPPABLE: { id: 'UNSTOPPABLE', name: 'Unstoppable', description: '20 wins in a row', icon: '⚡', pts: 2000, category: 'streak' },
+  LONGSHOT: { id: 'LONGSHOT', name: 'Longshot', description: 'Win with 10x+ odds', icon: '🎰', pts: 1000, category: 'risk' },
+  QUICK_DRAW: { id: 'QUICK_DRAW', name: 'Quick Draw', description: 'Win 5-min prediction', icon: '⏱️', pts: 400, category: 'risk' },
+  HIGH_ROLLER: { id: 'HIGH_ROLLER', name: 'High Roller', description: 'Win 5000+ PTS once', icon: '💎', pts: 750, category: 'risk' },
+  MANHATTAN_MASTER: { id: 'MANHATTAN_MASTER', name: 'Manhattan Master', description: '10 wins in Manhattan', icon: '🏙️', pts: 400, category: 'borough' },
+  BROOKLYN_BOSS: { id: 'BROOKLYN_BOSS', name: 'Brooklyn Boss', description: '10 wins in Brooklyn', icon: '🌉', pts: 400, category: 'borough' },
+  BRONX_VETERAN: { id: 'BRONX_VETERAN', name: 'Bronx Veteran', description: '10 wins in Bronx', icon: '🏟️', pts: 400, category: 'borough' },
+  QUEENS_KING: { id: 'QUEENS_KING', name: 'Queens King', description: '10 wins in Queens', icon: '👑', pts: 400, category: 'borough' },
+  ISLAND_EXPLORER: { id: 'ISLAND_EXPLORER', name: 'Island Explorer', description: '10 wins in Staten Island', icon: '🏝️', pts: 500, category: 'borough' },
+  CITY_WIDE: { id: 'CITY_WIDE', name: 'City Wide', description: 'Win in all 5 boroughs', icon: '🗽', pts: 1000, category: 'borough' },
+  NIGHT_OWL: { id: 'NIGHT_OWL', name: 'Night Owl', description: 'Win between 2-5 AM', icon: '🦉', pts: 300, category: 'time' },
+  EARLY_BIRD: { id: 'EARLY_BIRD', name: 'Early Bird', description: 'Win between 5-7 AM', icon: '🐦', pts: 250, category: 'time' },
+  WEEKEND_WARRIOR: { id: 'WEEKEND_WARRIOR', name: 'Weekend Warrior', description: '5 weekend wins', icon: '🎉', pts: 350, category: 'time' },
+  SHOTS_SPOTTER: { id: 'SHOTS_SPOTTER', name: 'Shots Spotter', description: '5 shots fired correct', icon: '💥', pts: 750, category: 'specialist' },
+  PURSUIT_PREDICTOR: { id: 'PURSUIT_PREDICTOR', name: 'Pursuit Predictor', description: '5 pursuit correct', icon: '🚔', pts: 600, category: 'specialist' },
+  DEDICATED: { id: 'DEDICATED', name: 'Dedicated', description: '7-day login streak', icon: '📅', pts: 300, category: 'engagement' },
+  MONTHLY_MASTER: { id: 'MONTHLY_MASTER', name: 'Monthly Master', description: '30-day login streak', icon: '🗓️', pts: 1500, category: 'engagement' },
+  THOUSAND_CLUB: { id: 'THOUSAND_CLUB', name: 'Thousand Club', description: 'Reach 1,000 PTS', icon: '💰', pts: 0, category: 'wealth' },
+  MADE_DETECTIVE: { id: 'MADE_DETECTIVE', name: 'Made Detective', description: 'Reach Detective rank', icon: '🔍', pts: 0, category: 'rank' },
+  MADE_CAPTAIN: { id: 'MADE_CAPTAIN', name: 'Made Captain', description: 'Reach Captain rank', icon: '🏅', pts: 0, category: 'rank' },
+  COMMISSIONER: { id: 'COMMISSIONER', name: 'Commissioner', description: 'Reach Commissioner rank', icon: '🏆', pts: 0, category: 'rank' }
+};
+
+async function checkAndAwardAchievements(username, context = {}) {
+  const user = getUserByUsername(username);
+  if (!user) return [];
+  
+  if (!user.achievements) user.achievements = [];
+  if (!user.boroughWins) user.boroughWins = {};
+  if (!user.incidentTypeWins) user.incidentTypeWins = {};
+  
+  const newlyAwarded = [];
+  
+  const tryAward = async (id) => {
+    if (user.achievements.includes(id)) return;
+    const ach = ACHIEVEMENTS[id];
+    if (!ach) return;
+    
+    user.achievements.push(id);
+    user.pts += ach.pts;
+    newlyAwarded.push(ach);
+    
+    if (pool) {
+      try {
+        await pool.query('INSERT INTO user_achievements (username, achievement_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [username, id]);
+        await pool.query('UPDATE users_db SET pts = $1, achievements = $2 WHERE username = $3', [user.pts, user.achievements, username]);
+      } catch (e) { console.error('[ACHIEVEMENTS] DB error:', e.message); }
+    }
+    
+    broadcast({ type: 'achievement_unlocked', username: user.displayName, achievement: ach, timestamp: new Date().toISOString() });
+    addToActivityFeed({ type: 'achievement', user: user.displayName, achievement: ach.name, icon: ach.icon });
+  };
+  
+  if (context.type === 'prediction_win') {
+    if (user.wins === 1) await tryAward('FIRST_BLOOD');
+    if ((user.currentWinStreak || 0) >= 5) await tryAward('SHARPSHOOTER');
+    if ((user.currentWinStreak || 0) >= 10) await tryAward('HOT_STREAK');
+    if ((user.currentWinStreak || 0) >= 20) await tryAward('UNSTOPPABLE');
+    if ((user.totalPredictions || 0) >= 100) await tryAward('CENTURY');
+    if (context.multiplier >= 10) await tryAward('LONGSHOT');
+    if (context.windowMinutes <= 5) await tryAward('QUICK_DRAW');
+    if (context.winnings >= 5000) await tryAward('HIGH_ROLLER');
+    
+    const hour = new Date().getHours();
+    if (hour >= 2 && hour < 5) await tryAward('NIGHT_OWL');
+    if (hour >= 5 && hour < 7) await tryAward('EARLY_BIRD');
+    
+    const day = new Date().getDay();
+    if (day === 0 || day === 6) {
+      user.weekendWins = (user.weekendWins || 0) + 1;
+      if (user.weekendWins >= 5) await tryAward('WEEKEND_WARRIOR');
+    }
+    
+    const borough = (context.district || '').toLowerCase();
+    user.boroughWins[borough] = (user.boroughWins[borough] || 0) + 1;
+    
+    if (borough === 'manhattan' && user.boroughWins[borough] >= 10) await tryAward('MANHATTAN_MASTER');
+    if (borough === 'brooklyn' && user.boroughWins[borough] >= 10) await tryAward('BROOKLYN_BOSS');
+    if (borough === 'bronx' && user.boroughWins[borough] >= 10) await tryAward('BRONX_VETERAN');
+    if (borough === 'queens' && user.boroughWins[borough] >= 10) await tryAward('QUEENS_KING');
+    if (borough === 'staten island' && user.boroughWins[borough] >= 10) await tryAward('ISLAND_EXPLORER');
+    
+    const allBoroughs = ['manhattan', 'brooklyn', 'bronx', 'queens', 'staten island'];
+    if (allBoroughs.every(b => (user.boroughWins[b] || 0) >= 1)) await tryAward('CITY_WIDE');
+    
+    const incType = (context.incidentType || '').toLowerCase();
+    user.incidentTypeWins[incType] = (user.incidentTypeWins[incType] || 0) + 1;
+    if (incType.includes('shots') && user.incidentTypeWins[incType] >= 5) await tryAward('SHOTS_SPOTTER');
+    if (incType.includes('pursuit') && user.incidentTypeWins[incType] >= 5) await tryAward('PURSUIT_PREDICTOR');
+  }
+  
+  if (context.type === 'login') {
+    if ((user.loginStreak || 0) >= 7) await tryAward('DEDICATED');
+    if ((user.loginStreak || 0) >= 30) await tryAward('MONTHLY_MASTER');
+  }
+  
+  if (user.pts >= 1000) await tryAward('THOUSAND_CLUB');
+  if (user.pts >= 2000) await tryAward('MADE_DETECTIVE');
+  if (user.pts >= 25000) await tryAward('MADE_CAPTAIN');
+  if (user.pts >= 100000) await tryAward('COMMISSIONER');
+  
+  return newlyAwarded;
+}
+
+// --- DAILY CHALLENGES SYSTEM ---
+const CHALLENGE_TEMPLATES = [
+  { id: 'predict_borough', type: 'borough_predictions', template: 'Make {target} predictions in {borough}', targetRange: [2, 5], rewardRange: [75, 200], needsBorough: true },
+  { id: 'win_any', type: 'win_predictions', template: 'Win {target} predictions today', targetRange: [1, 3], rewardRange: [100, 300] },
+  { id: 'high_odds', type: 'high_multiplier_win', template: 'Win with {target}x+ odds', targetRange: [3, 8], rewardRange: [150, 400] },
+  { id: 'multi_borough', type: 'unique_boroughs', template: 'Predict in {target} different boroughs', targetRange: [2, 4], rewardRange: [100, 250] },
+  { id: 'wager_total', type: 'total_wagered', template: 'Wager {target} PTS total today', targetRange: [100, 500], rewardRange: [50, 150] },
+  { id: 'quick_bet', type: 'short_window_win', template: 'Win a {target}-minute (or less) prediction', targetRange: [5, 15], rewardRange: [150, 350] }
+];
+
+async function generateDailyChallenges(city = 'nyc') {
+  const today = new Date().toISOString().split('T')[0];
+  const boroughs = CITIES[city]?.districts || ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'];
+  const challenges = [];
+  const usedTypes = new Set();
+  
+  for (let i = 0; i < 4; i++) {
+    let tmpl;
+    let attempts = 0;
+    do { tmpl = CHALLENGE_TEMPLATES[Math.floor(Math.random() * CHALLENGE_TEMPLATES.length)]; attempts++; }
+    while (usedTypes.has(tmpl.id) && attempts < 10);
+    if (usedTypes.has(tmpl.id)) continue;
+    usedTypes.add(tmpl.id);
+    
+    const target = tmpl.targetRange[0] + Math.floor(Math.random() * (tmpl.targetRange[1] - tmpl.targetRange[0] + 1));
+    const reward = Math.round((tmpl.rewardRange[0] + Math.floor(Math.random() * (tmpl.rewardRange[1] - tmpl.rewardRange[0] + 1))) / 25) * 25;
+    const borough = tmpl.needsBorough ? boroughs[Math.floor(Math.random() * boroughs.length)] : null;
+    const desc = tmpl.template.replace('{target}', target).replace('{borough}', borough);
+    
+    const challenge = { id: `${tmpl.id}_${today}_${i}`, type: tmpl.type, description: desc, target, reward, city, borough, date: today };
+    challenges.push(challenge);
+    
+    if (pool) {
+      try {
+        await pool.query('INSERT INTO daily_challenges (challenge_date, challenge_id, challenge_type, description, target_value, reward_pts, city, borough) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING',
+          [today, challenge.id, tmpl.type, desc, target, reward, city, borough]);
+      } catch (e) { /* ignore duplicates */ }
+    }
+  }
+  return challenges;
+}
+
+async function getDailyChallenges(username, city = 'nyc') {
+  const today = new Date().toISOString().split('T')[0];
+  let challenges = [];
+  
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT * FROM daily_challenges WHERE challenge_date = $1 AND (city = $2 OR city IS NULL)', [today, city]);
+      challenges = r.rows.map(c => ({ id: c.challenge_id, type: c.challenge_type, description: c.description, target: c.target_value, reward: c.reward_pts, city: c.city, borough: c.borough }));
+    } catch (e) { /* ignore */ }
+  }
+  
+  if (challenges.length === 0) challenges = await generateDailyChallenges(city);
+  
+  if (username && pool) {
+    try {
+      const pr = await pool.query('SELECT * FROM user_challenge_progress WHERE username = $1 AND challenge_date = $2', [username, today]);
+      const pm = new Map(pr.rows.map(p => [p.challenge_id, p]));
+      challenges = challenges.map(c => ({ ...c, progress: pm.get(c.id)?.current_value || 0, completed: pm.get(c.id)?.completed || false, claimed: pm.get(c.id)?.claimed || false }));
+    } catch (e) { /* ignore */ }
+  }
+  
+  return challenges;
+}
+
+async function updateChallengeProgress(username, context = {}) {
+  if (!pool || !username) return;
+  const today = new Date().toISOString().split('T')[0];
+  const challenges = await getDailyChallenges(username, context.city || 'nyc');
+  
+  for (const ch of challenges) {
+    if (ch.completed || ch.claimed) continue;
+    let inc = 0, done = false;
+    
+    if (ch.type === 'borough_predictions' && context.type === 'prediction' && (context.district || '').toLowerCase() === (ch.borough || '').toLowerCase()) inc = 1;
+    if (ch.type === 'win_predictions' && context.type === 'prediction_win') inc = 1;
+    if (ch.type === 'high_multiplier_win' && context.type === 'prediction_win' && context.multiplier >= ch.target) done = true;
+    if (ch.type === 'unique_boroughs' && context.type === 'prediction') inc = 1;
+    if (ch.type === 'total_wagered' && context.type === 'prediction') inc = context.amount || 0;
+    if (ch.type === 'short_window_win' && context.type === 'prediction_win' && context.windowMinutes <= ch.target) done = true;
+    
+    if (inc > 0 || done) {
+      const newVal = (ch.progress || 0) + inc;
+      const completed = done || newVal >= ch.target;
+      try {
+        await pool.query('INSERT INTO user_challenge_progress (username, challenge_date, challenge_id, current_value, completed, completed_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (username, challenge_date, challenge_id) DO UPDATE SET current_value = user_challenge_progress.current_value + $7, completed = $5, completed_at = CASE WHEN $5 AND NOT user_challenge_progress.completed THEN NOW() ELSE user_challenge_progress.completed_at END',
+          [username, today, ch.id, newVal, completed, completed ? new Date() : null, inc]);
+        if (completed && !ch.completed) {
+          broadcast({ type: 'challenge_completed', username, challenge: ch, timestamp: new Date().toISOString() });
+        }
+      } catch (e) { console.error('[CHALLENGES] Progress error:', e.message); }
+    }
+  }
+}
+
 function createBounty(data) {
   const { type, title, description, location, city, reward, expiresInMinutes = 60, createdBy } = data;
   const bountyId = `bounty_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -2148,6 +2371,73 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_agent_memory_city ON agent_memory(city);
+
+      -- Enhanced Users columns
+      ALTER TABLE users_db ADD COLUMN IF NOT EXISTS password_hash VARCHAR(128);
+      ALTER TABLE users_db ADD COLUMN IF NOT EXISTS best_win_streak INTEGER DEFAULT 0;
+      ALTER TABLE users_db ADD COLUMN IF NOT EXISTS current_win_streak INTEGER DEFAULT 0;
+      ALTER TABLE users_db ADD COLUMN IF NOT EXISTS total_winnings INTEGER DEFAULT 0;
+      ALTER TABLE users_db ADD COLUMN IF NOT EXISTS achievements TEXT[] DEFAULT '{}';
+      ALTER TABLE users_db ADD COLUMN IF NOT EXISTS borough_wins JSONB DEFAULT '{}';
+
+      -- User Achievements
+      CREATE TABLE IF NOT EXISTS user_achievements (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) NOT NULL,
+        achievement_id VARCHAR(50) NOT NULL,
+        unlocked_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(username, achievement_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_achievements_user ON user_achievements(username);
+
+      -- Daily Challenges
+      CREATE TABLE IF NOT EXISTS daily_challenges (
+        id SERIAL PRIMARY KEY,
+        challenge_date DATE NOT NULL,
+        challenge_id VARCHAR(50) NOT NULL,
+        challenge_type VARCHAR(50) NOT NULL,
+        description TEXT NOT NULL,
+        target_value INTEGER NOT NULL,
+        reward_pts INTEGER NOT NULL,
+        city VARCHAR(10),
+        borough VARCHAR(50),
+        incident_type VARCHAR(50),
+        UNIQUE(challenge_date, challenge_id)
+      );
+
+      -- User Challenge Progress
+      CREATE TABLE IF NOT EXISTS user_challenge_progress (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) NOT NULL,
+        challenge_date DATE NOT NULL,
+        challenge_id VARCHAR(50) NOT NULL,
+        current_value INTEGER DEFAULT 0,
+        completed BOOLEAN DEFAULT FALSE,
+        completed_at TIMESTAMP,
+        claimed BOOLEAN DEFAULT FALSE,
+        UNIQUE(username, challenge_date, challenge_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_challenge_progress_user ON user_challenge_progress(username);
+
+      -- Predictions History (persistent)
+      CREATE TABLE IF NOT EXISTS predictions_db (
+        id SERIAL PRIMARY KEY,
+        prediction_id VARCHAR(100) UNIQUE NOT NULL,
+        username VARCHAR(50) NOT NULL,
+        city VARCHAR(10) NOT NULL,
+        district VARCHAR(50) NOT NULL,
+        incident_type VARCHAR(50) NOT NULL,
+        amount INTEGER NOT NULL,
+        multiplier DECIMAL(5,2) NOT NULL,
+        status VARCHAR(20) DEFAULT 'ACTIVE',
+        potential_win INTEGER,
+        actual_win INTEGER,
+        created_at TIMESTAMP DEFAULT NOW(),
+        expires_at TIMESTAMP NOT NULL,
+        resolved_at TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_predictions_user ON predictions_db(username);
+      CREATE INDEX IF NOT EXISTS idx_predictions_status ON predictions_db(status);
     `);
     
     console.log('[DATABASE] Tables initialized');
@@ -2699,6 +2989,27 @@ function checkPredictionsForIncident(incident) {
           streakFire: user?.currentWinStreak >= 3
         },
         timestamp: new Date().toISOString()
+      });
+      
+      // Check achievements for the winner
+      checkAndAwardAchievements(pred.username, {
+        type: 'prediction_win',
+        district: pred.district,
+        incidentType: pred.incidentType,
+        multiplier: pred.multiplier,
+        windowMinutes: pred.windowMinutes,
+        winnings: winnings
+      });
+      
+      // Update challenge progress
+      updateChallengeProgress(pred.username, {
+        type: 'prediction_win',
+        city: pred.city,
+        district: pred.district,
+        incidentType: pred.incidentType,
+        multiplier: pred.multiplier,
+        windowMinutes: pred.windowMinutes,
+        amount: pred.amount
       });
       
       console.log(`[PREDICTION] WIN! ${pred.displayName} won ${winnings} PTS (${user?.currentWinStreak || 1}x streak)`);
@@ -6397,8 +6708,82 @@ app.post('/detective/cleanup', (req, res) => {
 
 // Betting endpoints
 // Prediction Game endpoints (PTS-based)
-app.post('/auth/login', (req, res) => {
-  const { username } = req.body;
+// Register endpoint (new)
+app.post('/auth/register', async (req, res) => {
+  const { username, password } = req.body;
+  
+  if (!username || username.length < 3 || username.length > 20) {
+    return res.status(400).json({ error: 'Username must be 3-20 characters' });
+  }
+  if (!password || password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+  
+  const cleanUsername = username.toLowerCase().trim().replace(/[^a-z0-9_]/g, '');
+  if (cleanUsername.length < 3) {
+    return res.status(400).json({ error: 'Invalid username (use letters, numbers, underscore)' });
+  }
+  
+  // Check if exists in memory
+  if (getUserByUsername(cleanUsername)) {
+    return res.status(400).json({ error: 'Username already taken' });
+  }
+  
+  // Check if exists in database
+  if (pool) {
+    try {
+      const check = await pool.query('SELECT username FROM users_db WHERE username = $1', [cleanUsername]);
+      if (check.rows.length > 0) {
+        return res.status(400).json({ error: 'Username already taken' });
+      }
+    } catch (e) { /* ignore */ }
+  }
+  
+  // Hash password and create user
+  const passwordHash = hashPassword(password);
+  const user = createUser(cleanUsername);
+  user.passwordHash = passwordHash;
+  
+  // Save to database
+  if (pool) {
+    try {
+      await pool.query(`
+        INSERT INTO users_db (username, display_name, password_hash, pts, login_streak, last_login_date, created_at)
+        VALUES ($1, $2, $3, $4, 1, $5, NOW())
+        ON CONFLICT (username) DO UPDATE SET password_hash = $3
+      `, [cleanUsername, user.displayName, passwordHash, SIGNUP_BONUS, new Date().toISOString().split('T')[0]]);
+    } catch (e) { console.error('[AUTH] Register DB error:', e.message); }
+  }
+  
+  const rank = getUserRank(user.pts);
+  const challenges = await getDailyChallenges(cleanUsername);
+  
+  res.json({
+    success: true,
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.displayName,
+      pts: user.pts,
+      wins: 0,
+      losses: 0,
+      totalPredictions: 0,
+      loginStreak: 1,
+      currentWinStreak: 0,
+      achievements: []
+    },
+    rank,
+    isNewUser: true,
+    bonuses: [{ type: 'signup', amount: SIGNUP_BONUS, label: 'Welcome Bonus!' }],
+    challenges,
+    activePredictions: []
+  });
+});
+
+// Login endpoint (updated with password support)
+app.post('/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  
   if (!username || username.length < 3 || username.length > 20) {
     return res.status(400).json({ error: 'Username must be 3-20 characters' });
   }
@@ -6409,14 +6794,59 @@ app.post('/auth/login', (req, res) => {
   }
   
   let user = getUserByUsername(cleanUsername);
+  
+  // Try to load from database if not in memory
+  if (!user && pool) {
+    try {
+      const result = await pool.query('SELECT * FROM users_db WHERE username = $1', [cleanUsername]);
+      if (result.rows[0]) {
+        const db = result.rows[0];
+        user = {
+          id: `user_${db.id}`,
+          username: db.username,
+          displayName: db.display_name || db.username,
+          passwordHash: db.password_hash,
+          pts: db.pts || SIGNUP_BONUS,
+          wins: db.wins || 0,
+          losses: db.losses || 0,
+          totalPredictions: db.total_predictions || 0,
+          loginStreak: db.login_streak || 1,
+          bestLoginStreak: db.best_login_streak || 1,
+          lastLoginDate: db.last_login_date ? new Date(db.last_login_date).toISOString().split('T')[0] : null,
+          currentWinStreak: db.current_win_streak || 0,
+          bestWinStreak: db.best_win_streak || 0,
+          achievements: db.achievements || [],
+          boroughWins: db.borough_wins || {},
+          createdAt: db.created_at
+        };
+        users.set(cleanUsername, user);
+      }
+    } catch (e) { console.error('[AUTH] DB load error:', e.message); }
+  }
+  
+  // If user not found and no password, this is a new user - prompt to register
+  if (!user) {
+    // Legacy behavior: create user without password for backwards compatibility
+    // But if password is provided, tell them to register
+    if (password) {
+      return res.status(401).json({ error: 'User not found. Please register first.', needsRegister: true });
+    }
+    // Legacy: create without password
+    user = createUser(cleanUsername);
+  }
+  
+  // Password verification if user has a password
+  if (user.passwordHash) {
+    if (!password) {
+      return res.status(401).json({ error: 'Password required', requiresPassword: true });
+    }
+    if (!verifyPassword(password, user.passwordHash)) {
+      return res.status(401).json({ error: 'Incorrect password' });
+    }
+  }
+  
   let isNewUser = false;
   let bonuses = [];
-  
-  if (!user) {
-    user = createUser(cleanUsername);
-    isNewUser = true;
-    bonuses.push({ type: 'signup', amount: SIGNUP_BONUS, label: 'Welcome Bonus!' });
-  }
   
   // Calculate streak
   const streakInfo = calculateLoginStreak(user);
@@ -6447,7 +6877,21 @@ app.post('/auth/login', (req, res) => {
         bonus: loginBonus.bonus
       });
     }
+    
+    // Save to database
+    if (pool) {
+      try {
+        await pool.query('UPDATE users_db SET pts = $1, login_streak = $2, best_login_streak = $3, last_login_date = $4 WHERE username = $5',
+          [user.pts, user.loginStreak, user.bestLoginStreak, user.lastLoginDate, cleanUsername]);
+      } catch (e) { /* ignore */ }
+    }
   }
+  
+  // Check achievements
+  const newAchievements = await checkAndAwardAchievements(cleanUsername, { type: 'login' });
+  
+  // Get challenges
+  const challenges = await getDailyChallenges(cleanUsername);
   
   const rank = getUserRank(user.pts);
   
@@ -6458,20 +6902,23 @@ app.post('/auth/login', (req, res) => {
       username: user.username,
       displayName: user.displayName,
       pts: user.pts,
-      wins: user.wins,
-      losses: user.losses,
-      totalPredictions: user.totalPredictions,
+      wins: user.wins || 0,
+      losses: user.losses || 0,
+      totalPredictions: user.totalPredictions || 0,
       winRate: user.totalPredictions > 0 ? ((user.wins / user.totalPredictions) * 100).toFixed(1) + '%' : '0%',
       currentWinStreak: user.currentWinStreak || 0,
       bestWinStreak: user.bestWinStreak || 0,
       loginStreak: user.loginStreak || 1,
       bestLoginStreak: user.bestLoginStreak || 1,
       bountiesCompleted: user.bountiesCompleted || 0,
-      transcriptionsVerified: user.transcriptionsVerified || 0
+      transcriptionsVerified: user.transcriptionsVerified || 0,
+      achievements: user.achievements || []
     },
     rank,
     isNewUser,
     bonuses,
+    newAchievements,
+    challenges,
     activePredictions: Array.from(activePredictions.values()).filter(p => p.username === user.username)
   });
 });
@@ -6570,6 +7017,261 @@ app.get('/predict/leaderboard', (req, res) => {
       ...getUserRank(u.pts)
     }));
   res.json({ currency: 'PTS', leaderboard: leaders, totalPlayers: users.size, timestamp: new Date().toISOString() });
+});
+
+// Comprehensive predictions page data
+app.get('/predict/page', async (req, res) => {
+  const { city = 'nyc', username } = req.query;
+  
+  // User data
+  let userData = null;
+  let userChallenges = [];
+  let userAchievements = [];
+  let userActivePredictions = [];
+  
+  if (username) {
+    const user = getUserByUsername(username);
+    if (user) {
+      const rank = getUserRank(user.pts);
+      userData = {
+        username: user.username,
+        displayName: user.displayName,
+        pts: user.pts,
+        wins: user.wins || 0,
+        losses: user.losses || 0,
+        totalPredictions: user.totalPredictions || 0,
+        winRate: user.totalPredictions > 0 ? ((user.wins / user.totalPredictions) * 100).toFixed(1) : '0',
+        currentWinStreak: user.currentWinStreak || 0,
+        bestWinStreak: user.bestWinStreak || 0,
+        loginStreak: user.loginStreak || 1,
+        rank: rank.rank,
+        rankIcon: rank.icon,
+        rankColor: rank.color,
+        nextRank: rank.nextRank,
+        rankProgress: rank.progress
+      };
+      userChallenges = await getDailyChallenges(username, city);
+      userAchievements = user.achievements || [];
+      userActivePredictions = Array.from(activePredictions.values()).filter(p => p.username === username && p.status === 'ACTIVE');
+    }
+  }
+  
+  // All odds
+  const districts = oddsEngine.getDistricts(city);
+  const incidentTypes = ['any', 'assault', 'robbery', 'shots fired', 'pursuit', 'domestic', 'traffic'];
+  const timeWindows = [5, 15, 30, 60];
+  
+  const odds = {};
+  districts.forEach(d => {
+    odds[d] = {};
+    incidentTypes.forEach(t => {
+      odds[d][t] = {};
+      timeWindows.forEach(w => { odds[d][t][w] = oddsEngine.getOdds(d, t, w, city); });
+    });
+  });
+  
+  // Active predictions (anonymized)
+  const allActive = Array.from(activePredictions.values())
+    .filter(p => p.city === city && p.status === 'ACTIVE')
+    .map(p => ({
+      id: p.id,
+      user: (p.username || 'anon').slice(0, 1).toUpperCase() + '***',
+      district: p.district,
+      incidentType: p.incidentType,
+      amount: p.amount,
+      multiplier: p.multiplier,
+      potentialWin: p.potentialWin,
+      expiresAt: p.expiresAt,
+      timeRemaining: Math.max(0, new Date(p.expiresAt) - Date.now())
+    }));
+  
+  // Recent results
+  const recentResults = predictionHistory.filter(p => p.city === city).slice(0, 20).map(p => ({
+    user: (p.username || 'anon').slice(0, 1).toUpperCase() + '***',
+    district: p.district,
+    incidentType: p.incidentType,
+    status: p.status,
+    amount: p.amount,
+    winnings: p.winnings || 0,
+    multiplier: p.multiplier,
+    resolvedAt: p.resolvedAt
+  }));
+  
+  // Leaderboard top 10
+  const leaderboard = Array.from(users.values())
+    .filter(u => u.totalPredictions > 0)
+    .sort((a, b) => b.pts - a.pts)
+    .slice(0, 10)
+    .map((u, i) => {
+      const r = getUserRank(u.pts);
+      return {
+        rank: i + 1,
+        displayName: u.displayName,
+        pts: u.pts,
+        wins: u.wins || 0,
+        winRate: u.totalPredictions > 0 ? ((u.wins / u.totalPredictions) * 100).toFixed(1) + '%' : '0%',
+        rankName: r.rank,
+        rankIcon: r.icon
+      };
+    });
+  
+  // Hot zones from recent incidents
+  const hotZones = {};
+  const recentIncidents = cityState[city]?.incidents || [];
+  recentIncidents.slice(0, 50).forEach(inc => {
+    if (inc.borough) hotZones[inc.borough] = (hotZones[inc.borough] || 0) + 1;
+  });
+  
+  // Suggested bets based on activity
+  const suggestedBets = districts.map(d => {
+    const activity = hotZones[d] || 0;
+    const heat = activity > 10 ? 'hot' : activity > 5 ? 'warm' : activity > 0 ? 'moderate' : 'quiet';
+    return {
+      district: d,
+      heat,
+      activity,
+      ...oddsEngine.getOdds(d, 'any', 30, city)
+    };
+  }).sort((a, b) => b.activity - a.activity).slice(0, 3);
+  
+  // Pool stats
+  const poolStats = {
+    totalActive: allActive.length,
+    totalPtsInPlay: allActive.reduce((s, p) => s + p.amount, 0),
+    totalPotentialPayout: allActive.reduce((s, p) => s + p.potentialWin, 0),
+    recentWins: recentResults.filter(r => r.status === 'WON').length,
+    recentLosses: recentResults.filter(r => r.status === 'EXPIRED').length
+  };
+  
+  res.json({
+    city,
+    cityName: CITIES[city]?.name || city,
+    user: userData,
+    userPredictions: userActivePredictions,
+    challenges: userChallenges,
+    achievements: {
+      unlocked: userAchievements.length,
+      total: Object.keys(ACHIEVEMENTS).length,
+      list: userAchievements.map(id => ACHIEVEMENTS[id]).filter(Boolean)
+    },
+    districts,
+    incidentTypes,
+    timeWindows,
+    odds,
+    suggestedBets,
+    activePredictions: allActive,
+    recentResults,
+    poolStats,
+    leaderboard,
+    config: {
+      minBet: MIN_PREDICTION,
+      maxBet: MAX_PREDICTION,
+      houseEdge: HOUSE_EDGE,
+      signupBonus: SIGNUP_BONUS
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Achievements endpoints
+app.get('/achievements', (req, res) => {
+  res.json({
+    achievements: Object.values(ACHIEVEMENTS),
+    categories: ['milestone', 'streak', 'risk', 'borough', 'time', 'specialist', 'engagement', 'wealth', 'rank']
+  });
+});
+
+app.get('/achievements/:username', (req, res) => {
+  const user = getUserByUsername(req.params.username);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  
+  const unlocked = user.achievements || [];
+  const unlockedDetails = unlocked.map(id => ACHIEVEMENTS[id]).filter(Boolean);
+  const locked = Object.values(ACHIEVEMENTS).filter(a => !unlocked.includes(a.id));
+  
+  res.json({
+    unlocked: unlockedDetails,
+    locked,
+    stats: {
+      total: Object.keys(ACHIEVEMENTS).length,
+      unlocked: unlocked.length,
+      progress: Math.round((unlocked.length / Object.keys(ACHIEVEMENTS).length) * 100)
+    }
+  });
+});
+
+// Daily challenges endpoints
+app.get('/challenges', async (req, res) => {
+  const { city = 'nyc', username } = req.query;
+  const challenges = await getDailyChallenges(username, city);
+  const resetTime = new Date();
+  resetTime.setHours(24, 0, 0, 0);
+  
+  res.json({
+    challenges,
+    date: new Date().toISOString().split('T')[0],
+    resetsIn: resetTime - Date.now(),
+    resetsAt: resetTime.toISOString()
+  });
+});
+
+app.post('/challenges/:challengeId/claim', async (req, res) => {
+  const { username } = req.body;
+  const { challengeId } = req.params;
+  
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  
+  const user = getUserByUsername(username);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  
+  if (!pool) return res.status(500).json({ error: 'Database not available' });
+  
+  const today = new Date().toISOString().split('T')[0];
+  
+  try {
+    const result = await pool.query(`
+      SELECT cp.*, dc.reward_pts 
+      FROM user_challenge_progress cp
+      JOIN daily_challenges dc ON cp.challenge_id = dc.challenge_id AND cp.challenge_date = dc.challenge_date
+      WHERE cp.username = $1 AND cp.challenge_id = $2 AND cp.challenge_date = $3
+    `, [username, challengeId, today]);
+    
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Challenge not found or not started' });
+    }
+    
+    const progress = result.rows[0];
+    
+    if (!progress.completed) {
+      return res.status(400).json({ error: 'Challenge not completed yet' });
+    }
+    
+    if (progress.claimed) {
+      return res.status(400).json({ error: 'Reward already claimed' });
+    }
+    
+    // Award reward
+    const reward = progress.reward_pts;
+    user.pts += reward;
+    
+    // Update database
+    await pool.query('UPDATE user_challenge_progress SET claimed = TRUE WHERE username = $1 AND challenge_id = $2 AND challenge_date = $3', 
+      [username, challengeId, today]);
+    await pool.query('UPDATE users_db SET pts = $1 WHERE username = $2', [user.pts, username]);
+    
+    // Check if this triggers any achievements
+    const newAchievements = await checkAndAwardAchievements(username, { type: 'pts_earned' });
+    
+    res.json({
+      success: true,
+      reward,
+      newBalance: user.pts,
+      newAchievements
+    });
+  } catch (e) {
+    console.error('[CHALLENGES] Claim error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ============================================
@@ -7242,6 +7944,15 @@ app.post('/predict/place', (req, res) => {
   });
   
   broadcast({ type: 'new_prediction', prediction: { id: prediction.id, user: user.displayName, city, district: selectedDistrict, incidentType: type, amount: pts, multiplier: odds.multiplier, potentialWin }, timestamp: new Date().toISOString() });
+  
+  // Track challenge progress for making predictions
+  updateChallengeProgress(username, {
+    type: 'prediction',
+    city,
+    district: selectedDistrict,
+    incidentType: type,
+    amount: pts
+  });
   
   res.json({ success: true, prediction, odds, newBalance: user.pts });
 });
