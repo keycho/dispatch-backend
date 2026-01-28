@@ -2896,6 +2896,330 @@ async function fetchNYCInmateData() {
   }
 }
 
+// ============================================
+// EXPOSURE / SURVEILLANCE INFRASTRUCTURE
+// ============================================
+
+// In-memory storage for exposure data
+const exposureData = {
+  subwayEntrances: [],
+  nychaBuildings: [],
+  highProfileLocations: [
+    { name: 'Times Square', lat: 40.758, lng: -73.985, radius: 300, frRisk: 40 },
+    { name: 'Penn Station', lat: 40.750, lng: -73.991, radius: 200, frRisk: 35 },
+    { name: 'Grand Central', lat: 40.752, lng: -73.977, radius: 200, frRisk: 35 },
+    { name: 'World Trade Center', lat: 40.711, lng: -74.013, radius: 300, frRisk: 40 },
+    { name: 'Barclays Center', lat: 40.682, lng: -73.975, radius: 200, frRisk: 30 },
+    { name: 'Madison Square Garden', lat: 40.750, lng: -73.993, radius: 200, frRisk: 35 },
+    { name: 'Yankee Stadium', lat: 40.829, lng: -73.926, radius: 250, frRisk: 30 },
+    { name: 'Citi Field', lat: 40.757, lng: -73.846, radius: 250, frRisk: 30 },
+    { name: 'JFK Airport', lat: 40.641, lng: -73.778, radius: 500, frRisk: 45 },
+    { name: 'LaGuardia Airport', lat: 40.773, lng: -73.872, radius: 400, frRisk: 45 },
+    { name: 'Newark Airport', lat: 40.692, lng: -74.168, radius: 400, frRisk: 45 },
+    { name: 'Port Authority', lat: 40.757, lng: -73.990, radius: 150, frRisk: 35 },
+    { name: 'Brooklyn Bridge', lat: 40.706, lng: -73.997, radius: 200, frRisk: 25 },
+    { name: 'Manhattan Bridge', lat: 40.708, lng: -73.991, radius: 150, frRisk: 20 },
+    { name: 'Williamsburg Bridge', lat: 40.713, lng: -73.972, radius: 150, frRisk: 20 },
+    { name: 'Lincoln Tunnel', lat: 40.763, lng: -74.002, radius: 200, frRisk: 30 },
+    { name: 'Holland Tunnel', lat: 40.727, lng: -74.011, radius: 200, frRisk: 30 },
+    { name: 'City Hall', lat: 40.712, lng: -74.006, radius: 200, frRisk: 40 },
+    { name: 'Federal Plaza', lat: 40.715, lng: -74.002, radius: 150, frRisk: 45 },
+    { name: 'UN Headquarters', lat: 40.749, lng: -73.968, radius: 200, frRisk: 45 },
+    { name: 'Trump Tower', lat: 40.762, lng: -73.974, radius: 100, frRisk: 40 },
+    { name: 'Central Park Zoo', lat: 40.768, lng: -73.972, radius: 150, frRisk: 20 },
+    { name: 'Rockefeller Center', lat: 40.759, lng: -73.979, radius: 200, frRisk: 30 },
+    { name: 'Wall Street', lat: 40.706, lng: -74.009, radius: 200, frRisk: 35 },
+    { name: 'Brooklyn Navy Yard', lat: 40.702, lng: -73.971, radius: 300, frRisk: 25 },
+  ],
+  cameraTypes: {}, // Camera ID -> type mapping (DOT vs NYPD)
+  lastSync: null,
+  heatmapGrid: null, // Pre-calculated heatmap
+};
+
+// Haversine distance calculation (meters)
+function getDistanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000; // Earth radius in meters
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng/2) * Math.sin(dLng/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+// NYC Open Data - Subway Entrances
+async function fetchSubwayEntrances() {
+  console.log('[EXPOSURE] Fetching subway entrances...');
+  try {
+    const url = 'https://data.cityofnewyork.us/resource/drex-xx56.json?$limit=5000';
+    const response = await fetch(url, {
+      headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+    });
+    
+    if (!response.ok) {
+      console.log('[EXPOSURE] Subway API returned:', response.status);
+      return;
+    }
+    
+    const data = await response.json();
+    exposureData.subwayEntrances = data
+      .filter(e => e.the_geom?.coordinates)
+      .map(e => ({
+        name: e.name || 'Subway Entrance',
+        line: e.line || '',
+        lat: e.the_geom.coordinates[1],
+        lng: e.the_geom.coordinates[0],
+        entranceType: e.entrance_type || 'unknown',
+        ada: e.ada === 'TRUE',
+        frRisk: 30, // Base FR risk for subway
+      }));
+    
+    console.log(`[EXPOSURE] Loaded ${exposureData.subwayEntrances.length} subway entrances`);
+  } catch (error) {
+    console.error('[EXPOSURE] Subway fetch error:', error.message);
+  }
+}
+
+// NYC Open Data - NYCHA Buildings
+async function fetchNYCHABuildings() {
+  console.log('[EXPOSURE] Fetching NYCHA buildings...');
+  try {
+    const url = 'https://data.cityofnewyork.us/resource/evjd-dqpz.json?$limit=5000';
+    const response = await fetch(url, {
+      headers: { 'X-App-Token': process.env.NYC_OPEN_DATA_TOKEN || '' }
+    });
+    
+    if (!response.ok) {
+      console.log('[EXPOSURE] NYCHA API returned:', response.status);
+      return;
+    }
+    
+    const data = await response.json();
+    exposureData.nychaBuildings = data
+      .filter(b => b.latitude && b.longitude)
+      .map(b => ({
+        name: b.development || 'NYCHA Building',
+        address: b.address || '',
+        borough: b.borough || '',
+        lat: parseFloat(b.latitude),
+        lng: parseFloat(b.longitude),
+        units: parseInt(b.total_number_of_apartments) || 0,
+        frRisk: 25, // NYCHA has NYPD camera networks
+      }));
+    
+    console.log(`[EXPOSURE] Loaded ${exposureData.nychaBuildings.length} NYCHA buildings`);
+  } catch (error) {
+    console.error('[EXPOSURE] NYCHA fetch error:', error.message);
+  }
+}
+
+// Calculate FR Risk Score for a location
+function calculateFRRisk(lat, lng, cityId = 'nyc') {
+  let score = 0;
+  const factors = [];
+  
+  // Get city cameras
+  const state = cityState[cityId];
+  const cameras = state?.cameras || [];
+  
+  // Check nearby cameras
+  const nearbyCameras = cameras.filter(c => {
+    const dist = getDistanceMeters(lat, lng, c.lat, c.lng);
+    return dist < 100;
+  });
+  
+  if (nearbyCameras.length >= 5) {
+    score += 25;
+    factors.push({ factor: `High camera density (${nearbyCameras.length} within 100m)`, weight: 25 });
+  } else if (nearbyCameras.length >= 3) {
+    score += 15;
+    factors.push({ factor: `Moderate camera density (${nearbyCameras.length} within 100m)`, weight: 15 });
+  } else if (nearbyCameras.length >= 1) {
+    score += 5;
+    factors.push({ factor: `Camera nearby (${nearbyCameras.length} within 100m)`, weight: 5 });
+  }
+  
+  // Check subway entrances (MTA has FR pilots)
+  const nearbySubway = exposureData.subwayEntrances.filter(s => {
+    const dist = getDistanceMeters(lat, lng, s.lat, s.lng);
+    return dist < 100;
+  });
+  
+  if (nearbySubway.length > 0) {
+    const subwayScore = Math.min(30, nearbySubway.length * 15);
+    score += subwayScore;
+    factors.push({ 
+      factor: `Near subway entrance${nearbySubway.length > 1 ? 's' : ''} (${nearbySubway[0].name})`, 
+      weight: subwayScore 
+    });
+  }
+  
+  // Check NYCHA buildings (NYPD camera networks)
+  const nearbyNYCHA = exposureData.nychaBuildings.filter(b => {
+    const dist = getDistanceMeters(lat, lng, b.lat, b.lng);
+    return dist < 150;
+  });
+  
+  if (nearbyNYCHA.length > 0) {
+    score += 20;
+    factors.push({ factor: `Near NYCHA property (${nearbyNYCHA[0].name})`, weight: 20 });
+  }
+  
+  // Check high-profile locations
+  const nearbyHighProfile = exposureData.highProfileLocations.filter(h => {
+    const dist = getDistanceMeters(lat, lng, h.lat, h.lng);
+    return dist < h.radius;
+  });
+  
+  if (nearbyHighProfile.length > 0) {
+    const hpScore = nearbyHighProfile[0].frRisk;
+    score += hpScore;
+    factors.push({ factor: `Near ${nearbyHighProfile[0].name}`, weight: hpScore });
+  }
+  
+  // Check camera overlapping views (multiple angles = higher FR capability)
+  const veryNearCameras = cameras.filter(c => {
+    const dist = getDistanceMeters(lat, lng, c.lat, c.lng);
+    return dist < 50;
+  });
+  
+  if (veryNearCameras.length >= 2) {
+    score += 15;
+    factors.push({ factor: 'Multiple camera angles (overlapping coverage)', weight: 15 });
+  }
+  
+  // Normalize score to 0-100
+  score = Math.min(100, score);
+  
+  // Determine risk level
+  let risk;
+  if (score >= 60) risk = 'HIGH';
+  else if (score >= 30) risk = 'MEDIUM';
+  else risk = 'LOW';
+  
+  return {
+    score,
+    risk,
+    factors,
+    nearby: {
+      cameras: nearbyCameras.length,
+      subwayEntrances: nearbySubway.length,
+      nychaBuildings: nearbyNYCHA.length,
+      highProfileLocations: nearbyHighProfile.map(h => h.name),
+    },
+    explanation: factors.length > 0 
+      ? `This location has ${risk.toLowerCase()} estimated facial recognition risk based on ${factors.length} factor${factors.length > 1 ? 's' : ''}.`
+      : 'This location has minimal surveillance infrastructure detected nearby.'
+  };
+}
+
+// Calculate route exposure
+function calculateRouteExposure(points, cityId = 'nyc') {
+  if (!points || points.length < 2) {
+    return { error: 'Need at least 2 points for a route' };
+  }
+  
+  const segmentScores = [];
+  let totalDistance = 0;
+  let weightedScore = 0;
+  let maxScore = 0;
+  let maxScoreLocation = null;
+  
+  // Sample points along the route
+  for (let i = 0; i < points.length - 1; i++) {
+    const start = points[i];
+    const end = points[i + 1];
+    const segmentDist = getDistanceMeters(start.lat, start.lng, end.lat, end.lng);
+    totalDistance += segmentDist;
+    
+    // Sample every 50 meters
+    const samples = Math.max(1, Math.floor(segmentDist / 50));
+    
+    for (let j = 0; j <= samples; j++) {
+      const ratio = j / samples;
+      const sampleLat = start.lat + (end.lat - start.lat) * ratio;
+      const sampleLng = start.lng + (end.lng - start.lng) * ratio;
+      
+      const risk = calculateFRRisk(sampleLat, sampleLng, cityId);
+      segmentScores.push({
+        lat: sampleLat,
+        lng: sampleLng,
+        score: risk.score,
+        risk: risk.risk,
+      });
+      
+      weightedScore += risk.score;
+      
+      if (risk.score > maxScore) {
+        maxScore = risk.score;
+        maxScoreLocation = { lat: sampleLat, lng: sampleLng, factors: risk.factors };
+      }
+    }
+  }
+  
+  const avgScore = segmentScores.length > 0 ? weightedScore / segmentScores.length : 0;
+  
+  return {
+    totalDistance: Math.round(totalDistance),
+    averageScore: Math.round(avgScore),
+    maxScore,
+    maxScoreLocation,
+    overallRisk: avgScore >= 60 ? 'HIGH' : avgScore >= 30 ? 'MEDIUM' : 'LOW',
+    segments: segmentScores,
+    summary: `Route is ${Math.round(totalDistance)}m with ${avgScore >= 60 ? 'high' : avgScore >= 30 ? 'moderate' : 'low'} average surveillance exposure.`,
+  };
+}
+
+// Generate heatmap grid for NYC
+function generateExposureHeatmap(cityId = 'nyc') {
+  console.log('[EXPOSURE] Generating heatmap grid...');
+  
+  const city = CITIES[cityId];
+  if (!city) return null;
+  
+  const bounds = {
+    nyc: { minLat: 40.49, maxLat: 40.92, minLng: -74.26, maxLng: -73.70 },
+    mpls: { minLat: 44.89, maxLat: 45.05, minLng: -93.33, maxLng: -93.20 },
+  };
+  
+  const b = bounds[cityId] || bounds.nyc;
+  const gridSize = 0.005; // ~500m cells
+  const grid = [];
+  
+  for (let lat = b.minLat; lat <= b.maxLat; lat += gridSize) {
+    for (let lng = b.minLng; lng <= b.maxLng; lng += gridSize) {
+      const risk = calculateFRRisk(lat, lng, cityId);
+      if (risk.score > 0) { // Only include cells with some risk
+        grid.push({
+          lat: Math.round(lat * 1000) / 1000,
+          lng: Math.round(lng * 1000) / 1000,
+          score: risk.score,
+          risk: risk.risk,
+        });
+      }
+    }
+  }
+  
+  console.log(`[EXPOSURE] Generated heatmap with ${grid.length} cells`);
+  exposureData.heatmapGrid = grid;
+  exposureData.lastSync = new Date().toISOString();
+  
+  return grid;
+}
+
+// Sync exposure data
+async function syncExposureData() {
+  console.log('[EXPOSURE] Starting exposure data sync...');
+  await fetchSubwayEntrances();
+  await fetchNYCHABuildings();
+  
+  // Generate heatmap after data is loaded
+  setTimeout(() => generateExposureHeatmap('nyc'), 5000);
+  
+  console.log('[EXPOSURE] Sync complete');
+}
+
 // Start data sync scheduler
 function startDataSyncScheduler() {
   if (!pool) {
@@ -2916,6 +3240,10 @@ function startDataSyncScheduler() {
   setTimeout(fetchNYCArrestData, 15000);
   setTimeout(fetchNYCInmateData, 45000);
   setTimeout(fetchNYC911Data, 30000);
+  
+  // Exposure data sync - daily (static infrastructure)
+  setInterval(syncExposureData, 24 * 60 * 60 * 1000);
+  setTimeout(syncExposureData, 10000); // Initial sync
   
   console.log('[DATA SYNC] Scheduler started');
 }
@@ -9057,6 +9385,142 @@ app.get('/city/:cityId/init', (req, res) => {
 });
 
 // ============================================
+// EXPOSURE / SURVEILLANCE API ENDPOINTS
+// ============================================
+
+// Get FR risk score for a specific location
+app.get('/api/exposure/risk', (req, res) => {
+  const { lat, lng, city = 'nyc' } = req.query;
+  
+  if (!lat || !lng) {
+    return res.status(400).json({ error: 'lat and lng required' });
+  }
+  
+  const risk = calculateFRRisk(parseFloat(lat), parseFloat(lng), city);
+  res.json(risk);
+});
+
+// Get exposure data for a route
+app.post('/api/exposure/route', (req, res) => {
+  const { points, city = 'nyc' } = req.body;
+  
+  if (!points || !Array.isArray(points) || points.length < 2) {
+    return res.status(400).json({ error: 'points array with at least 2 points required' });
+  }
+  
+  const exposure = calculateRouteExposure(points, city);
+  res.json(exposure);
+});
+
+// Get pre-calculated heatmap grid
+app.get('/api/exposure/heatmap', (req, res) => {
+  const { city = 'nyc' } = req.query;
+  
+  if (!exposureData.heatmapGrid) {
+    // Generate on-demand if not ready
+    generateExposureHeatmap(city);
+    return res.json({ 
+      status: 'generating', 
+      message: 'Heatmap is being generated, try again in a few seconds',
+      grid: []
+    });
+  }
+  
+  res.json({
+    status: 'ready',
+    lastSync: exposureData.lastSync,
+    cellCount: exposureData.heatmapGrid.length,
+    grid: exposureData.heatmapGrid,
+  });
+});
+
+// Get surveillance infrastructure data
+app.get('/api/exposure/infrastructure', (req, res) => {
+  const { city = 'nyc' } = req.query;
+  const state = cityState[city] || cityStates.nyc;
+  
+  res.json({
+    cameras: {
+      count: state?.cameras?.length || 0,
+      sample: (state?.cameras || []).slice(0, 10),
+    },
+    subwayEntrances: {
+      count: exposureData.subwayEntrances.length,
+      sample: exposureData.subwayEntrances.slice(0, 10),
+    },
+    nychaBuildings: {
+      count: exposureData.nychaBuildings.length,
+      sample: exposureData.nychaBuildings.slice(0, 10),
+    },
+    highProfileLocations: exposureData.highProfileLocations,
+    lastSync: exposureData.lastSync,
+  });
+});
+
+// Get all subway entrances (for map layer)
+app.get('/api/exposure/subway', (req, res) => {
+  res.json({
+    count: exposureData.subwayEntrances.length,
+    entrances: exposureData.subwayEntrances,
+  });
+});
+
+// Get all NYCHA buildings (for map layer)
+app.get('/api/exposure/nycha', (req, res) => {
+  res.json({
+    count: exposureData.nychaBuildings.length,
+    buildings: exposureData.nychaBuildings,
+  });
+});
+
+// Get all high-profile locations (for map layer)
+app.get('/api/exposure/high-profile', (req, res) => {
+  res.json({
+    count: exposureData.highProfileLocations.length,
+    locations: exposureData.highProfileLocations,
+  });
+});
+
+// Get exposure summary stats
+app.get('/api/exposure/stats', (req, res) => {
+  const state = cityStates.nyc || { cameras: [] };
+  
+  // Calculate borough-level stats
+  const boroughStats = {};
+  for (const borough of CITIES.nyc.districts) {
+    const boroughCams = state.cameras?.filter(c => {
+      // Simple approximation by location
+      return c.name?.toLowerCase().includes(borough.toLowerCase());
+    }) || [];
+    
+    boroughStats[borough] = {
+      cameras: boroughCams.length,
+      riskLevel: boroughCams.length > 100 ? 'HIGH' : boroughCams.length > 50 ? 'MEDIUM' : 'LOW',
+    };
+  }
+  
+  res.json({
+    totalCameras: state.cameras?.length || 0,
+    totalSubwayEntrances: exposureData.subwayEntrances.length,
+    totalNYCHA: exposureData.nychaBuildings.length,
+    totalHighProfile: exposureData.highProfileLocations.length,
+    byBorough: boroughStats,
+    heatmapReady: !!exposureData.heatmapGrid,
+    lastSync: exposureData.lastSync,
+  });
+});
+
+// Force refresh exposure data
+app.post('/api/exposure/refresh', async (req, res) => {
+  await syncExposureData();
+  res.json({ 
+    status: 'refreshed',
+    subwayEntrances: exposureData.subwayEntrances.length,
+    nychaBuildings: exposureData.nychaBuildings.length,
+  });
+});
+
+// ============================================
 // LEGACY ENDPOINTS (default to NYC for backwards compatibility)
 // ============================================
 
@@ -9371,19 +9835,19 @@ wss.on('connection', (ws, req) => {
       message: 'MnDOT camera system may be under seasonal maintenance. Camera feeds may be temporarily unavailable.'
     } : { status: 'operational' };
     
-    // Load incidents - combine memory + database
+    // Load incidents - combine memory + database (always load from DB for persistence)
     let incidents = state.incidents.slice(0, 20);
     
-    // If memory is low, fetch from database (last 2 hours only)
-    if (incidents.length < 10 && pool) {
+    // Always fetch from database to ensure new users see recent incidents (last 6 hours)
+    if (pool) {
       try {
-        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+        const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
         const result = await pool.query(`
           SELECT * FROM incidents_db 
           WHERE city = $1 AND created_at > $2
           ORDER BY created_at DESC 
           LIMIT 50
-        `, [requestedCity, twoHoursAgo]);
+        `, [requestedCity, sixHoursAgo]);
         
         const dbIncidents = result.rows.map(row => ({
           id: row.id,
