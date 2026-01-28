@@ -772,7 +772,7 @@ Analyze escape route patterns and high-risk areas for this time of day.`
       this.agents.CHASE.stats.activations++;
       
       // Emit processing logs
-      this.emitAgentLog('CHASE', `> parsing incident_${incident.id.slice(-8)}...`, broadcast);
+      this.emitAgentLog('CHASE', `> parsing incident_${String(incident.id).slice(-8)}...`, broadcast);
       this.emitAgentLog('CHASE', `> trigger_match("${incident.incidentType}")`, broadcast);
       this.emitAgentLog('CHASE', `> location: "${incident.location}"`, broadcast);
       this.emitAgentLog('CHASE', `> checking pursuit_history[last_24h]...`, broadcast);
@@ -866,7 +866,7 @@ Analyze escape route patterns and high-risk areas for this time of day.`
       this.agents.PATTERN.stats.activations++;
       
       // Emit processing logs
-      this.emitAgentLog('PATTERN', `> analyzing incident_${incident.id.slice(-8)}...`, broadcast);
+      this.emitAgentLog('PATTERN', `> analyzing incident_${String(incident.id).slice(-8)}...`, broadcast);
       this.emitAgentLog('PATTERN', `> scanning recent_incidents[${Math.min(15, this.memory.incidents.length)}]`, broadcast);
       this.emitAgentLog('PATTERN', `> checking active_patterns[${this.memory.patterns.filter(p => p.status === 'active').length}]`, broadcast);
       
