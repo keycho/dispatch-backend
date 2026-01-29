@@ -9985,6 +9985,122 @@ app.get('/cameras', (req, res) => res.json(cameras));
 app.get('/incidents', (req, res) => res.json(incidents));
 
 // ============================================
+// 24 HOURS IN NYC - VISUALIZATION ENDPOINTS
+// ============================================
+
+// Get last 24 hours of incidents for animated heat map
+app.get('/viz/24hours', (req, res) => {
+  const now = new Date();
+  const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+  
+  // Filter to incidents with valid coordinates
+  const validIncidents = incidents.filter(inc => 
+    new Date(inc.timestamp) >= dayAgo &&
+    inc.lat && inc.lng &&
+    inc.borough && inc.borough !== 'Unknown'
+  ).map(inc => ({
+    id: inc.id,
+    timestamp: inc.timestamp,
+    lat: inc.lat,
+    lng: inc.lng,
+    borough: inc.borough,
+    incidentType: inc.incidentType,
+    priority: inc.priority,
+    location: inc.location
+  }));
+  
+  // Calculate summary stats
+  const stats = {
+    total: validIncidents.length,
+    byBorough: {},
+    byType: {},
+    byHour: Array(24).fill(0),
+    peakHour: null,
+    hottestBorough: null
+  };
+  
+  validIncidents.forEach(inc => {
+    stats.byBorough[inc.borough] = (stats.byBorough[inc.borough] || 0) + 1;
+    if (inc.incidentType) {
+      stats.byType[inc.incidentType] = (stats.byType[inc.incidentType] || 0) + 1;
+    }
+    const hour = new Date(inc.timestamp).getHours();
+    stats.byHour[hour]++;
+  });
+  
+  const maxHourCount = Math.max(...stats.byHour);
+  stats.peakHour = stats.byHour.indexOf(maxHourCount);
+  
+  const boroughCounts = Object.entries(stats.byBorough);
+  if (boroughCounts.length > 0) {
+    stats.hottestBorough = boroughCounts.sort((a, b) => b[1] - a[1])[0][0];
+  }
+  
+  res.json({
+    timeRange: { start: dayAgo.toISOString(), end: now.toISOString() },
+    incidents: validIncidents,
+    stats,
+    generated: now.toISOString()
+  });
+});
+
+// Hourly aggregated data (lighter weight for charts)
+app.get('/viz/24hours/summary', (req, res) => {
+  const now = new Date();
+  const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+  
+  const hourlyData = Array(24).fill(null).map(() => ({
+    total: 0,
+    byBorough: { 'Manhattan': 0, 'Brooklyn': 0, 'Queens': 0, 'Bronx': 0, 'Staten Island': 0 },
+    byPriority: { 'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0 }
+  }));
+  
+  incidents.forEach(inc => {
+    const incTime = new Date(inc.timestamp);
+    if (incTime < dayAgo) return;
+    
+    const hour = incTime.getHours();
+    hourlyData[hour].total++;
+    
+    if (inc.borough && hourlyData[hour].byBorough[inc.borough] !== undefined) {
+      hourlyData[hour].byBorough[inc.borough]++;
+    }
+    if (inc.priority && hourlyData[hour].byPriority[inc.priority] !== undefined) {
+      hourlyData[hour].byPriority[inc.priority]++;
+    }
+  });
+  
+  res.json({
+    timeRange: { start: dayAgo.toISOString(), end: now.toISOString() },
+    hourlyData,
+    generated: now.toISOString()
+  });
+});
+
+// Live activity stream (last 5 minutes)
+app.get('/viz/live-activity', (req, res) => {
+  const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
+  
+  const recentActivity = incidents
+    .filter(inc => new Date(inc.timestamp) >= fiveMinAgo)
+    .map(inc => ({
+      id: inc.id,
+      timestamp: inc.timestamp,
+      lat: inc.lat,
+      lng: inc.lng,
+      borough: inc.borough,
+      incidentType: inc.incidentType,
+      priority: inc.priority
+    }));
+  
+  res.json({
+    activity: recentActivity,
+    count: recentActivity.length,
+    since: fiveMinAgo.toISOString()
+  });
+});
+
+// ============================================
 // RICH INCIDENT DETAIL ENDPOINT
 // Returns everything needed for Citizen-style detail panel
 // ============================================
