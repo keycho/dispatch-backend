@@ -3604,12 +3604,6 @@ const oddsEngine = {
     };
   }
 };
-      probabilityRaw: prob,
-      multiplier: mult,
-      houseEdge: `${(HOUSE_EDGE * 100).toFixed(0)}%`
-    };
-  }
-};
 
 const predictionPool = { 
   totalPredictions: 0, 
