@@ -5767,28 +5767,6 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     
     broadcastToCity(cityId, { type: "incident", incident });
     console.log(`[${feedName}] 📍 ACTIVITY (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location}`);
-  }
-    
-    console.log(`[${feedName}] 🚨 INCIDENT (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
-    
-    // Log scanner-detected arrests to database
-    if (parsed.isArrest && pool) {
-      try {
-        await pool.query(`
-          INSERT INTO arrests (external_id, city, arrest_date, offense_description, offense_category, borough, lat, lng, source)
-          VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, 'scanner')
-        `, [
-          `scanner_${Date.now()}`,
-          cityId,
-          parsed.incidentType,
-          parsed.arrestType || 'unknown',
-          parsed.borough,
-          camera?.lat,
-          camera?.lng
-        ]);
-        console.log(`[SCANNER ARREST] Logged: ${parsed.incidentType} at ${parsed.location}`);
-      } catch (e) { /* skip dupes */ }
-    }
   } else {
     // Broadcast as monitoring even if no incident detected
     broadcastToCity(cityId, {
