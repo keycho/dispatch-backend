@@ -3015,36 +3015,106 @@ async function fetchSubwayEntrances() {
 // Fallback subway data for major stations
 function loadFallbackSubwayData() {
   exposureData.subwayEntrances = [
+    // Midtown
     { name: 'Times Square-42nd St', lat: 40.7559, lng: -73.9870, frRisk: 35 },
     { name: 'Grand Central-42nd St', lat: 40.7527, lng: -73.9772, frRisk: 35 },
     { name: 'Penn Station-34th St', lat: 40.7506, lng: -73.9935, frRisk: 35 },
-    { name: 'Union Square-14th St', lat: 40.7355, lng: -73.9903, frRisk: 30 },
     { name: 'Herald Square-34th St', lat: 40.7493, lng: -73.9878, frRisk: 30 },
-    { name: 'Fulton St', lat: 40.7102, lng: -74.0070, frRisk: 30 },
-    { name: 'Atlantic Ave-Barclays Ctr', lat: 40.6840, lng: -73.9786, frRisk: 30 },
-    { name: 'Jackson Heights-Roosevelt', lat: 40.7466, lng: -73.8914, frRisk: 28 },
-    { name: 'Flushing-Main St', lat: 40.7596, lng: -73.8300, frRisk: 28 },
-    { name: '125th St', lat: 40.8041, lng: -73.9375, frRisk: 28 },
     { name: '59th St-Columbus Circle', lat: 40.7681, lng: -73.9819, frRisk: 30 },
+    { name: 'Rockefeller Center', lat: 40.7588, lng: -73.9815, frRisk: 30 },
+    { name: 'Port Authority-42nd St', lat: 40.7570, lng: -73.9897, frRisk: 32 },
+    { name: '50th St-Broadway', lat: 40.7619, lng: -73.9839, frRisk: 28 },
+    { name: '49th St-7th Ave', lat: 40.7596, lng: -73.9843, frRisk: 28 },
+    { name: '47-50th Sts-Rockefeller', lat: 40.7586, lng: -73.9814, frRisk: 28 },
+    { name: '57th St-7th Ave', lat: 40.7649, lng: -73.9807, frRisk: 28 },
+    { name: 'Lexington Ave/53rd', lat: 40.7575, lng: -73.9690, frRisk: 28 },
+    { name: '51st St-Lexington', lat: 40.7571, lng: -73.9719, frRisk: 28 },
+    
+    // Downtown Manhattan
+    { name: 'Union Square-14th St', lat: 40.7355, lng: -73.9903, frRisk: 30 },
     { name: '14th St-8th Ave', lat: 40.7398, lng: -74.0023, frRisk: 28 },
-    { name: 'Jay St-MetroTech', lat: 40.6923, lng: -73.9851, frRisk: 28 },
-    { name: 'Canal St', lat: 40.7191, lng: -74.0006, frRisk: 28 },
+    { name: '14th St-6th Ave', lat: 40.7377, lng: -73.9966, frRisk: 28 },
+    { name: '23rd St-6th Ave', lat: 40.7426, lng: -73.9930, frRisk: 25 },
+    { name: '23rd St-Broadway', lat: 40.7410, lng: -73.9890, frRisk: 25 },
+    { name: '28th St-Broadway', lat: 40.7452, lng: -73.9882, frRisk: 25 },
+    { name: '8th St-NYU', lat: 40.7304, lng: -73.9927, frRisk: 28 },
+    { name: 'Astor Place', lat: 40.7290, lng: -73.9909, frRisk: 28 },
+    { name: 'Bleecker St', lat: 40.7259, lng: -73.9945, frRisk: 28 },
+    { name: 'West 4th St-Washington Sq', lat: 40.7321, lng: -74.0006, frRisk: 30 },
+    { name: 'Spring St-6th Ave', lat: 40.7263, lng: -74.0037, frRisk: 25 },
+    { name: 'Houston St', lat: 40.7286, lng: -73.9977, frRisk: 25 },
+    { name: 'Prince St', lat: 40.7243, lng: -73.9977, frRisk: 25 },
+    { name: 'Canal St-6th Ave', lat: 40.7234, lng: -74.0054, frRisk: 28 },
+    { name: 'Canal St-Broadway', lat: 40.7191, lng: -74.0006, frRisk: 28 },
+    { name: 'Christopher St-Sheridan Sq', lat: 40.7334, lng: -74.0027, frRisk: 25 },
+    
+    // Financial District
+    { name: 'Fulton St', lat: 40.7102, lng: -74.0070, frRisk: 30 },
     { name: 'Chambers St', lat: 40.7142, lng: -74.0086, frRisk: 28 },
-    { name: '168th St', lat: 40.8407, lng: -73.9393, frRisk: 25 },
-    { name: 'Yankee Stadium-161st', lat: 40.8279, lng: -73.9257, frRisk: 28 },
-    { name: 'Coney Island-Stillwell', lat: 40.5772, lng: -73.9819, frRisk: 25 },
     { name: 'Brooklyn Bridge-City Hall', lat: 40.7133, lng: -74.0036, frRisk: 30 },
     { name: 'Wall St', lat: 40.7069, lng: -74.0089, frRisk: 30 },
     { name: 'World Trade Center', lat: 40.7126, lng: -74.0099, frRisk: 35 },
+    { name: 'Rector St', lat: 40.7075, lng: -74.0130, frRisk: 25 },
+    { name: 'Cortlandt St', lat: 40.7105, lng: -74.0115, frRisk: 28 },
+    { name: 'Bowling Green', lat: 40.7044, lng: -74.0140, frRisk: 28 },
+    { name: 'South Ferry', lat: 40.7019, lng: -74.0130, frRisk: 25 },
+    { name: 'Whitehall St', lat: 40.7031, lng: -74.0128, frRisk: 25 },
+    
+    // Upper Manhattan
+    { name: '72nd St-Broadway', lat: 40.7784, lng: -73.9817, frRisk: 25 },
+    { name: '79th St-Broadway', lat: 40.7839, lng: -73.9798, frRisk: 25 },
+    { name: '86th St-Broadway', lat: 40.7889, lng: -73.9769, frRisk: 25 },
     { name: '86th St-Lexington', lat: 40.7796, lng: -73.9556, frRisk: 28 },
     { name: '96th St-Broadway', lat: 40.7938, lng: -73.9720, frRisk: 25 },
+    { name: '96th St-Lexington', lat: 40.7850, lng: -73.9510, frRisk: 25 },
+    { name: '103rd St-Lexington', lat: 40.7907, lng: -73.9475, frRisk: 25 },
+    { name: '116th St-Lexington', lat: 40.7987, lng: -73.9415, frRisk: 25 },
+    { name: '125th St-Lexington', lat: 40.8041, lng: -73.9375, frRisk: 28 },
+    { name: '125th St-Broadway', lat: 40.8155, lng: -73.9586, frRisk: 25 },
+    { name: '145th St-Broadway', lat: 40.8268, lng: -73.9502, frRisk: 25 },
+    { name: '168th St', lat: 40.8407, lng: -73.9393, frRisk: 25 },
+    { name: '175th St', lat: 40.8476, lng: -73.9397, frRisk: 22 },
+    { name: '181st St', lat: 40.8517, lng: -73.9377, frRisk: 22 },
+    { name: 'Lexington Ave/63rd', lat: 40.7647, lng: -73.9660, frRisk: 28 },
+    
+    // Brooklyn
+    { name: 'Atlantic Ave-Barclays Ctr', lat: 40.6840, lng: -73.9786, frRisk: 30 },
+    { name: 'Jay St-MetroTech', lat: 40.6923, lng: -73.9851, frRisk: 28 },
     { name: 'Court Square', lat: 40.7471, lng: -73.9460, frRisk: 28 },
     { name: 'Bedford Ave', lat: 40.7173, lng: -73.9567, frRisk: 25 },
-    { name: 'Lexington Ave/63rd', lat: 40.7647, lng: -73.9660, frRisk: 28 },
-    { name: 'Rockefeller Center', lat: 40.7588, lng: -73.9815, frRisk: 30 },
-    { name: 'Port Authority', lat: 40.7570, lng: -73.9897, frRisk: 32 },
-    { name: '72nd St-Broadway', lat: 40.7784, lng: -73.9817, frRisk: 25 },
-    { name: '23rd St-6th Ave', lat: 40.7426, lng: -73.9930, frRisk: 25 },
+    { name: 'Coney Island-Stillwell', lat: 40.5772, lng: -73.9819, frRisk: 25 },
+    { name: 'DeKalb Ave', lat: 40.6909, lng: -73.9818, frRisk: 25 },
+    { name: 'Borough Hall', lat: 40.6929, lng: -73.9899, frRisk: 28 },
+    { name: 'Hoyt-Schermerhorn', lat: 40.6884, lng: -73.9850, frRisk: 25 },
+    { name: 'High St', lat: 40.6995, lng: -73.9906, frRisk: 25 },
+    { name: 'Clark St', lat: 40.6975, lng: -73.9931, frRisk: 22 },
+    { name: 'Bergen St', lat: 40.6862, lng: -73.9756, frRisk: 22 },
+    { name: 'Grand Army Plaza', lat: 40.6752, lng: -73.9709, frRisk: 25 },
+    { name: 'Eastern Pkwy-Museum', lat: 40.6719, lng: -73.9644, frRisk: 25 },
+    { name: 'Nostrand Ave', lat: 40.6699, lng: -73.9504, frRisk: 22 },
+    { name: 'Broadway Junction', lat: 40.6783, lng: -73.9052, frRisk: 25 },
+    
+    // Queens
+    { name: 'Jackson Heights-Roosevelt', lat: 40.7466, lng: -73.8914, frRisk: 28 },
+    { name: 'Flushing-Main St', lat: 40.7596, lng: -73.8300, frRisk: 28 },
+    { name: 'Jamaica Center', lat: 40.7024, lng: -73.8010, frRisk: 28 },
+    { name: 'Forest Hills-71st', lat: 40.7215, lng: -73.8448, frRisk: 25 },
+    { name: 'Woodhaven Blvd', lat: 40.6937, lng: -73.8517, frRisk: 22 },
+    { name: 'Steinway St', lat: 40.7560, lng: -73.9205, frRisk: 22 },
+    { name: 'Queens Plaza', lat: 40.7490, lng: -73.9371, frRisk: 25 },
+    { name: 'Queensboro Plaza', lat: 40.7510, lng: -73.9402, frRisk: 25 },
+    { name: 'Astoria-Ditmars', lat: 40.7751, lng: -73.9120, frRisk: 22 },
+    { name: '74th St-Broadway', lat: 40.7468, lng: -73.8918, frRisk: 25 },
+    
+    // Bronx
+    { name: 'Yankee Stadium-161st', lat: 40.8279, lng: -73.9257, frRisk: 28 },
+    { name: '149th St-Grand Concourse', lat: 40.8186, lng: -73.9275, frRisk: 25 },
+    { name: '138th St-Grand Concourse', lat: 40.8132, lng: -73.9300, frRisk: 22 },
+    { name: 'Fordham Rd', lat: 40.8614, lng: -73.8900, frRisk: 25 },
+    { name: 'Pelham Bay Park', lat: 40.8524, lng: -73.8281, frRisk: 22 },
+    { name: 'E 180th St', lat: 40.8418, lng: -73.8735, frRisk: 22 },
+    { name: 'Burnside Ave', lat: 40.8535, lng: -73.9077, frRisk: 22 },
+    { name: 'Kingsbridge Rd', lat: 40.8670, lng: -73.8973, frRisk: 22 },
   ];
   console.log(`[EXPOSURE] Loaded ${exposureData.subwayEntrances.length} fallback subway stations`);
 }
@@ -3091,30 +3161,30 @@ function calculateFRRisk(lat, lng, cityId = 'nyc') {
   const state = cityState[cityId];
   const cameras = state?.cameras || [];
   
-  // Check nearby cameras - expanded radius and higher weights
+  // Check nearby cameras - expanded radius
   const nearbyCameras = cameras.filter(c => {
     const dist = getDistanceMeters(lat, lng, c.lat, c.lng);
-    return dist < 150; // Expanded from 100m
+    return dist < 250; // 250m radius
   });
   
-  if (nearbyCameras.length >= 8) {
+  if (nearbyCameras.length >= 12) {
     score += 35;
-    factors.push({ factor: `Very high camera density (${nearbyCameras.length} within 150m)`, weight: 35 });
-  } else if (nearbyCameras.length >= 5) {
-    score += 25;
-    factors.push({ factor: `High camera density (${nearbyCameras.length} within 150m)`, weight: 25 });
-  } else if (nearbyCameras.length >= 3) {
+    factors.push({ factor: `Very high camera density (${nearbyCameras.length} within 250m)`, weight: 35 });
+  } else if (nearbyCameras.length >= 8) {
+    score += 28;
+    factors.push({ factor: `High camera density (${nearbyCameras.length} within 250m)`, weight: 28 });
+  } else if (nearbyCameras.length >= 4) {
     score += 18;
-    factors.push({ factor: `Moderate camera density (${nearbyCameras.length} within 150m)`, weight: 18 });
+    factors.push({ factor: `Moderate camera density (${nearbyCameras.length} within 250m)`, weight: 18 });
   } else if (nearbyCameras.length >= 1) {
     score += 10;
-    factors.push({ factor: `Camera nearby (${nearbyCameras.length} within 150m)`, weight: 10 });
+    factors.push({ factor: `Camera nearby (${nearbyCameras.length} within 250m)`, weight: 10 });
   }
   
   // Check subway entrances (MTA has FR pilots) - expanded radius
   const nearbySubway = exposureData.subwayEntrances.filter(s => {
     const dist = getDistanceMeters(lat, lng, s.lat, s.lng);
-    return dist < 150; // Expanded from 100m
+    return dist < 300; // 300m radius
   });
   
   if (nearbySubway.length > 0) {
@@ -3129,7 +3199,7 @@ function calculateFRRisk(lat, lng, cityId = 'nyc') {
   // Check NYCHA buildings (NYPD camera networks) - expanded radius
   const nearbyNYCHA = exposureData.nychaBuildings.filter(b => {
     const dist = getDistanceMeters(lat, lng, b.lat, b.lng);
-    return dist < 200; // Expanded from 150m
+    return dist < 300; // 300m radius
   });
   
   if (nearbyNYCHA.length > 0) {
@@ -3153,7 +3223,7 @@ function calculateFRRisk(lat, lng, cityId = 'nyc') {
   // Check camera overlapping views (multiple angles = higher FR capability)
   const veryNearCameras = cameras.filter(c => {
     const dist = getDistanceMeters(lat, lng, c.lat, c.lng);
-    return dist < 75;
+    return dist < 100; // Close range for overlapping coverage
   });
   
   if (veryNearCameras.length >= 3) {
