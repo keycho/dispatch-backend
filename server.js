@@ -3276,58 +3276,70 @@ function calculateFRRisk(lat, lng, cityId = 'nyc') {
 // Calculate route exposure
 function calculateRouteExposure(points, cityId = 'nyc') {
   if (!points || points.length < 2) {
-    return { error: 'Need at least 2 points for a route' };
+    return { error: 'Need at least 2 points for a route', segments: [], averageScore: 0 };
   }
   
-  const segmentScores = [];
-  let totalDistance = 0;
-  let weightedScore = 0;
-  let maxScore = 0;
-  let maxScoreLocation = null;
-  
-  // Sample points along the route
-  for (let i = 0; i < points.length - 1; i++) {
-    const start = points[i];
-    const end = points[i + 1];
-    const segmentDist = getDistanceMeters(start.lat, start.lng, end.lat, end.lng);
-    totalDistance += segmentDist;
+  try {
+    const segmentScores = [];
+    let totalDistance = 0;
+    let weightedScore = 0;
+    let maxScore = 0;
+    let maxScoreLocation = null;
     
-    // Sample every 50 meters
-    const samples = Math.max(1, Math.floor(segmentDist / 50));
-    
-    for (let j = 0; j <= samples; j++) {
-      const ratio = j / samples;
-      const sampleLat = start.lat + (end.lat - start.lat) * ratio;
-      const sampleLng = start.lng + (end.lng - start.lng) * ratio;
+    // Sample points along the route
+    for (let i = 0; i < points.length - 1; i++) {
+      const start = points[i];
+      const end = points[i + 1];
       
-      const risk = calculateFRRisk(sampleLat, sampleLng, cityId);
-      segmentScores.push({
-        lat: sampleLat,
-        lng: sampleLng,
-        score: risk.score,
-        risk: risk.risk,
-      });
+      if (!start || !end || !start.lat || !start.lng || !end.lat || !end.lng) {
+        console.log('[ROUTE] Invalid segment:', i, start, end);
+        continue;
+      }
       
-      weightedScore += risk.score;
+      const segmentDist = getDistanceMeters(start.lat, start.lng, end.lat, end.lng);
+      totalDistance += segmentDist;
       
-      if (risk.score > maxScore) {
-        maxScore = risk.score;
-        maxScoreLocation = { lat: sampleLat, lng: sampleLng, factors: risk.factors };
+      // Sample every 50 meters (minimum 3 samples per segment)
+      const samples = Math.max(3, Math.floor(segmentDist / 50));
+      
+      for (let j = 0; j <= samples; j++) {
+        const ratio = j / samples;
+        const sampleLat = start.lat + (end.lat - start.lat) * ratio;
+        const sampleLng = start.lng + (end.lng - start.lng) * ratio;
+        
+        const risk = calculateFRRisk(sampleLat, sampleLng, cityId);
+        segmentScores.push({
+          lat: sampleLat,
+          lng: sampleLng,
+          score: risk.score,
+          risk: risk.risk,
+        });
+        
+        weightedScore += risk.score;
+        
+        if (risk.score > maxScore) {
+          maxScore = risk.score;
+          maxScoreLocation = { lat: sampleLat, lng: sampleLng, factors: risk.factors };
+        }
       }
     }
+    
+    const avgScore = segmentScores.length > 0 ? weightedScore / segmentScores.length : 0;
+    
+    return {
+      totalDistance: Math.round(totalDistance),
+      averageScore: Math.round(avgScore),
+      maxScore,
+      maxScoreLocation,
+      overallRisk: avgScore >= 60 ? 'HIGH' : avgScore >= 30 ? 'MEDIUM' : 'LOW',
+      segments: segmentScores,
+      pointCount: points.length,
+      summary: `Route is ${Math.round(totalDistance)}m with ${avgScore >= 60 ? 'high' : avgScore >= 30 ? 'moderate' : 'low'} average surveillance exposure.`,
+    };
+  } catch (error) {
+    console.error('[ROUTE] Calculation error:', error.message);
+    return { error: error.message, segments: [], averageScore: 0 };
   }
-  
-  const avgScore = segmentScores.length > 0 ? weightedScore / segmentScores.length : 0;
-  
-  return {
-    totalDistance: Math.round(totalDistance),
-    averageScore: Math.round(avgScore),
-    maxScore,
-    maxScoreLocation,
-    overallRisk: avgScore >= 60 ? 'HIGH' : avgScore >= 30 ? 'MEDIUM' : 'LOW',
-    segments: segmentScores,
-    summary: `Route is ${Math.round(totalDistance)}m with ${avgScore >= 60 ? 'high' : avgScore >= 30 ? 'moderate' : 'low'} average surveillance exposure.`,
-  };
 }
 
 // Generate heatmap grid for NYC
@@ -9587,14 +9599,62 @@ app.get('/api/exposure/risk', (req, res) => {
 
 // Get exposure data for a route
 app.post('/api/exposure/route', (req, res) => {
-  const { points, city = 'nyc' } = req.body;
-  
-  if (!points || !Array.isArray(points) || points.length < 2) {
-    return res.status(400).json({ error: 'points array with at least 2 points required' });
+  try {
+    const { points, city = 'nyc' } = req.body;
+    
+    console.log('[EXPOSURE ROUTE] Request:', JSON.stringify({ pointCount: points?.length, city, sample: points?.[0] }));
+    
+    if (!points || !Array.isArray(points) || points.length < 2) {
+      return res.status(400).json({ error: 'points array with at least 2 points required', received: points });
+    }
+    
+    // Normalize points - accept various formats
+    const normalizedPoints = points.map(p => {
+      if (!p) return null;
+      
+      // Standard format {lat, lng}
+      if (typeof p.lat === 'number' && typeof p.lng === 'number') {
+        return { lat: p.lat, lng: p.lng };
+      }
+      // Alternative format {latitude, longitude}
+      if (typeof p.latitude === 'number' && typeof p.longitude === 'number') {
+        return { lat: p.latitude, lng: p.longitude };
+      }
+      // Array format [lat, lng]
+      if (Array.isArray(p) && p.length >= 2) {
+        return { lat: p[0], lng: p[1] };
+      }
+      // String numbers
+      if (p.lat !== undefined && p.lng !== undefined) {
+        return { lat: parseFloat(p.lat), lng: parseFloat(p.lng) };
+      }
+      
+      return null;
+    }).filter(p => p !== null && !isNaN(p.lat) && !isNaN(p.lng));
+    
+    if (normalizedPoints.length < 2) {
+      return res.status(400).json({ 
+        error: 'Invalid point format. Each point needs {lat: number, lng: number}',
+        received: points,
+        parsed: normalizedPoints
+      });
+    }
+    
+    console.log('[EXPOSURE ROUTE] Normalized points:', normalizedPoints);
+    
+    const exposure = calculateRouteExposure(normalizedPoints, city);
+    
+    console.log('[EXPOSURE ROUTE] Result:', { 
+      distance: exposure.totalDistance, 
+      avgScore: exposure.averageScore,
+      segments: exposure.segments?.length 
+    });
+    
+    res.json(exposure);
+  } catch (error) {
+    console.error('[EXPOSURE ROUTE] Error:', error.message, error.stack);
+    res.status(500).json({ error: error.message });
   }
-  
-  const exposure = calculateRouteExposure(points, city);
-  res.json(exposure);
 });
 
 // Get pre-calculated heatmap grid
