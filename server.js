@@ -2959,26 +2959,94 @@ async function fetchSubwayEntrances() {
     
     if (!response.ok) {
       console.log('[EXPOSURE] Subway API returned:', response.status);
+      loadFallbackSubwayData();
       return;
     }
     
     const data = await response.json();
+    
+    // Try different coordinate field names
     exposureData.subwayEntrances = data
-      .filter(e => e.the_geom?.coordinates)
-      .map(e => ({
-        name: e.name || 'Subway Entrance',
-        line: e.line || '',
-        lat: e.the_geom.coordinates[1],
-        lng: e.the_geom.coordinates[0],
-        entranceType: e.entrance_type || 'unknown',
-        ada: e.ada === 'TRUE',
-        frRisk: 30, // Base FR risk for subway
-      }));
+      .map(e => {
+        let lat, lng;
+        
+        // Try different coordinate formats
+        if (e.the_geom?.coordinates) {
+          lng = e.the_geom.coordinates[0];
+          lat = e.the_geom.coordinates[1];
+        } else if (e.entrance_georeference?.coordinates) {
+          lng = e.entrance_georeference.coordinates[0];
+          lat = e.entrance_georeference.coordinates[1];
+        } else if (e.latitude && e.longitude) {
+          lat = parseFloat(e.latitude);
+          lng = parseFloat(e.longitude);
+        } else if (e.station_latitude && e.station_longitude) {
+          lat = parseFloat(e.station_latitude);
+          lng = parseFloat(e.station_longitude);
+        }
+        
+        if (!lat || !lng) return null;
+        
+        return {
+          name: e.station_name || e.name || 'Subway Entrance',
+          line: e.line || e.daytime_routes || '',
+          lat,
+          lng,
+          entranceType: e.entrance_type || 'unknown',
+          ada: e.ada === 'TRUE' || e.ada_accessible === 'Y',
+          frRisk: 30,
+        };
+      })
+      .filter(e => e !== null);
+    
+    if (exposureData.subwayEntrances.length === 0) {
+      console.log('[EXPOSURE] No subway data parsed, loading fallback');
+      loadFallbackSubwayData();
+      return;
+    }
     
     console.log(`[EXPOSURE] Loaded ${exposureData.subwayEntrances.length} subway entrances`);
   } catch (error) {
     console.error('[EXPOSURE] Subway fetch error:', error.message);
+    loadFallbackSubwayData();
   }
+}
+
+// Fallback subway data for major stations
+function loadFallbackSubwayData() {
+  exposureData.subwayEntrances = [
+    { name: 'Times Square-42nd St', lat: 40.7559, lng: -73.9870, frRisk: 35 },
+    { name: 'Grand Central-42nd St', lat: 40.7527, lng: -73.9772, frRisk: 35 },
+    { name: 'Penn Station-34th St', lat: 40.7506, lng: -73.9935, frRisk: 35 },
+    { name: 'Union Square-14th St', lat: 40.7355, lng: -73.9903, frRisk: 30 },
+    { name: 'Herald Square-34th St', lat: 40.7493, lng: -73.9878, frRisk: 30 },
+    { name: 'Fulton St', lat: 40.7102, lng: -74.0070, frRisk: 30 },
+    { name: 'Atlantic Ave-Barclays Ctr', lat: 40.6840, lng: -73.9786, frRisk: 30 },
+    { name: 'Jackson Heights-Roosevelt', lat: 40.7466, lng: -73.8914, frRisk: 28 },
+    { name: 'Flushing-Main St', lat: 40.7596, lng: -73.8300, frRisk: 28 },
+    { name: '125th St', lat: 40.8041, lng: -73.9375, frRisk: 28 },
+    { name: '59th St-Columbus Circle', lat: 40.7681, lng: -73.9819, frRisk: 30 },
+    { name: '14th St-8th Ave', lat: 40.7398, lng: -74.0023, frRisk: 28 },
+    { name: 'Jay St-MetroTech', lat: 40.6923, lng: -73.9851, frRisk: 28 },
+    { name: 'Canal St', lat: 40.7191, lng: -74.0006, frRisk: 28 },
+    { name: 'Chambers St', lat: 40.7142, lng: -74.0086, frRisk: 28 },
+    { name: '168th St', lat: 40.8407, lng: -73.9393, frRisk: 25 },
+    { name: 'Yankee Stadium-161st', lat: 40.8279, lng: -73.9257, frRisk: 28 },
+    { name: 'Coney Island-Stillwell', lat: 40.5772, lng: -73.9819, frRisk: 25 },
+    { name: 'Brooklyn Bridge-City Hall', lat: 40.7133, lng: -74.0036, frRisk: 30 },
+    { name: 'Wall St', lat: 40.7069, lng: -74.0089, frRisk: 30 },
+    { name: 'World Trade Center', lat: 40.7126, lng: -74.0099, frRisk: 35 },
+    { name: '86th St-Lexington', lat: 40.7796, lng: -73.9556, frRisk: 28 },
+    { name: '96th St-Broadway', lat: 40.7938, lng: -73.9720, frRisk: 25 },
+    { name: 'Court Square', lat: 40.7471, lng: -73.9460, frRisk: 28 },
+    { name: 'Bedford Ave', lat: 40.7173, lng: -73.9567, frRisk: 25 },
+    { name: 'Lexington Ave/63rd', lat: 40.7647, lng: -73.9660, frRisk: 28 },
+    { name: 'Rockefeller Center', lat: 40.7588, lng: -73.9815, frRisk: 30 },
+    { name: 'Port Authority', lat: 40.7570, lng: -73.9897, frRisk: 32 },
+    { name: '72nd St-Broadway', lat: 40.7784, lng: -73.9817, frRisk: 25 },
+    { name: '23rd St-6th Ave', lat: 40.7426, lng: -73.9930, frRisk: 25 },
+  ];
+  console.log(`[EXPOSURE] Loaded ${exposureData.subwayEntrances.length} fallback subway stations`);
 }
 
 // NYC Open Data - NYCHA Buildings
@@ -3023,70 +3091,91 @@ function calculateFRRisk(lat, lng, cityId = 'nyc') {
   const state = cityState[cityId];
   const cameras = state?.cameras || [];
   
-  // Check nearby cameras
+  // Check nearby cameras - expanded radius and higher weights
   const nearbyCameras = cameras.filter(c => {
     const dist = getDistanceMeters(lat, lng, c.lat, c.lng);
-    return dist < 100;
+    return dist < 150; // Expanded from 100m
   });
   
-  if (nearbyCameras.length >= 5) {
+  if (nearbyCameras.length >= 8) {
+    score += 35;
+    factors.push({ factor: `Very high camera density (${nearbyCameras.length} within 150m)`, weight: 35 });
+  } else if (nearbyCameras.length >= 5) {
     score += 25;
-    factors.push({ factor: `High camera density (${nearbyCameras.length} within 100m)`, weight: 25 });
+    factors.push({ factor: `High camera density (${nearbyCameras.length} within 150m)`, weight: 25 });
   } else if (nearbyCameras.length >= 3) {
-    score += 15;
-    factors.push({ factor: `Moderate camera density (${nearbyCameras.length} within 100m)`, weight: 15 });
+    score += 18;
+    factors.push({ factor: `Moderate camera density (${nearbyCameras.length} within 150m)`, weight: 18 });
   } else if (nearbyCameras.length >= 1) {
-    score += 5;
-    factors.push({ factor: `Camera nearby (${nearbyCameras.length} within 100m)`, weight: 5 });
+    score += 10;
+    factors.push({ factor: `Camera nearby (${nearbyCameras.length} within 150m)`, weight: 10 });
   }
   
-  // Check subway entrances (MTA has FR pilots)
+  // Check subway entrances (MTA has FR pilots) - expanded radius
   const nearbySubway = exposureData.subwayEntrances.filter(s => {
     const dist = getDistanceMeters(lat, lng, s.lat, s.lng);
-    return dist < 100;
+    return dist < 150; // Expanded from 100m
   });
   
   if (nearbySubway.length > 0) {
-    const subwayScore = Math.min(30, nearbySubway.length * 15);
+    const subwayScore = Math.min(35, nearbySubway.length * 18);
     score += subwayScore;
     factors.push({ 
-      factor: `Near subway entrance${nearbySubway.length > 1 ? 's' : ''} (${nearbySubway[0].name})`, 
+      factor: `Near subway entrance${nearbySubway.length > 1 ? 's' : ''} (${nearbySubway[0]?.name || 'MTA'})`, 
       weight: subwayScore 
     });
   }
   
-  // Check NYCHA buildings (NYPD camera networks)
+  // Check NYCHA buildings (NYPD camera networks) - expanded radius
   const nearbyNYCHA = exposureData.nychaBuildings.filter(b => {
     const dist = getDistanceMeters(lat, lng, b.lat, b.lng);
-    return dist < 150;
+    return dist < 200; // Expanded from 150m
   });
   
   if (nearbyNYCHA.length > 0) {
-    score += 20;
-    factors.push({ factor: `Near NYCHA property (${nearbyNYCHA[0].name})`, weight: 20 });
+    const nychaScore = Math.min(25, nearbyNYCHA.length * 12);
+    score += nychaScore;
+    factors.push({ factor: `Near NYCHA property (${nearbyNYCHA[0]?.name || 'Public Housing'})`, weight: nychaScore });
   }
   
-  // Check high-profile locations
+  // Check high-profile locations - expanded radii in the list
   const nearbyHighProfile = exposureData.highProfileLocations.filter(h => {
     const dist = getDistanceMeters(lat, lng, h.lat, h.lng);
-    return dist < h.radius;
+    return dist < (h.radius * 1.5); // 50% larger radius for detection
   });
   
   if (nearbyHighProfile.length > 0) {
-    const hpScore = nearbyHighProfile[0].frRisk;
+    const hpScore = Math.min(45, nearbyHighProfile.reduce((sum, h) => sum + h.frRisk, 0));
     score += hpScore;
-    factors.push({ factor: `Near ${nearbyHighProfile[0].name}`, weight: hpScore });
+    factors.push({ factor: `Near ${nearbyHighProfile.map(h => h.name).join(', ')}`, weight: hpScore });
   }
   
   // Check camera overlapping views (multiple angles = higher FR capability)
   const veryNearCameras = cameras.filter(c => {
     const dist = getDistanceMeters(lat, lng, c.lat, c.lng);
-    return dist < 50;
+    return dist < 75;
   });
   
-  if (veryNearCameras.length >= 2) {
-    score += 15;
-    factors.push({ factor: 'Multiple camera angles (overlapping coverage)', weight: 15 });
+  if (veryNearCameras.length >= 3) {
+    score += 20;
+    factors.push({ factor: 'Multiple overlapping camera angles', weight: 20 });
+  } else if (veryNearCameras.length >= 2) {
+    score += 12;
+    factors.push({ factor: 'Overlapping camera coverage', weight: 12 });
+  }
+  
+  // Manhattan density bonus (higher baseline surveillance)
+  if (cityId === 'nyc' && lat > 40.70 && lat < 40.82 && lng > -74.02 && lng < -73.93) {
+    const manhattanBonus = 15;
+    score += manhattanBonus;
+    factors.push({ factor: 'Manhattan commercial district', weight: manhattanBonus });
+  }
+  
+  // Major intersection bonus (approximate based on camera clustering)
+  if (nearbyCameras.length >= 4) {
+    const intersectionBonus = 10;
+    score += intersectionBonus;
+    factors.push({ factor: 'Major intersection or thoroughfare', weight: intersectionBonus });
   }
   
   // Normalize score to 0-100
@@ -3178,22 +3267,41 @@ function generateExposureHeatmap(cityId = 'nyc') {
   const city = CITIES[cityId];
   if (!city) return null;
   
-  const bounds = {
-    nyc: { minLat: 40.49, maxLat: 40.92, minLng: -74.26, maxLng: -73.70 },
-    mpls: { minLat: 44.89, maxLat: 45.05, minLng: -93.33, maxLng: -93.20 },
-  };
+  // Different grid sizes for different areas
+  const manhattanBounds = { minLat: 40.70, maxLat: 40.82, minLng: -74.02, maxLng: -73.93 };
+  const nycBounds = { minLat: 40.49, maxLat: 40.92, minLng: -74.26, maxLng: -73.70 };
   
-  const b = bounds[cityId] || bounds.nyc;
-  const gridSize = 0.005; // ~500m cells
   const grid = [];
   
-  for (let lat = b.minLat; lat <= b.maxLat; lat += gridSize) {
-    for (let lng = b.minLng; lng <= b.maxLng; lng += gridSize) {
+  // Fine grid for Manhattan (higher density)
+  const manhattanGridSize = 0.003; // ~300m cells
+  for (let lat = manhattanBounds.minLat; lat <= manhattanBounds.maxLat; lat += manhattanGridSize) {
+    for (let lng = manhattanBounds.minLng; lng <= manhattanBounds.maxLng; lng += manhattanGridSize) {
       const risk = calculateFRRisk(lat, lng, cityId);
-      if (risk.score > 0) { // Only include cells with some risk
+      grid.push({
+        lat: Math.round(lat * 10000) / 10000,
+        lng: Math.round(lng * 10000) / 10000,
+        score: risk.score,
+        risk: risk.risk,
+      });
+    }
+  }
+  
+  // Coarser grid for outer boroughs
+  const outerGridSize = 0.008; // ~800m cells
+  for (let lat = nycBounds.minLat; lat <= nycBounds.maxLat; lat += outerGridSize) {
+    for (let lng = nycBounds.minLng; lng <= nycBounds.maxLng; lng += outerGridSize) {
+      // Skip Manhattan (already covered with fine grid)
+      if (lat >= manhattanBounds.minLat && lat <= manhattanBounds.maxLat &&
+          lng >= manhattanBounds.minLng && lng <= manhattanBounds.maxLng) {
+        continue;
+      }
+      
+      const risk = calculateFRRisk(lat, lng, cityId);
+      if (risk.score > 5) { // Only include cells with some risk
         grid.push({
-          lat: Math.round(lat * 1000) / 1000,
-          lng: Math.round(lng * 1000) / 1000,
+          lat: Math.round(lat * 10000) / 10000,
+          lng: Math.round(lng * 10000) / 10000,
           score: risk.score,
           risk: risk.risk,
         });
@@ -3201,7 +3309,14 @@ function generateExposureHeatmap(cityId = 'nyc') {
     }
   }
   
-  console.log(`[EXPOSURE] Generated heatmap with ${grid.length} cells`);
+  // Sort by score descending for frontend optimization
+  grid.sort((a, b) => b.score - a.score);
+  
+  const highRisk = grid.filter(c => c.risk === 'HIGH').length;
+  const mediumRisk = grid.filter(c => c.risk === 'MEDIUM').length;
+  const lowRisk = grid.filter(c => c.risk === 'LOW').length;
+  
+  console.log(`[EXPOSURE] Generated heatmap: ${grid.length} cells (${highRisk} HIGH, ${mediumRisk} MEDIUM, ${lowRisk} LOW)`);
   exposureData.heatmapGrid = grid;
   exposureData.lastSync = new Date().toISOString();
   
