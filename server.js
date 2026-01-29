@@ -1,4 +1,4 @@
-import express from 'express'; // force redeploy
+import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import https from 'https';
@@ -5249,10 +5249,10 @@ function startMultiStreamBroadcastify() {
   console.log(`[MULTI-STREAM] Starting ${MAX_CONCURRENT_STREAMS} simultaneous feeds (NYC + MPLS)...`);
   console.log(`[MULTI-STREAM] Auth: ${BROADCASTIFY_USERNAME} / ${'*'.repeat(BROADCASTIFY_PASSWORD.length)}`);
   
-  // Balance between NYC and Minneapolis - 3 NYC, 1 MPLS
+  // Use all available feeds up to MAX_CONCURRENT_STREAMS
   const initialFeeds = [
-    ...NYPD_FEEDS.slice(0, 3),  // 3 NYC feeds
-    ...MPLS_FEEDS.slice(0, 1),  // 1 Minneapolis feed
+    ...NYPD_FEEDS,  // All NYC feeds
+    ...MPLS_FEEDS,  // All Minneapolis feeds
   ].slice(0, MAX_CONCURRENT_STREAMS);
   
   initialFeeds.forEach((feed, i) => {
