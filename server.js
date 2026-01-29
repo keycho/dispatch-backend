@@ -10,6 +10,7 @@ import OpenAI, { toFile } from 'openai';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import cors from 'cors';
+import DispatchTwitterBot from './twitter-bot.js';
 
 dotenv.config();
 
@@ -136,6 +137,13 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const clients = new Set();
+
+// Twitter Bot for auto-posting notable incidents
+const twitterBot = new DispatchTwitterBot({
+  siteUrl: 'https://dispatch.live',
+  minInterval: 10 * 60 * 1000,  // 10 min between tweets
+  dailyLimit: 45                 // Stay under free tier
+});
 
 // ============================================
 // NYPD PRECINCT TO BOROUGH MAPPING
@@ -810,6 +818,11 @@ Analyze escape route patterns and high-risk areas for this time of day.`
           urgency: 'critical',
           timestamp: new Date().toISOString()
         });
+        
+        // Add to pending Twitter post
+        if (typeof twitterBot !== 'undefined') {
+          twitterBot.addAgentAnalysis(incident.id, 'CHASE', chaseInsight);
+        }
       }
       this.emitAgentStatus('CHASE', 'idle', broadcast);
     }
@@ -4989,6 +5002,7 @@ async function processOpenMHzCall(call, cityId = 'nyc') {
       if (cityId === 'nyc') checkBetsForIncident(incident);
       
       broadcastToCity(cityId, { type: "incident", incident });
+      if (cityId === 'nyc') twitterBot.queueIncident(incident, camera);
       if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}` });
       
       console.log(`[OPENMHZ-${cityId.toUpperCase()} INCIDENT]`, incident.incidentType, '@', incident.location, `(${incident.borough})`);
@@ -5662,6 +5676,7 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     if (cityId === 'nyc') checkBetsForIncident(incident);
     
     broadcastToCity(cityId, { type: "incident", incident });
+    if (cityId === 'nyc') twitterBot.queueIncident(incident, camera);
     if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}`, priority: parsed.priority });
     
     console.log(`[${feedName}] 🚨 INCIDENT (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
