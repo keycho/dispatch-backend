@@ -1183,7 +1183,26 @@ Based on patterns, hotspots, time of day, and your learning from past prediction
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       
       if (jsonMatch) {
-        const result = JSON.parse(jsonMatch[0]);
+        let result;
+        try {
+          result = JSON.parse(jsonMatch[0]);
+        } catch (parseError) {
+          // Try to extract just predictions array if full JSON fails
+          const predictionsMatch = text.match(/"predictions"\s*:\s*\[([\s\S]*?)\]/);
+          if (predictionsMatch) {
+            try {
+              result = { predictions: JSON.parse(`[${predictionsMatch[1]}]`) };
+            } catch {
+              this.emitAgentLog('PROPHET', `> error: JSON parse failed, skipping cycle`);
+              this.emitAgentStatus('PROPHET', 'idle');
+              return;
+            }
+          } else {
+            this.emitAgentLog('PROPHET', `> error: malformed response, skipping cycle`);
+            this.emitAgentStatus('PROPHET', 'idle');
+            return;
+          }
+        }
         
         this.emitAgentLog('PROPHET', `> generated ${result.predictions?.length || 0} predictions`);
         
