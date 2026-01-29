@@ -65,7 +65,11 @@ const CITIES = {
       { id: '40184', name: 'NYPD Citywide 1' },
       { id: '40185', name: 'NYPD Citywide 2' },
       { id: '40186', name: 'NYPD Citywide 3' },
-      { id: '32119', name: 'NYPD Dispatch Citywide' },
+      { id: '1189', name: 'NYPD Transit/SOD' },
+      { id: '46554', name: 'FDNY Manhattan Dispatch' },
+      { id: '25863', name: 'Jersey City Police' },
+      { id: '43534', name: 'Newark Police' },
+      { id: '30065', name: 'Suffolk County Dispatch' },
     ],
     cameraApi: 'https://webcams.nyctmc.org/api/cameras',
     districts: ['Manhattan', 'Brooklyn', 'Bronx', 'Queens', 'Staten Island'],
@@ -4757,12 +4761,29 @@ function broadcast(data) {
 const BROADCASTIFY_USERNAME = 'whitefang123';
 const BROADCASTIFY_PASSWORD = process.env.BROADCASTIFY_PASSWORD;
 
-// NYC Feeds
+// NYC Feeds - MAXIMUM COVERAGE
 const NYPD_FEEDS = [
+  // Core NYPD
   { id: '40184', name: 'NYPD Citywide 1', city: 'nyc' },
   { id: '40185', name: 'NYPD Citywide 2', city: 'nyc' },
   { id: '40186', name: 'NYPD Citywide 3', city: 'nyc' },
-  { id: '32119', name: 'NYPD Dispatch Citywide', city: 'nyc' },
+  { id: '1189', name: 'NYPD Transit/SOD', city: 'nyc' },      // ESU, K-9, Bomb Squad
+  // Fire (often at crime scenes)
+  { id: '46554', name: 'FDNY Manhattan Dispatch', city: 'nyc' }, // 51 listeners - very active
+  // EMS (shootings, stabbings, assaults)
+  { id: '7392', name: 'Hatzolah EMS', city: 'nyc' },
+  // Nearby police - still NYC metro crime
+  { id: '25863', name: 'Jersey City Police', city: 'nyc' },   // 35 listeners
+  { id: '802', name: 'Jersey City Fire', city: 'nyc' },       // JC Fire
+  { id: '43534', name: 'Newark Police', city: 'nyc' },        // 10 listeners - major city
+  { id: '27785', name: 'North Hudson Fire/Rescue', city: 'nyc' },
+  // Long Island / outer boroughs activity
+  { id: '30065', name: 'Suffolk County Dispatch', city: 'nyc' }, // 39 listeners
+  { id: '1635', name: 'Nassau County Fire East', city: 'nyc' }, // 11 listeners
+  // Westchester (north of NYC)
+  { id: '41094', name: 'Westchester Fire/EMS 10', city: 'nyc' }, // 19 listeners
+  { id: '41129', name: 'Westchester Fire/EMS 11', city: 'nyc' }, // 48 listeners
+  { id: '38713', name: 'Yonkers Fire', city: 'nyc' },
 ];
 
 // Minneapolis Feeds
@@ -4775,8 +4796,8 @@ const MPLS_FEEDS = [
 // Combined feeds for multi-city streaming
 const ALL_FEEDS = [...NYPD_FEEDS, ...MPLS_FEEDS];
 
-// Run 4 streams simultaneously for 4x the coverage
-const MAX_CONCURRENT_STREAMS = 4;
+// Run 10 streams simultaneously for maximum coverage
+const MAX_CONCURRENT_STREAMS = 10;
 let activeStreams = new Map();
 let streamStats = {};
 
@@ -5037,6 +5058,32 @@ async function processOpenMHzCall(call, cityId = 'nyc') {
           console.log(`[SCANNER ARREST] Logged: ${parsed.incidentType} at ${parsed.location}`);
         } catch (e) { /* skip dupes */ }
       }
+    } else if (parsed.location && parsed.location !== 'Unknown' && parsed.location.length > 5) {
+      // FALLBACK: Create incident from any transcript with a valid location
+      state.incidentId++;
+      const camera = findNearestCameraForCity(parsed.location, parsed.borough, cityId);
+      
+      const incident = {
+        id: state.incidentId,
+        incidentType: parsed.incidentType || 'Police Activity',
+        location: parsed.location,
+        borough: parsed.borough || 'Unknown',
+        priority: 'low',
+        summary: parsed.summary || clean.substring(0, 100),
+        transcript: clean,
+        source: `OpenMHz: ${talkgroupName}`,
+        camera,
+        lat: camera?.lat,
+        lng: camera?.lng,
+        city: cityId,
+        timestamp: call.time || new Date().toISOString()
+      };
+      
+      state.incidents.unshift(incident);
+      if (state.incidents.length > 50) state.incidents.pop();
+      
+      broadcastToCity(cityId, { type: "incident", incident });
+      console.log(`[OPENMHZ-${cityId.toUpperCase()} ACTIVITY]`, incident.incidentType, '@', incident.location);
     }
     
     // ICE WATCHER: Analyze Minneapolis transcripts for ICE activity
@@ -5691,6 +5738,36 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     if (cityId === 'nyc') twitterBot.queueIncident(incident, camera);
     if (cityId === 'nyc' || cityId === 'mpls') telegramBot.queueIncident(incident, camera);
     if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}`, priority: parsed.priority });
+    
+    console.log(`[${feedName}] 🚨 INCIDENT (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
+  } else if (parsed.location && parsed.location !== 'Unknown' && parsed.location.length > 5) {
+    // FALLBACK: Create incident from any transcript with a valid location
+    state.incidentId++;
+    const camera = findNearestCameraForCity(parsed.location, parsed.borough, cityId);
+    
+    const incident = {
+      id: state.incidentId,
+      incidentType: parsed.incidentType || 'Police Activity',
+      location: parsed.location,
+      borough: parsed.borough || 'Unknown',
+      priority: 'low',
+      summary: parsed.summary || clean.substring(0, 100),
+      transcript: clean,
+      camera,
+      lat: camera?.lat,
+      lng: camera?.lng,
+      source: feedName,
+      city: cityId,
+      timestamp: new Date().toISOString()
+    };
+    
+    state.incidents.unshift(incident);
+    if (state.incidents.length > 50) state.incidents.pop();
+    saveIncidentToDb(incident);
+    
+    broadcastToCity(cityId, { type: "incident", incident });
+    console.log(`[${feedName}] 📍 ACTIVITY (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location}`);
+  }
     
     console.log(`[${feedName}] 🚨 INCIDENT (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
     
