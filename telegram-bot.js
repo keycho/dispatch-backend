@@ -146,7 +146,7 @@ class DispatchTelegramBot {
       msg += `🤖 <b>${agentAnalysis.agent}:</b> "${agentAnalysis.analysis}"\n\n`;
     }
     
-    msg += `👁️ <a href="${this.siteUrl}/nyc?incident=${incident.id}">Watch Live</a>`;
+    msg += `👁️ <a href="${this.siteUrl}/${incident.city || 'nyc'}?incident=${incident.id}">Watch Live</a>`;
     
     return msg;
   }

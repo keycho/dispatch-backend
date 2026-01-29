@@ -5014,7 +5014,7 @@ async function processOpenMHzCall(call, cityId = 'nyc') {
       
       broadcastToCity(cityId, { type: "incident", incident });
       if (cityId === 'nyc') twitterBot.queueIncident(incident, camera);
-      if (cityId === 'nyc') telegramBot.queueIncident(incident, camera);
+      if (cityId === 'nyc' || cityId === 'mpls') telegramBot.queueIncident(incident, camera);
       if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}` });
       
       console.log(`[OPENMHZ-${cityId.toUpperCase()} INCIDENT]`, incident.incidentType, '@', incident.location, `(${incident.borough})`);
@@ -5689,7 +5689,7 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     
     broadcastToCity(cityId, { type: "incident", incident });
     if (cityId === 'nyc') twitterBot.queueIncident(incident, camera);
-    if (cityId === 'nyc') telegramBot.queueIncident(incident, camera);
+    if (cityId === 'nyc' || cityId === 'mpls') telegramBot.queueIncident(incident, camera);
     if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}`, priority: parsed.priority });
     
     console.log(`[${feedName}] 🚨 INCIDENT (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
@@ -10082,6 +10082,49 @@ app.post('/scanner/remove-feed', (req, res) => {
   streamState.delete(feedId);
   
   res.json({ success: true, message: `Disconnected from feed ${feedId}` });
+});
+
+// Reset OpenMHz polling to fetch recent calls
+app.post('/api/reset-openmhz', (req, res) => {
+  const fiveMinAgo = Date.now() - (5 * 60 * 1000);
+  openMHzState.nyc.lastTime = fiveMinAgo;
+  openMHzState.mpls.lastTime = fiveMinAgo;
+  lastOpenMHzTime = fiveMinAgo;
+  console.log('[OPENMHZ] Poll time reset to 5 minutes ago');
+  res.json({ success: true, message: 'OpenMHz poll time reset', newTime: new Date(fiveMinAgo).toISOString() });
+});
+
+// Force create a test incident (for debugging Telegram/frontend)
+app.post('/api/test-incident', async (req, res) => {
+  const cityId = req.body.city || 'nyc';
+  const state = cityState[cityId];
+  const testIncident = {
+    id: `test_${Date.now()}`,
+    incidentType: req.body.type || 'Shots Fired',
+    location: req.body.location || 'Test Location - 42nd St & Broadway',
+    borough: req.body.borough || 'Manhattan',
+    lat: 40.7558,
+    lng: -73.9869,
+    priority: 'critical',
+    summary: req.body.summary || 'Test incident for debugging - multiple units responding',
+    transcript: 'Test transcript',
+    units: ['TEST1', 'TEST2'],
+    source: 'test',
+    city: cityId,
+    timestamp: new Date().toISOString()
+  };
+  
+  state.incidents.unshift(testIncident);
+  if (state.incidents.length > 50) state.incidents.pop();
+  
+  // Broadcast and trigger Telegram
+  broadcastToCity(cityId, { type: "incident", incident: testIncident });
+  if (cityId === 'nyc' || cityId === 'mpls') {
+    telegramBot.queueIncident(testIncident, null);
+  }
+  
+  console.log(`[TEST] Created test incident: ${testIncident.incidentType} @ ${testIncident.location}`);
+  res.json({ success: true, incident: testIncident });
 });
 
 // WebSocket with city subscription support
