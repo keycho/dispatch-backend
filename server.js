@@ -3502,7 +3502,7 @@ initDatabase().then(() => {
 // ============================================
 
 const oddsEngine = {
-  // City-specific district rates
+  // City-specific base district rates (now adjusted by live data)
   districtRates: {
     nyc: { 
       'Manhattan': 2.5, 'Brooklyn': 2.0, 'Bronx': 1.8, 'Queens': 1.2, 'Staten Island': 0.3
@@ -3530,6 +3530,34 @@ const oddsEngine = {
   getDistricts(cityId = 'nyc') {
     return Object.keys(this.districtRates[cityId] || this.districtRates.nyc);
   },
+
+  // NEW: Get live incident data for odds calculation
+  getLiveIncidentData(district, cityId = 'nyc', lookbackHours = 2) {
+    const detective = detectiveBureaus[cityId];
+    if (!detective) return { recentIncidents: 0, hotspotMultiplier: 1.0, dataSource: 'static' };
+    
+    const cutoff = new Date(Date.now() - lookbackHours * 60 * 60 * 1000);
+    const recentIncidents = detective.memory.incidents.filter(inc => 
+      inc.borough === district && new Date(inc.timestamp) > cutoff
+    );
+    
+    // Check PROPHET predictions for this district
+    const prophetBoost = detective.predictionStats.pending.filter(pred => 
+      pred.borough === district && pred.confidence > 0.6
+    ).length > 0 ? 1.3 : 1.0;
+    
+    // Calculate hotspot multiplier based on recent activity
+    const incidentCount = recentIncidents.length;
+    const hotspotMultiplier = 1.0 + (incidentCount * 0.15); // +15% per recent incident
+    
+    return {
+      recentIncidents: incidentCount,
+      hotspotMultiplier: Math.min(3.0, hotspotMultiplier * prophetBoost),
+      dataSource: 'live_dispatch',
+      prophetPrediction: prophetBoost > 1.0,
+      lastUpdate: new Date().toISOString()
+    };
+  },
   
   calculateProbability(district, incidentType = 'any', windowMinutes = 30, cityId = 'nyc') {
     const hour = new Date().getHours();
@@ -3537,10 +3565,19 @@ const oddsEngine = {
     const baseRate = cityRates[district] || 1.0;
     const timeAdjusted = baseRate * this.timeMultipliers[hour];
     const typeMultiplier = this.incidentTypeRarity[incidentType.toLowerCase()] || 0.05;
-    const adjusted = timeAdjusted * typeMultiplier;
+    
+    // NEW: Apply live dispatch data
+    const liveData = this.getLiveIncidentData(district, cityId);
+    const dispatchAdjusted = timeAdjusted * liveData.hotspotMultiplier;
+    
+    const adjusted = dispatchAdjusted * typeMultiplier;
     const lambda = (adjusted / 60) * windowMinutes;
     const probability = 1 - Math.exp(-lambda);
-    return Math.max(0.02, Math.min(0.85, probability));
+    
+    return {
+      probability: Math.max(0.02, Math.min(0.85, probability)),
+      liveData
+    };
   },
   
   calculateMultiplier(probability) {
@@ -3550,14 +3587,23 @@ const oddsEngine = {
   },
   
   getOdds(district, incidentType = 'any', windowMinutes = 30, cityId = 'nyc') {
-    const prob = this.calculateProbability(district, incidentType, windowMinutes, cityId);
-    const mult = this.calculateMultiplier(prob);
+    const result = this.calculateProbability(district, incidentType, windowMinutes, cityId);
+    const mult = this.calculateMultiplier(result.probability);
+    
     return { 
       district,
       borough: district, // Legacy compatibility
       incidentType, 
       windowMinutes, 
-      probability: Math.round(prob * 100),
+      probability: Math.round(result.probability * 100),
+      multiplier: mult,
+      // NEW: Show dispatch data being used
+      liveData: result.liveData,
+      dataSource: result.liveData.dataSource,
+      explanation: `${result.liveData.recentIncidents} incidents in last 2h${result.liveData.prophetPrediction ? ' + PROPHET alert' : ''}`
+    };
+  }
+};
       probabilityRaw: prob,
       multiplier: mult,
       houseEdge: `${(HOUSE_EDGE * 100).toFixed(0)}%`
@@ -7843,6 +7889,65 @@ app.get('/auth/user/:username', (req, res) => {
     rank,
     activePredictions: Array.from(activePredictions.values()).filter(p => p.username === user.username),
     recentHistory: predictionHistory.filter(p => p.username === user.username).slice(0, 20)
+  });
+});
+
+app.get('/predict/engine-status', (req, res) => {
+  const { city = 'nyc' } = req.query;
+  const detective = detectiveBureaus[city];
+  
+  if (!detective) {
+    return res.json({ 
+      status: 'offline', 
+      reason: 'City not supported',
+      availableCities: Object.keys(detectiveBureaus)
+    });
+  }
+
+  const districts = oddsEngine.getDistricts(city);
+  const recentIncidents = detective.memory.incidents.slice(0, 10);
+  const activePredictions = detective.predictionStats.pending.length;
+  
+  // Calculate current hotspots based on live data
+  const hotspots = districts.map(district => {
+    const liveData = oddsEngine.getLiveIncidentData(district, city);
+    return {
+      district,
+      recentIncidents: liveData.recentIncidents,
+      hotspotLevel: liveData.recentIncidents >= 3 ? 'HIGH' : liveData.recentIncidents >= 1 ? 'MEDIUM' : 'LOW',
+      prophetAlert: liveData.prophetPrediction,
+      multiplier: liveData.hotspotMultiplier
+    };
+  }).sort((a, b) => b.recentIncidents - a.recentIncidents);
+
+  res.json({
+    status: 'online',
+    engine: 'DISPATCH-CONNECTED',
+    city: city.toUpperCase(),
+    dataSource: 'live_scanner_feeds',
+    lastUpdate: new Date().toISOString(),
+    stats: {
+      totalIncidents: detective.memory.incidents.length,
+      recentIncidents: recentIncidents.length,
+      activeProphetPredictions: activePredictions,
+      trackedDistricts: districts.length
+    },
+    currentHotspots: hotspots,
+    recentActivity: recentIncidents.map(inc => ({
+      type: inc.incidentType,
+      location: inc.location,
+      borough: inc.borough,
+      timestamp: inc.timestamp,
+      source: inc.source
+    })),
+    dataProof: {
+      connectedFeeds: Object.keys(activeStreams).length,
+      agentProcessing: Object.keys(detectiveBureaus).map(city => ({
+        city: city.toUpperCase(),
+        memorySize: detectiveBureaus[city].memory.incidents.length,
+        lastIncident: detectiveBureaus[city].memory.incidents[0]?.timestamp
+      }))
+    }
   });
 });
 
