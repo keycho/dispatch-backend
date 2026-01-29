@@ -17,9 +17,9 @@ class DispatchTelegramBot {
       console.log('[TELEGRAM] Bot disabled - missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID');
     }
     
-    // Rate limiting
+    // Rate limiting (lowered for testing)
     this.lastPostTime = 0;
-    this.minInterval = config.minInterval || 5 * 60 * 1000; // 5 min default (more lenient than Twitter)
+    this.minInterval = config.minInterval || 1 * 60 * 1000; // 1 min for testing
     
     // Pending incidents waiting for agent analysis
     this.pendingIncidents = new Map();
@@ -31,12 +31,17 @@ class DispatchTelegramBot {
     // Site URL for links
     this.siteUrl = config.siteUrl || 'https://suspect.fyi';
     
-    // Notable incident filters
+    // Notable incident filters (lowered for testing)
     this.notableTypes = [
       'pursuit', 'shots fired', 'shooting', 'stabbing', 'robbery',
       'carjacking', 'officer down', 'hostage', 'active shooter',
       'explosion', 'assault in progress', 'kidnapping', 'hit and run',
-      'armed robbery', 'burglary in progress', 'vehicle pursuit'
+      'armed robbery', 'burglary in progress', 'vehicle pursuit',
+      // Lower threshold - more common incidents
+      'assault', 'dispute', 'fight', 'disturbance', 'domestic',
+      'burglary', 'theft', 'larceny', 'suspicious', 'weapon',
+      'drugs', 'ems', 'ambulance', 'fire', 'accident', 'crash',
+      'medical', 'unconscious', 'intoxicated', 'trespass'
     ];
     
     this.criticalPriorities = ['critical', 'high'];
