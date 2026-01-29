@@ -11,6 +11,7 @@ import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import DispatchTwitterBot from './twitter-bot.js';
+import DispatchTelegramBot from './telegram-bot.js';
 
 dotenv.config();
 
@@ -140,9 +141,15 @@ const clients = new Set();
 
 // Twitter Bot for auto-posting notable incidents
 const twitterBot = new DispatchTwitterBot({
-  siteUrl: 'https://dispatch.live',
+  siteUrl: 'https://suspect.fyi',
   minInterval: 10 * 60 * 1000,  // 10 min between tweets
   dailyLimit: 45                 // Stay under free tier
+});
+
+// Telegram Bot for auto-posting notable incidents
+const telegramBot = new DispatchTelegramBot({
+  siteUrl: 'https://suspect.fyi',
+  minInterval: 5 * 60 * 1000  // 5 min between posts
 });
 
 // ============================================
@@ -822,6 +829,10 @@ Analyze escape route patterns and high-risk areas for this time of day.`
         // Add to pending Twitter post
         if (typeof twitterBot !== 'undefined') {
           twitterBot.addAgentAnalysis(incident.id, 'CHASE', chaseInsight);
+        }
+        // Add to pending Telegram post
+        if (typeof telegramBot !== 'undefined') {
+          telegramBot.addAgentAnalysis(incident.id, 'CHASE', chaseInsight);
         }
       }
       this.emitAgentStatus('CHASE', 'idle', broadcast);
@@ -5003,6 +5014,7 @@ async function processOpenMHzCall(call, cityId = 'nyc') {
       
       broadcastToCity(cityId, { type: "incident", incident });
       if (cityId === 'nyc') twitterBot.queueIncident(incident, camera);
+      if (cityId === 'nyc') telegramBot.queueIncident(incident, camera);
       if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}` });
       
       console.log(`[OPENMHZ-${cityId.toUpperCase()} INCIDENT]`, incident.incidentType, '@', incident.location, `(${incident.borough})`);
@@ -5677,6 +5689,7 @@ async function processAudioFromStream(buffer, feedName, feedId = null) {
     
     broadcastToCity(cityId, { type: "incident", incident });
     if (cityId === 'nyc') twitterBot.queueIncident(incident, camera);
+    if (cityId === 'nyc') telegramBot.queueIncident(incident, camera);
     if (camera) broadcastToCity(cityId, { type: "camera_switch", camera, reason: `${parsed.incidentType} at ${parsed.location}`, priority: parsed.priority });
     
     console.log(`[${feedName}] 🚨 INCIDENT (${cityId.toUpperCase()}): ${incident.incidentType} @ ${incident.location} (${incident.borough})`);
