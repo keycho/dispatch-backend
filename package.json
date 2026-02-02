@@ -1,10 +1,11 @@
 {
-  "name": "dispatch-split",
+  "name": "dispatch-nyc",
   "version": "2.0.0",
   "type": "module",
+  "main": "server.js",
   "scripts": {
-    "start": "node web.js",
-    "worker": "node worker.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.27.0",
@@ -12,10 +13,7 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "node-fetch": "^3.3.2",
-    "openai": "^4.20.0",
-    "pg": "^8.11.3",
-    "redis": "^4.6.10",
-    "twitter-api-v2": "^1.15.0",
-    "ws": "^8.14.2"
+    "openai": "^4.52.0",
+    "ws": "^8.16.0"
   }
 }
